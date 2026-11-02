@@ -1,0 +1,295 @@
+# Crosslinking (XL-MS) searches
+
+Sage can search for chemically crosslinked peptides. Add a `crosslink` block to
+the usual JSON configuration to enable it; omit it and Sage behaves exactly as
+before. Two strategies are used, chosen by the reagent:
+
+* **MS-cleavable** reagents (**DSSO**, **DSBU**): `"crosslink": {"reagent": "dsso"}`.
+  Recommended for proteome-scale work - see [Cleavable linkers](#ms-cleavable-linkers-dsso-dsbu).
+* **Non-cleavable** reagents (DSS, BS3, DSG, BS2G, custom): the default.
+* **Zero-length / heterobifunctional** reagents (**EDC**, **DMTMM**, custom
+  `site1`/`site2`): ends that react with different groups - see
+  [Heterobifunctional and zero-length reagents](#heterobifunctional-and-zero-length-reagents-edc-dmtmm).
+
+```json
+{
+  "database": {
+    "fasta": "proteins.fasta",
+    "enzyme": { "missed_cleavages": 2, "min_len": 6, "max_len": 40 },
+    "generate_decoys": true
+  },
+  "precursor_tol": { "ppm": [-10, 10] },
+  "fragment_tol":  { "ppm": [-10, 10] },
+  "precursor_charge": [3, 6],
+  "deisotope": true,
+  "crosslink": {}
+}
+```
+
+`"crosslink": {}` means DSS/BS3 on lysine and protein N-termini. All options:
+
+| key | default | meaning |
+|---|---|---|
+| `reagent` | none | preset: `dss`, `bs3`, `dsg`, `bs2g`, `dsso`, `dsbu`, `edc`, `dmtmm`. Sets the linker mass (and stub masses for cleavable reagents, sites for EDC/DMTMM) |
+| `mass` | `138.06808` | custom reagents only (not with `reagent`): mass added to the *pair* of peptides; may be negative down to -20 for zero-length couplings (-18.010565) |
+| `cleavable` | none | custom MS-cleavable reagents only: `{"short": .., "long": .., "alt": [..]}`; `short + long` must equal `mass` |
+| `backend` | `"cpu"` | non-cleavable search algorithm / hardware: `cpu`, `reflect`, `gpu`, `auto` - see [Choosing a backend](#choosing-a-backend) |
+| `chain_survivors` | `20000` | `reflect`/`gpu` only: peptides kept per spectrum after the per-chain filter (best by chain score) |
+| `require_complete_doublets` | `false` | cleavable only: require both stub peaks of *both* peptides (default: both of one, at least one of the other) |
+| `residues` | `"K"` | residues the linker reacts with (e.g. `"KST"`) |
+| `protein_nterm` | `true` | allow linking the protein N-terminal amine |
+| `site1`, `site2` | none | heterobifunctional chemistry, set both: what each end reacts with, as residue letters plus `[` (protein N-terminus) and `]` (protein C-terminus). Replaces `residues` / `protein_nterm`; overrides a reagent's sites |
+| `allow_cterm_residue` | `false` | allow linking a peptide's C-terminal residue when it is not the protein C-terminus |
+| `loop_links` | `true` | also search loop-links (both ends of the linker on one peptide) |
+| `candidates` | `30` | linear "seed" peptides per spectrum used to find partners |
+| `min_chain_peaks` | `3` | minimum matched fragments required on *each* peptide |
+
+Output: `crosslinks.sage.tsv` (+ `results.json`). Run as normal: `sage config.json`.
+
+## Required database settings
+
+* **`enzyme.missed_cleavages` must be >= 1 (typically 2).** A crosslinked lysine
+  blocks trypsin, so linked peptides contain an *internal* K. Sage's default
+  enzyme allows 0 missed cleavages; Sage warns if you leave it that way.
+* `database.prefilter` is rejected (partners rarely identify as linear peptides).
+* `peptide_min_mass` defaults to 350 Da in crosslink mode (500 Da otherwise) so
+  small partner peptides are kept.
+* Several enzymes can be combined (co-digestion, e.g. trypsin + Asp-N, common in
+  XL-MS): `"enzyme": {"missed_cleavages": 2, "enzymes": ["trypsin", "asp-n"]}`.
+  Peptides are cut wherever any listed enzyme cleaves. Names: `trypsin`,
+  `trypsin/p`, `lys-c`, `lys-n`, `arg-c`, `asp-n`, `glu-c`, `chymotrypsin`,
+  `chymotrypsin-high`, `proalanase`; a custom rule
+  `{"cleave_at": "DE", "restrict": "P", "c_terminal": true}` may be listed too.
+  The C-terminal-residue rule (`allow_cterm_residue`) assumes enzymes that cut
+  *after* the linked residue; with only N-terminal cutters (Asp-N, Lys-N) consider
+  setting `allow_cterm_residue: true`.
+
+## Heterobifunctional and zero-length reagents (EDC, DMTMM)
+
+```json
+"crosslink": { "reagent": "edc" }
+```
+
+EDC and DMTMM couple a primary amine to a carboxyl directly, forming an amide
+bond and releasing one water: the linker mass is **-18.010565 Da** and nothing
+of the reagent remains. The two ends react with different groups:
+
+| | reacts with | spec |
+|---|---|---|
+| `site1` | Lys, protein N-terminus (amines) | `"K["` |
+| `site2` | Asp, Glu, protein C-terminus (carboxyls) | `"DE]"` |
+
+Every reported link joins a `site1` group to a `site2` group (K-D, K-E,
+N-term-E, ...); K-K or D-E pairs are never formed. The same holds for loop-links
+and for every backend. The protein C-terminal carboxyl is modelled on the last
+residue (every y-ion contains it), as the N-terminal amine is on the first.
+
+Any other two-group chemistry is a custom reagent with both sites, e.g. a
+hypothetical amine-to-sulfhydryl linker:
+
+```json
+"crosslink": { "mass": 96.02113, "site1": "K[", "site2": "C" }
+```
+
+Explicit `site1`/`site2` may also be combined with `"reagent": "edc"` to narrow
+or extend its chemistry (e.g. `"site1": "KST["`).
+
+## MS-cleavable linkers (DSSO, DSBU)
+
+```json
+"crosslink": { "reagent": "dsso" }
+```
+
+A cleavable linker breaks in the collision cell, so each peptide appears in the
+MS2 spectrum on its own carrying a small remnant (a *stub*). The two stubs of one
+reagent differ by a fixed mass, so every peptide shows up as a **doublet**:
+
+| reagent | linker | stubs | doublet spacing |
+|---|---|---|---|
+| DSSO | 158.00376 | 54.01056 (alkene), 103.99320 (thiol); also 85.98264 (sulfenic acid) | 49.98264 |
+| DSBU | 196.08479 | 85.05276, 111.03203 | 25.97927 |
+
+The search exploits this:
+
+1. Find peak pairs spaced by the doublet mass. If `a = m(A) + short`, the partner
+   peptide's doublet must sit at `M - a` and `M - a - spacing` (precursor mass `M`).
+2. Both peptide masses are now known, so each is looked up directly in the
+   mass-sorted peptide list with a narrow window. **No pairwise enumeration and no
+   wide seed search.**
+3. Each peptide is scored independently as a linear peptide with a stub on one
+   residue (any of the stubs may be on fragment ions that contain the link). The
+   pair's score is the joint hyperscore.
+
+Because candidates come from narrow mass windows, cost grows roughly with database
+size rather than quadratically, which is what makes proteome-scale searching practical.
+
+Recommended: `deisotope: true` (assigns charges to the stub-peptide ions; without
+it the search tries every charge up to precursor-1 for each peak) and a
+generous `max_peaks` (defaults to 300 in cleavable mode, since doublets are
+often weak). Loop-links are not searched in cleavable mode.
+
+## Choosing a backend
+
+Non-cleavable reagents can be searched with three interchangeable strategies,
+selected with `"backend"`. MS-cleavable reagents always use the doublet search on
+the CPU (it is already cheap and has nothing worth offloading); the setting is
+ignored for them, with a log message.
+
+| backend | what it does | when to use it |
+|---|---|---|
+| `cpu` (default) | seed search + partner lookup (below) | the validated default; cheap enough for purified complexes and small databases |
+| `reflect` | chain reflection (below) on the CPU | a slow *reference* of the GPU algorithm; use it to check the GPU, not for large databases |
+| `gpu` | chain reflection with the per-peptide scoring on a GPU | proteome-scale non-cleavable searches. Errors if no GPU backend is available |
+| `auto` | `gpu` if a real GPU is available, else `cpu` | convenience. Software adapters (llvmpipe, WARP) are never chosen by `auto`, since they are slower than `cpu`; backends can give slightly different results |
+
+### Building with GPU support
+
+```
+cargo build --release -p sage-cli --features gpu
+```
+
+This uses [wgpu](https://wgpu.rs), so it runs on Vulkan (Linux/Windows), DirectX 12
+(Windows) and Metal (macOS) with NVIDIA, AMD, Intel or Apple GPUs; there is no CUDA
+dependency. It needs Rust 1.87 or newer. Without `--features gpu`, `"backend":
+"gpu"` is an error and `"auto"` falls back to `cpu`.
+
+The peptide ion table is uploaded once and stays resident; for a human proteome at
+2 missed cleavages expect on the order of 1 GB of device memory (Sage reports the
+table size at start-up). Tables larger than the device's buffer limits are split
+into chunks automatically.
+
+### Checking the GPU on your machine
+
+The GPU kernel is tested against the CPU reference. Run this on the machine with
+the GPU; it prints the adapter it used and fails if any survivor differs
+(peptide set, link site, matched ions, or score beyond 1e-3):
+
+```
+cargo test -p sage-core --features gpu gpu_kernel -- --nocapture
+```
+
+Real GPUs may round f32 differently from the CPU (fused multiply-add, `log`), so a
+borderline peak can in principle flip; if the test fails on your hardware, please
+report the adapter name and the failing message. The final scores are always
+recomputed exactly on the CPU, so such a flip can only change *which candidates*
+reach the exact rescoring, not a reported score.
+
+### How chain reflection works
+
+For a pair `A-B` with precursor mass `M = m(A) + m(B) + linker`, every fragment of
+`A` containing the linked residue carries the other chain plus the linker, a shift
+of `M - m(A)`. That depends only on `A` and the precursor, not on `B`, so:
+
+1. **Chain filter (the GPU part).** Every peptide is scored independently, with
+   its link-residue ions shifted by `M - m(A)`; the best link site is kept. The
+   `chain_survivors` best peptides go on.
+2. **Join on mass.** Survivors are paired where `m(B) = M - linker - m(A)`.
+3. **Exact rescoring.** The best `candidates` pairs are rescored with the real
+   partner mass, using the same scoring (and FDR) as the `cpu` backend.
+4. **Loop-links** need no partner: peptides with `m(A) + linker = M` are looked up
+   directly.
+
+The shift uses the *observed* precursor mass, so shifted ions carry the precursor
+error; their windows are widened by it. The filter score is therefore a coarse
+surrogate (always the Sage hyperscore formula); only the final score is exact.
+
+The top-`chain_survivors` cut makes the join a heuristic, not exact: a true chain
+that scores below the cut is lost. True chains usually score far above random
+peptides, but raise `chain_survivors` if you suspect misses.
+
+## How the non-cleavable `cpu` search works
+
+1. **Seed search** - the spectrum is searched against the fragment index with a
+   very wide precursor window. Each chain of a crosslinked pair still yields many
+   ordinary, unshifted b/y ions, so the best-matching linear peptides are seeds.
+2. **Partner lookup** - for seed `A`, the partner mass is fixed by the precursor:
+   `m(B) = M - m(A) - linker`. Peptides are mass-sorted, so partners are found by
+   binary search; each pair, and each pair of reactive residues, is scored.
+3. **Fragment model** - for chain `A` linked at residue `i`, every fragment that
+   *contains* residue `i` carries the whole other chain plus the linker.
+4. **Score** - joint hyperscore over both chains, requiring `min_chain_peaks`
+   matched ions on each. `alpha` is the better-supported chain.
+5. **FDR** - target-decoy, `(TD - DD) / TT` for crosslinks (Walzthoeni 2012);
+   `decoys / targets` for loop-links. Computed **separately** for loop-links,
+   intra-protein and inter-protein links. `spectrum_q` is per CSM;
+   `crosslink_q` is per unique (peptide pair + sites).
+
+## Output columns
+
+`link_a` / `link_b` are 1-based residue positions *within* `peptide_a` /
+`peptide_b`. For a loop-link, both are positions on `peptide_a`. `label` is 1 for
+target-target, -1 otherwise; `class` is `TT`/`TD`/`DD` (loop-links: `TT`/`DD`).
+
+## Quantification
+
+The usual `quant` block works for crosslink searches:
+
+```json
+"quant": { "tmt": "Tmt16", "tmt_settings": { "level": 3 }, "lfq": true,
+           "lfq_settings": { "peptide_q_value": 0.01, "ppm_tolerance": 5.0 } }
+```
+
+**Isobaric labels (TMT).** Reporter ions are read from each crosslink match's
+spectrum (MS2, or with `"level": 3` the SPS-MS3 scan that names it as precursor)
+and appended to `crosslinks.sage.tsv` as `ion_injection_time`, `tmt_1` ... (empty
+when a spectrum has no reporter scan). `tmt_settings.sn` works as for linear
+searches. Sum reporters per unique crosslink (or per protein pair) downstream.
+
+Labelling usually follows crosslinking, so a **crosslinked lysine carries no
+label**. A residue with a static modification can't be linked, so a static TMT on
+K would block every lysine link (Sage warns). Instead:
+
+```json
+"static_mods":   { "^": 304.2071 },
+"variable_mods": { "K": [304.2071] }
+```
+
+Sage then links only the unlabelled form of a lysine while the other lysines of
+the peptide may carry the label.
+
+**Label-free (MS1).** With `"lfq": true` Sage writes `crosslinks.lfq.tsv`, one
+row per crosslinked *species* (peptide pair or loop-linked peptide; link-site
+isomers have the same MS1 signal and are not separated) with its intensity in
+every run:
+
+1. Species with a target-target match at `crosslink_q <= lfq_settings.peptide_q_value`
+   are traced in MS1 at every precursor charge and the first three isotopes,
+   within `ppm_tolerance`, using the isotope envelope of both peptides plus the
+   linker (`mobility_pct_tolerance` on ion-mobility data).
+2. Runs are aligned with a linear retention-time fit on species identified in at
+   least two runs (at least three such species per run; otherwise unaligned).
+   Peaks are then smoothed, time-warped and integrated exactly as in linear LFQ
+   (`peak_scoring`, `integration`, `spectral_angle`, `combine_charge_states`).
+3. Each species also gets a decoy trace (shifted m/z, earlier retention time);
+   `q_value` is the MS1 peak q-value from decoys / targets. Rows are named by the
+   species' best match (`peptide_a`, `link_a`, ... as above); `charge` is -1 when
+   charge states are combined.
+
+`predict_rt` is not used: it needs linear PSMs.
+
+## Limitations
+
+* `reflect`/`gpu`: results are close to, but not bit-identical with, the `cpu`
+  backend (different candidate generation). Report which backend you used.
+* Cleavable mode needs the stub doublets to be present in the MS2 spectrum
+  (i.e. HCD/stepped-HCD data). It is not an MS2-MS3 workflow.
+* Cleavable mode: peptides carrying a *mono-link* or *loop-link* are not searched.
+* **Mono-links** (hydrolyzed/amidated dead-ends) are not part of this search;
+  search for them as an ordinary variable modification (`K: 156.0786`).
+* Loop-links are found through unshifted ions *outside* the ring, so the linked
+  residues need flanking sequence.
+* Link positions are reported within peptides, not protein coordinates.
+* No machine-learning rescoring yet (Sage's LDA is tied to linear PSMs); FDR is
+  on the hyperscore. Adjacent reactive residues (e.g. `KK`) can be ambiguous.
+* `wide_window`/DIA, `chimera`, and parquet output are not supported in
+  crosslink mode.
+* Crosslink LFQ aligns runs only on crosslinks (a few per run in small studies);
+  with few shared identifications runs stay unaligned and rely on the local time
+  warping within the +/-0.5% retention-time window. Match-between-runs works for
+  species identified in at least one run.
+* **Validated on synthetic data only** (unit tests in `crosslink.rs`, plus an
+  independent generator). On synthetic DSSO/DSBU data an entrapment test (spectra
+  of peptides absent from the FASTA) gave an observed FDR close to the estimate,
+  but with very few false hits. Real spectra have chimeric precursors, missing and
+  mis-assigned peaks, and non-uniform fragmentation that synthetic data lack.
+  Benchmark on real data before trusting the FDR.

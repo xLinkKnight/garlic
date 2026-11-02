@@ -18,6 +18,14 @@ log = "0.4.0"
 rayon = "1.5"
 regex = "1.6"
 serde = { version="1.0", features = ["derive"] }
+wgpu = { version = "30", optional = true }
+pollster = { version = "1", optional = true }
+
+[features]
+default = []
+# GPU chain scoring for crosslink searches (wgpu: Vulkan / DX12 / Metal).
+# Needs Rust 1.87+.
+gpu = ["dep:wgpu", "dep:pollster"]
 
 [dev-dependencies]
 quickcheck = "1"

@@ -12,15 +12,15 @@ use std::collections::HashMap;
 // const MIN_SPECTRAL_ANGLE: f64 = 0.70;
 /// Retention time tolerance, in fraction of total run length, to search for
 /// precursor ions
-const RT_TOL: f32 = 0.0050;
+pub(crate) const RT_TOL: f32 = 0.0050;
 /// Width of gaussian kernel used for smoothing intensities
 const K_WIDTH: usize = 10;
 /// Mass tolerance, in ppm, to seach for precursor ions
 // const PPM_TOL: f32 = 5.0;
 /// Number of equally spaced bins that will be used to integrate ions in (-RT_TOL, +RT_TOL)
-const GRID_SIZE: usize = 100;
+pub(crate) const GRID_SIZE: usize = 100;
 /// Number of isotopes to search for
-const N_ISOTOPES: usize = 3;
+pub(crate) const N_ISOTOPES: usize = 3;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PeakScoringStrategy {
@@ -522,6 +522,19 @@ impl Grid {
         files: usize,
         grid_size: usize,
     ) -> Grid {
+        Self::centered(entry.rt, entry.file_id, rt_tol, distribution, files, grid_size)
+    }
+
+    /// A grid spanning `rt ± rt_tol` (aligned retention time), whose best
+    /// identification came from `reference_file_id`
+    pub fn centered(
+        rt: f32,
+        reference_file_id: usize,
+        rt_tol: f32,
+        distribution: [f32; N_ISOTOPES],
+        files: usize,
+        grid_size: usize,
+    ) -> Grid {
         let matrix = Matrix::new(
             vec![0.0; grid_size * files * N_ISOTOPES],
             files * N_ISOTOPES,
@@ -530,12 +543,12 @@ impl Grid {
         let rt_step = (rt_tol * 2.0) / (grid_size) as f32;
 
         Grid {
-            rt_min: entry.rt - rt_tol,
+            rt_min: rt - rt_tol,
             rt_step,
             distribution,
             matrix,
             files,
-            reference_file_id: entry.file_id,
+            reference_file_id,
         }
     }
 

@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+- Crosslinking (XL-MS) search: enable with a `crosslink` config block; writes `crosslinks.sage.tsv`. Supports non-cleavable (DSS/BS3/DSG/BS2G, incl. loop-links) and MS-cleavable (DSSO/DSBU, doublet-based) linkers. See `CROSSLINKING.md`.
+- Crosslinking: heterobifunctional chemistry with `site1` / `site2` (a link always joins a site1 group to a site2 group), and the zero-length reagents `edc` and `dmtmm` (amine to carboxyl, -18.010565 Da).
+- Multiple enzymes (co-digestion): `"enzyme": {"enzymes": ["trypsin", "asp-n"]}` cleaves wherever any listed enzyme does. Named proteases: trypsin, trypsin/p, lys-c, lys-n, arg-c, asp-n, glu-c, chymotrypsin, chymotrypsin-high, proalanase; custom rules `{"cleave_at": "DE", "restrict": "P", "c_terminal": true}` can be mixed in.
+- Crosslinking: quantification. `quant.tmt` adds reporter-ion columns to `crosslinks.sage.tsv` (MS2 or SPS-MS3); `quant.lfq` writes `crosslinks.lfq.tsv` with MS1 intensities per crosslinked peptide pair across runs (alignment on shared crosslinks, decoy-based peak q-values). Sage warns when a static modification (e.g. TMT on K) blocks crosslink-reactive residues.
+- `sage-gui`: a desktop window for editing search settings (with hover help on every field), choosing FASTA/mzML/MGF/Bruker `.d`/Thermo `.raw` files (RAW converted with msconvert or ThermoRawFileParser) and running searches.
+
+### Fixed
+- Crosslinking: the BS2G preset used 114.03170 Da (the hydrolysed mono-link); the crosslink adds 96.02113 Da, like DSG.
+
 ## [v0.15.0]
 ### Added
 - Support for named modifications using `{"mass": 15.9949, "name": "UniMod:35"}`

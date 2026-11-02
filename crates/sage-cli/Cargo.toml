@@ -18,6 +18,11 @@ path = "src/lib.rs"
 name = "sage"
 path = "src/main.rs"
 
+[features]
+default = []
+# GPU-accelerated crosslink search (wgpu: Vulkan / DX12 / Metal)
+gpu = ["sage-core/gpu"]
+
 [dependencies]
 sage-core = { path = "../sage" }
 sage-cloudpath = { path = "../sage-cloudpath", features = ["parquet"] }

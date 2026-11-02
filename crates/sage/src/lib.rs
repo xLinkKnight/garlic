@@ -1,3 +1,8 @@
+pub mod crosslink;
+pub mod crosslink_kernel;
+pub mod crosslink_quant;
+#[cfg(feature = "gpu")]
+pub mod crosslink_gpu;
 pub mod database;
 pub mod enzyme;
 pub mod fasta;

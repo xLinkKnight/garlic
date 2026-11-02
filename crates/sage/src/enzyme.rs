@@ -128,6 +128,8 @@ pub struct Enzyme {
     pub c_terminal: bool,
     // Semi-enzymatic cleavage?
     pub semi_enzymatic: bool,
+    // Further enzymes of a co-digestion: the digest cleaves wherever any of them does
+    others: Vec<Enzyme>,
 }
 
 #[derive(Clone)]
@@ -168,6 +170,7 @@ impl Enzyme {
                 c_terminal: true,
                 // Do not allow strange behavior
                 semi_enzymatic: false,
+                others: Vec::new(),
             }),
             _ => Some(Enzyme {
                 regex: Regex::new(&format!("[{}]", cleave.replace('?', ""))).unwrap(),
@@ -180,13 +183,22 @@ impl Enzyme {
                 },
                 c_terminal,
                 semi_enzymatic,
+                others: Vec::new(),
             }),
         }
     }
 
-    pub fn cleavage_sites(&self, sequence: &str) -> Vec<DigestSite> {
-        let mut sites = Vec::new();
-        let mut left = 0;
+    /// Combine several enzymes into one co-digestion (e.g. trypsin + Asp-N) that
+    /// cleaves wherever any of them does. Returns `None` for an empty list.
+    pub fn combine(enzymes: Vec<Enzyme>) -> Option<Self> {
+        let mut enzymes = enzymes.into_iter();
+        let mut first = enzymes.next()?;
+        first.others.extend(enzymes);
+        Some(first)
+    }
+
+    /// Positions (in `0..=sequence.len()`) at which this enzyme alone cuts
+    fn cut_positions(&self, sequence: &str, cuts: &mut Vec<usize>) {
         for mat in self.regex.find_iter(sequence) {
             let right = match self.c_terminal {
                 true => mat.end(),
@@ -199,6 +211,23 @@ impl Enzyme {
             {
                 continue;
             }
+            cuts.push(right);
+        }
+    }
+
+    pub fn cleavage_sites(&self, sequence: &str) -> Vec<DigestSite> {
+        let mut cuts = Vec::new();
+        self.cut_positions(sequence, &mut cuts);
+        if !self.others.is_empty() {
+            for enzyme in &self.others {
+                enzyme.cut_positions(sequence, &mut cuts);
+            }
+            cuts.sort_unstable();
+            cuts.dedup();
+        }
+        let mut sites = Vec::with_capacity(cuts.len() + 1);
+        let mut left = 0;
+        for right in cuts {
             sites.push(DigestSite {
                 site: left..right,
                 missed_cleavages: 0,
@@ -214,6 +243,43 @@ impl Enzyme {
         sites
     }
 }
+
+/// Commonly used proteases, by name: `(cleave_at, restrict, c_terminal)`.
+/// Names ignore case and punctuation, so `Asp-N`, `aspn` and `asp_n` are equal.
+pub fn protease(name: &str) -> Option<(&'static str, &'static str, bool)> {
+    let key = name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    Some(match key.as_str() {
+        "trypsin" => ("KR", "P", true),
+        "trypsinp" => ("KR", "", true),
+        "lysc" => ("K", "P", true),
+        "lysn" => ("K", "", false),
+        "argc" => ("R", "P", true),
+        "aspn" => ("D", "", false),
+        "gluc" => ("E", "P", true),
+        "chymotrypsin" => ("FYWL", "P", true),
+        "chymotrypsinhigh" => ("FYW", "P", true),
+        "proalanase" => ("PA", "", true),
+        _ => return None,
+    })
+}
+
+/// Names accepted by [`protease`]
+pub const PROTEASES: [&str; 10] = [
+    "trypsin",
+    "trypsin/p",
+    "lys-c",
+    "lys-n",
+    "arg-c",
+    "asp-n",
+    "glu-c",
+    "chymotrypsin",
+    "chymotrypsin-high",
+    "proalanase",
+];
 
 impl EnzymeParameters {
     pub fn cleavage_sites(&self, sequence: &str) -> Vec<DigestSite> {
@@ -757,6 +823,90 @@ mod test {
                 assert_eq!(digest.position, Position::Nterm);
             }
         }
+    }
+
+    #[test]
+    fn co_digestion_cleaves_at_every_enzyme() {
+        // trypsin cuts after K/R (not before P), Asp-N before D
+        let sequence = "MADEEKLPPGWEKRMSRSSGRVYYFNHITNASQWERPSGN";
+        let codigest = EnzymeParameters {
+            min_len: 1,
+            max_len: 50,
+            missed_cleavages: 0,
+            enzyme: Enzyme::combine(vec![
+                Enzyme::new("KR", "P", true, false).unwrap(),
+                Enzyme::new("D", "", false, false).unwrap(),
+            ]),
+        };
+        assert_eq!(
+            codigest
+                .digest(sequence, Arc::default())
+                .into_iter()
+                .map(|d| d.sequence)
+                .collect::<Vec<_>>(),
+            vec!["MA", "DEEK", "LPPGWEK", "R", "MSR", "SSGR", "VYYFNHITNASQWERPSGN"]
+        );
+
+        // A missed cleavage can span a site of either enzyme
+        let codigest = EnzymeParameters {
+            missed_cleavages: 1,
+            ..codigest
+        };
+        let peptides = codigest
+            .digest(sequence, Arc::default())
+            .into_iter()
+            .map(|d| (d.sequence, d.missed_cleavages))
+            .collect::<Vec<_>>();
+        assert!(peptides.contains(&("MADEEK".into(), 1)));
+        assert!(peptides.contains(&("DEEKLPPGWEK".into(), 1)));
+    }
+
+    #[test]
+    fn combining_one_enzyme_changes_nothing() {
+        let sequence = "MADEEKLPPGWEKRMSRSSGRVYYFNHITNASQWERPSGN";
+        let digest = |enzyme| {
+            EnzymeParameters {
+                min_len: 1,
+                max_len: 50,
+                missed_cleavages: 2,
+                enzyme,
+            }
+            .digest(sequence, Arc::default())
+            .into_iter()
+            .map(|d| (d.sequence, d.missed_cleavages))
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            digest(Enzyme::new("KR", "P", true, false)),
+            digest(Enzyme::combine(vec![Enzyme::new("KR", "P", true, false).unwrap()]))
+        );
+    }
+
+    #[test]
+    fn protease_names() {
+        assert_eq!(protease("Trypsin"), Some(("KR", "P", true)));
+        assert_eq!(protease("Asp-N"), Some(("D", "", false)));
+        assert_eq!(protease("glu_c"), Some(("E", "P", true)));
+        assert_eq!(protease("ProAlanase"), Some(("PA", "", true)));
+        assert_eq!(protease("pepsin"), None);
+        assert!(PROTEASES.iter().all(|p| protease(p).is_some()));
+
+        // ProAlanase cuts after P and A, also before P
+        let proalanase = EnzymeParameters {
+            min_len: 1,
+            max_len: 50,
+            missed_cleavages: 0,
+            enzyme: Enzyme::new("PA", "", true, false),
+        };
+        assert_eq!(
+            proalanase
+                .digest("GKAPPLE", Arc::default())
+                .into_iter()
+                .map(|d| d.sequence)
+                .collect::<Vec<_>>(),
+            // GKA | P | P | LE, with the repeated P reported once
+            vec!["GKA", "P", "LE"]
+        );
     }
 
     /// Helper struct for generation of random sequences of valid amino acids

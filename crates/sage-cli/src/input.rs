@@ -4,6 +4,7 @@ use sage_cloudpath::tdf::BrukerProcessingConfig;
 use sage_cloudpath::Url;
 use sage_core::scoring::ScoreType;
 use sage_core::{
+    crosslink::CrosslinkSettings,
     database::{Builder, Parameters},
     lfq::LfqSettings,
     mass::Tolerance,
@@ -36,6 +37,9 @@ pub struct Search {
     pub bruker_config: BrukerProcessingConfig,
     pub protein_grouping: bool,
     pub protein_grouping_peptide_fdr: f32,
+    /// Present only for crosslinking (XL-MS) searches
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crosslink: Option<CrosslinkSettings>,
 
     #[serde(skip_serializing)]
     pub output_directory: Url,
@@ -76,6 +80,8 @@ pub struct Input {
     pub bruker_config: Option<BrukerProcessingConfig>,
     pub protein_grouping: Option<bool>,
     pub protein_grouping_peptide_fdr: Option<f32>,
+    /// Enables a chemical crosslinking search (non-cleavable linkers)
+    pub crosslink: Option<CrosslinkSettings>,
 
     pub annotate_matches: Option<bool>,
     pub write_pin: Option<bool>,
@@ -283,7 +289,114 @@ impl Input {
         }
     }
 
+    /// Checks and adjusts settings that only matter for crosslink searches
+    fn prepare_crosslink(&mut self) -> anyhow::Result<()> {
+        let Some(crosslink) = &self.crosslink else {
+            return Ok(());
+        };
+        crosslink.validate().map_err(anyhow::Error::msg)?;
+
+        // The prefilter keeps only peptides that identify *linearly*. A crosslink
+        // partner often can't, so prefiltering would silently drop true links.
+        ensure!(
+            !self.database.prefilter.unwrap_or(false),
+            "`database.prefilter` cannot be combined with `crosslink`: partner peptides of a \
+             crosslink usually don't identify as linear peptides and would be discarded"
+        );
+        ensure!(
+            !self.wide_window.unwrap_or(false),
+            "`wide_window` is not supported for crosslink searches"
+        );
+        if self.chimera.unwrap_or(false) {
+            log::warn!("`chimera` is ignored for crosslink searches");
+        }
+        // A residue carrying a static modification can't be linked: with TMT on K
+        // as a static mod, no lysine could carry a crosslink. Labelling after
+        // crosslinking leaves linked lysines unlabelled, which a *variable* label
+        // on K models (Sage then only links the unlabelled form).
+        let reactive = match crosslink.hetero_sites() {
+            Some((site1, site2)) => site1 + &site2,
+            None => crosslink.residues.clone(),
+        };
+        let blocked = self
+            .database
+            .static_mods
+            .iter()
+            .flatten()
+            .filter_map(|(target, _)| match target {
+                sage_core::modification::ModificationSpecificity::Residue(aa)
+                    if reactive.as_bytes().contains(aa) =>
+                {
+                    Some(*aa as char)
+                }
+                _ => None,
+            })
+            .collect::<String>();
+        if !blocked.is_empty() {
+            log::warn!(
+                "static modification(s) on crosslink-reactive residue(s) `{}`: these residues can't \
+                 carry a crosslink. For isobaric labels (TMT) applied after crosslinking, make the \
+                 label on these residues a variable modification instead (keep it static on the \
+                 peptide N-terminus, `^`)",
+                blocked
+            );
+        }
+        if self.quant.as_ref().and_then(|q| q.lfq).unwrap_or(false) {
+            log::info!(
+                "crosslink LFQ: quantifying crosslinked peptide pairs in MS1 (crosslinks.lfq.tsv)"
+            );
+        }
+
+        if crosslink.is_cleavable() {
+            if crosslink.loop_links {
+                log::info!("MS-cleavable crosslinker: loop-links are not searched");
+            }
+            // Stub-peptide (doublet) peaks are often weak; keep more peaks than the
+            // linear default of 150 unless the user chose a value
+            if self.max_peaks.is_none() {
+                log::info!("cleavable crosslink search: setting `max_peaks` to 300");
+                self.max_peaks = Some(300);
+            }
+            if !self.deisotope.unwrap_or(true) {
+                log::warn!(
+                    "cleavable crosslink search works best with `deisotope: true`, which \
+                     assigns charge states to the stub-peptide ions"
+                );
+            }
+        }
+
+        // Crosslinked partners can be small; the linear default (500 Da) would hide them
+        if self.database.peptide_min_mass.is_none() {
+            log::info!("crosslink search: setting `database.peptide_min_mass` to 350 Da");
+            self.database.peptide_min_mass = Some(350.0);
+        }
+
+        // A crosslinked lysine is not cleaved by trypsin, so linked peptides contain
+        // an *internal* K. With 0 missed cleavages there is no such peptide.
+        let missed_cleavages = match &self.database.enzyme {
+            None => 0, // Sage's default enzyme allows no missed cleavages
+            Some(enzyme) => enzyme.missed_cleavages.unwrap_or(1),
+        };
+        if missed_cleavages == 0 {
+            log::warn!(
+                "crosslink search with `database.enzyme.missed_cleavages` = 0: crosslinked \
+                 residues block cleavage, so no linkable peptides will be generated. \
+                 Set `missed_cleavages` to at least 1 (typically 2)."
+            );
+        }
+        Ok(())
+    }
+
     pub fn build(mut self) -> anyhow::Result<Search> {
+        self.prepare_crosslink()?;
+
+        if let Some(enzyme) = &self.database.enzyme {
+            enzyme.validate().map_err(anyhow::Error::msg)?;
+            if enzyme.enzymes.is_some() && enzyme.cleave_at.is_some() {
+                log::warn!("`database.enzyme.enzymes` is set: `cleave_at`, `restrict` and `c_terminal` are ignored");
+            }
+        }
+
         let database = self
             .database
             .make_parameters()
@@ -384,6 +497,7 @@ impl Input {
             write_report: self.write_report.unwrap_or(false),
             protein_grouping: self.protein_grouping.unwrap_or(true),
             protein_grouping_peptide_fdr: self.protein_grouping_peptide_fdr.unwrap_or(0.01),
+            crosslink: self.crosslink,
             score_type,
         })
     }
@@ -420,6 +534,30 @@ mod test {
         }
         assert_eq!(c.enzyme.map(|e| e.skip_suffix), Some([false; 26]));
 
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_enzyme_list() -> Result<(), serde_json::Error> {
+        let builder: EnzymeBuilder = serde_json::from_value(serde_json::json!({
+            "missed_cleavages": 1,
+            "min_len": 2,
+            "enzymes": ["Trypsin", {"cleave_at": "D", "c_terminal": false}],
+        }))?;
+        assert!(builder.validate().is_ok());
+        let params: EnzymeParameters = builder.into();
+        let peptides = params
+            .digest("MADEEKLPPGWEKR", std::sync::Arc::default())
+            .into_iter()
+            .map(|d| d.sequence)
+            .collect::<Vec<_>>();
+        assert!(peptides.contains(&"DEEK".to_string()));
+
+        let unknown: EnzymeBuilder =
+            serde_json::from_value(serde_json::json!({ "enzymes": ["pepsin"] }))?;
+        assert!(unknown.validate().unwrap_err().contains("unknown enzyme"));
+        let empty: EnzymeBuilder = serde_json::from_value(serde_json::json!({ "enzymes": [] }))?;
+        assert!(empty.validate().is_err());
         Ok(())
     }
 }

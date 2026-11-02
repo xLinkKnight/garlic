@@ -27,6 +27,79 @@ pub struct EnzymeBuilder {
     pub restrict: Option<String>,
     pub c_terminal: Option<bool>,
     pub semi_enzymatic: Option<bool>,
+    /// Several enzymes used together (co-digestion), each a protease name
+    /// (`"trypsin"`, `"asp-n"`, see [`crate::enzyme::PROTEASES`]) or a rule
+    /// `{"cleave_at": "D", "restrict": "", "c_terminal": false}`. Replaces
+    /// `cleave_at` / `restrict` / `c_terminal` when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enzymes: Option<Vec<EnzymeRule>>,
+}
+
+/// One enzyme of [`EnzymeBuilder::enzymes`]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+#[serde(untagged)]
+pub enum EnzymeRule {
+    Named(String),
+    Custom {
+        cleave_at: String,
+        #[serde(default)]
+        restrict: String,
+        #[serde(default = "default_c_terminal")]
+        c_terminal: bool,
+    },
+}
+
+fn default_c_terminal() -> bool {
+    true
+}
+
+impl EnzymeRule {
+    /// `(cleave_at, restrict, c_terminal)`
+    pub fn resolve(&self) -> Result<(String, String, bool), String> {
+        let valid = |s: &str| s.bytes().all(|b| crate::mass::VALID_AA.contains(&b));
+        match self {
+            EnzymeRule::Named(name) => crate::enzyme::protease(name)
+                .map(|(c, r, t)| (c.into(), r.into(), t))
+                .ok_or_else(|| {
+                    format!(
+                        "unknown enzyme `{name}`; use one of {} or a rule {{\"cleave_at\": .., \"restrict\": .., \"c_terminal\": ..}}",
+                        crate::enzyme::PROTEASES.join(", ")
+                    )
+                }),
+            EnzymeRule::Custom {
+                cleave_at,
+                restrict,
+                c_terminal,
+            } => {
+                if cleave_at.is_empty() || !valid(cleave_at) {
+                    return Err(format!(
+                        "enzyme rule `cleave_at` must be amino acid letters, got `{cleave_at}`"
+                    ));
+                }
+                if !valid(restrict) {
+                    return Err(format!(
+                        "enzyme rule `restrict` must be amino acid letters, got `{restrict}`"
+                    ));
+                }
+                Ok((cleave_at.clone(), restrict.clone(), *c_terminal))
+            }
+        }
+    }
+}
+
+impl EnzymeBuilder {
+    /// Check the `enzymes` list (names must be known, rules well-formed)
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(rules) = &self.enzymes {
+            if rules.is_empty() {
+                return Err("`database.enzyme.enzymes` must list at least one enzyme".into());
+            }
+            for rule in rules {
+                rule.resolve()?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for EnzymeBuilder {
@@ -39,22 +112,38 @@ impl Default for EnzymeBuilder {
             restrict: Some("P".into()),
             c_terminal: Some(true),
             semi_enzymatic: Some(false),
+            enzymes: None,
         }
     }
 }
 
 impl From<EnzymeBuilder> for EnzymeParameters {
     fn from(en: EnzymeBuilder) -> EnzymeParameters {
+        let semi_enzymatic = en.semi_enzymatic.unwrap_or(false);
+        let enzyme = match &en.enzymes {
+            Some(rules) => Enzyme::combine(
+                rules
+                    .iter()
+                    .map(|rule| {
+                        let (cleave, restrict, c_terminal) =
+                            rule.resolve().unwrap_or_else(|e| panic!("{e}"));
+                        Enzyme::new(&cleave, &restrict, c_terminal, semi_enzymatic)
+                            .expect("enzyme rules always cleave")
+                    })
+                    .collect(),
+            ),
+            None => Enzyme::new(
+                &en.cleave_at.unwrap_or_else(|| "KR".into()),
+                &en.restrict.unwrap_or_else(|| "".into()),
+                en.c_terminal.unwrap_or(true),
+                semi_enzymatic,
+            ),
+        };
         EnzymeParameters {
             missed_cleavages: en.missed_cleavages.unwrap_or(1),
             min_len: en.min_len.unwrap_or(5),
             max_len: en.max_len.unwrap_or(50),
-            enzyme: Enzyme::new(
-                &en.cleave_at.unwrap_or_else(|| "KR".into()),
-                &en.restrict.unwrap_or_else(|| "".into()),
-                en.c_terminal.unwrap_or(true),
-                en.semi_enzymatic.unwrap_or(false),
-            ),
+            enzyme,
         }
     }
 }

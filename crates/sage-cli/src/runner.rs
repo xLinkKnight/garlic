@@ -26,6 +26,8 @@ use report_builder::{
     Report, ReportSection,
 };
 
+mod crosslink_runner;
+
 pub struct Runner {
     pub database: IndexedDatabase,
     pub parameters: Search,
@@ -495,6 +497,9 @@ impl Runner {
     }
 
     pub fn run(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
+        if self.parameters.crosslink.is_some() {
+            return self.run_crosslink(parallel, parquet);
+        }
         let scorer = Scorer {
             db: &self.database,
             precursor_tol: self.parameters.precursor_tol,
