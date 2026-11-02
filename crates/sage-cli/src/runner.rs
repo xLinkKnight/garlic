@@ -26,6 +26,8 @@ use report_builder::{
     Report, ReportSection,
 };
 
+mod crosslink_export;
+mod crosslink_mzid;
 mod crosslink_runner;
 
 pub struct Runner {
@@ -497,9 +499,44 @@ impl Runner {
     }
 
     pub fn run(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
-        if self.parameters.crosslink.is_some() {
+        if let Some(crosslink) = &self.parameters.crosslink {
+            if crosslink.linear_search {
+                info!("linear peptide search (results.sage.tsv), then the crosslink search");
+                self.run_linear(parallel, parquet)?;
+                // the crosslink search counts the same spectra again
+                self.spectra_searched.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
             return self.run_crosslink(parallel, parquet);
         }
+        self.run_linear(parallel, parquet)?;
+
+        let path = self.make_path("results.json");
+        println!("{}", serde_json::to_string_pretty(&self.parameters)?);
+
+        let bytes = serde_json::to_vec_pretty(&self.parameters)?;
+        sage_cloudpath::write_bytes_sync(&path, bytes)?;
+        self.parameters.output_paths.push(path);
+
+        let run_time = (Instant::now() - self.start).as_secs();
+        info!("finished in {}s", run_time);
+        info!("cite: \"Sage: An Open-Source Tool for Fast Proteomics Searching and Quantification at Scale\" https://doi.org/10.1021/acs.jproteome.3c00486");
+
+        let telemetry = telemetry::Telemetry::new(
+            self.parameters,
+            self.database.peptides.len(),
+            self.database.fragments.len(),
+            self.spectra_searched
+                .load(std::sync::atomic::Ordering::Relaxed),
+            parquet,
+            run_time,
+        );
+
+        Ok(telemetry)
+    }
+
+    /// Linear peptide search: scores, FDR, quantification and the
+    /// `results.sage.*` outputs (everything but `results.json`)
+    fn run_linear(&mut self, parallel: usize, parquet: bool) -> anyhow::Result<()> {
         let scorer = Scorer {
             db: &self.database,
             precursor_tol: self.parameters.precursor_tol,
@@ -673,29 +710,7 @@ impl Runner {
                 &filenames,
             )?);
         }
-
-        let path = self.make_path("results.json");
-        println!("{}", serde_json::to_string_pretty(&self.parameters)?);
-
-        let bytes = serde_json::to_vec_pretty(&self.parameters)?;
-        sage_cloudpath::write_bytes_sync(&path, bytes)?;
-        self.parameters.output_paths.push(path);
-
-        let run_time = (Instant::now() - self.start).as_secs();
-        info!("finished in {}s", run_time);
-        info!("cite: \"Sage: An Open-Source Tool for Fast Proteomics Searching and Quantification at Scale\" https://doi.org/10.1021/acs.jproteome.3c00486");
-
-        let telemetry = telemetry::Telemetry::new(
-            self.parameters,
-            self.database.peptides.len(),
-            self.database.fragments.len(),
-            self.spectra_searched
-                .load(std::sync::atomic::Ordering::Relaxed),
-            parquet,
-            run_time,
-        );
-
-        Ok(telemetry)
+        Ok(())
     }
     pub fn serialize_feature(&self, feature: &Feature, filenames: &[String]) -> csv::ByteRecord {
         let mut record = csv::ByteRecord::new();

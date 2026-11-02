@@ -4,8 +4,8 @@ Sage can search for chemically crosslinked peptides. Add a `crosslink` block to
 the usual JSON configuration to enable it; omit it and Sage behaves exactly as
 before. Two strategies are used, chosen by the reagent:
 
-* **MS-cleavable** reagents (**DSSO**, **DSBU**): `"crosslink": {"reagent": "dsso"}`.
-  Recommended for proteome-scale work - see [Cleavable linkers](#ms-cleavable-linkers-dsso-dsbu).
+* **MS-cleavable** reagents (**DSSO**, **DSBU**, **cliXlink**): `"crosslink": {"reagent": "dsso"}`.
+  Recommended for proteome-scale work - see [Cleavable linkers](#ms-cleavable-linkers-dsso-dsbu-clixlink).
 * **Non-cleavable** reagents (DSS, BS3, DSG, BS2G, custom): the default.
 * **Zero-length / heterobifunctional** reagents (**EDC**, **DMTMM**, custom
   `site1`/`site2`): ends that react with different groups - see
@@ -30,11 +30,13 @@ before. Two strategies are used, chosen by the reagent:
 
 | key | default | meaning |
 |---|---|---|
-| `reagent` | none | preset: `dss`, `bs3`, `dsg`, `bs2g`, `dsso`, `dsbu`, `edc`, `dmtmm`. Sets the linker mass (and stub masses for cleavable reagents, sites for EDC/DMTMM) |
+| `reagent` | none | preset: `dss`, `bs3`, `dsg`, `bs2g`, `dsso`, `dsbu`, `clixlink`, `edc`, `dmtmm`. Sets the linker mass (and stub masses for cleavable reagents, sites for EDC/DMTMM) |
 | `mass` | `138.06808` | custom reagents only (not with `reagent`): mass added to the *pair* of peptides; may be negative down to -20 for zero-length couplings (-18.010565) |
-| `cleavable` | none | custom MS-cleavable reagents only: `{"short": .., "long": .., "alt": [..]}`; `short + long` must equal `mass` |
+| `cleavable` | none | MS-cleavable stub masses: `{"short": .., "long": .., "alt": [..]}`; `short + long` must equal the linker mass. An asymmetric linker adds its second arm as `"other": {"short": .., "long": .., "alt": [..]}`; then each arm's short stub + the other arm's long stub must equal the linker mass. Required for custom cleavable reagents; with a cleavable preset it replaces the preset stubs |
 | `backend` | `"cpu"` | non-cleavable search algorithm / hardware: `cpu`, `reflect`, `gpu`, `auto` - see [Choosing a backend](#choosing-a-backend) |
 | `chain_survivors` | `20000` | `reflect`/`gpu` only: peptides kept per spectrum after the per-chain filter (best by chain score) |
+| `min_linked_peaks` | `2` | non-cleavable only: matched fragment ions that carry the linker (contain the link site; loop-links: both sites) required on *each* chain, reported as `linked_a` / `linked_b`. They are the only direct evidence of the link; without them a correct peptide with any modification of about the linker's mass passes as a loop-link, and a strong peptide with a barely matched partner as a crosslink. `0` turns the check off |
+| `linear_search` | `false` | also run an ordinary linear peptide search first, written to `results.sage.tsv` (plus the usual LFQ/TMT tables, `.pin` and HTML report when enabled). It uses the crosslink search's database settings, e.g. `peptide_min_mass` 350 Da |
 | `require_complete_doublets` | `false` | cleavable only: require both stub peaks of *both* peptides (default: both of one, at least one of the other) |
 | `residues` | `"K"` | residues the linker reacts with (e.g. `"KST"`) |
 | `protein_nterm` | `true` | allow linking the protein N-terminal amine |
@@ -44,7 +46,12 @@ before. Two strategies are used, chosen by the reagent:
 | `candidates` | `30` | linear "seed" peptides per spectrum used to find partners |
 | `min_chain_peaks` | `3` | minimum matched fragments required on *each* peptide |
 
-Output: `crosslinks.sage.tsv` (+ `results.json`). Run as normal: `sage config.json`.
+Output: `crosslinks.sage.tsv` (+ `results.json`): every candidate match, one per
+spectrum, targets and decoys, with their q-values (decoys are needed to estimate
+the FDR, and for viewers that filter themselves). `crosslinks_FDRfiltered.sage.tsv`
+has the same columns but only the accepted results: target-target matches with
+`spectrum_q` <= 0.01 (the CSM count reported in the log). With `"linear_search": true` there is also
+`results.sage.tsv` from a linear peptide search of the same spectra. Run as normal: `sage config.json`.
 
 ## Required database settings
 
@@ -94,7 +101,7 @@ hypothetical amine-to-sulfhydryl linker:
 Explicit `site1`/`site2` may also be combined with `"reagent": "edc"` to narrow
 or extend its chemistry (e.g. `"site1": "KST["`).
 
-## MS-cleavable linkers (DSSO, DSBU)
+## MS-cleavable linkers (DSSO, DSBU, cliXlink)
 
 ```json
 "crosslink": { "reagent": "dsso" }
@@ -106,13 +113,29 @@ reagent differ by a fixed mass, so every peptide shows up as a **doublet**:
 
 | reagent | linker | stubs | doublet spacing |
 |---|---|---|---|
-| DSSO | 158.00376 | 54.01056 (alkene), 103.99320 (thiol); also 85.98264 (sulfenic acid) | 49.98264 |
+| DSSO | 158.00376 | 54.01056 (alkene), 103.99320 (sulfenic acid); also 85.98264 (thiol) | 49.98264 |
 | DSBU | 196.08479 | 85.05276, 111.03203 | 25.97927 |
+| cliXlink | 267.05653 | arm 1: 54.01056, 103.99320; also 85.98264 / arm 2 (alkyne tag): 163.06333, 213.04596; also 195.03540 | 49.98264 (both arms) |
+
+cliXlink is **asymmetric**: its two arms are different, so a cleavage leaves one
+arm's short stub on one peptide and the *other* arm's long stub on its partner.
+Its preset is the same as
+
+```json
+"crosslink": { "mass": 267.05653, "cleavable": {
+  "short": 54.01056, "long": 103.9932, "alt": [85.98264],
+  "other": { "short": 163.06333, "long": 213.04596, "alt": [195.0354] } } }
+```
+
+and any other asymmetric linker can be described the same way. Each peptide pair
+is tried both ways round (A on arm 1 and B on arm 2, and vice versa) and the
+better-scoring orientation is kept.
 
 The search exploits this:
 
 1. Find peak pairs spaced by the doublet mass. If `a = m(A) + short`, the partner
-   peptide's doublet must sit at `M - a` and `M - a - spacing` (precursor mass `M`).
+   peptide B (mass `M - m(A) - linker`, precursor mass `M`) must show its doublet at
+   `m(B) + short` and `m(B) + long` (of the other arm, for an asymmetric linker).
 2. Both peptide masses are now known, so each is looked up directly in the
    mass-sorted peptide list with a narrow window. **No pairwise enumeration and no
    wide seed search.**
@@ -148,9 +171,11 @@ ignored for them, with a log message.
 cargo build --release -p sage-cli --features gpu
 ```
 
-This uses [wgpu](https://wgpu.rs), so it runs on Vulkan (Linux/Windows), DirectX 12
-(Windows) and Metal (macOS) with NVIDIA, AMD, Intel or Apple GPUs; there is no CUDA
-dependency. It needs Rust 1.87 or newer. Without `--features gpu`, `"backend":
+This uses [wgpu](https://wgpu.rs), so it runs on DirectX 12 (Windows), Vulkan
+(Linux) and Metal (macOS) with NVIDIA, AMD, Intel or Apple GPUs; there is no CUDA
+dependency. Windows uses DirectX 12 only: some Windows Vulkan drivers (Intel UHD
+31.0.101.2145) crash when a device is opened. `sage --gpu-info` lists the adapters
+a build can use. It needs Rust 1.87 or newer. Without `--features gpu`, `"backend":
 "gpu"` is an error and `"auto"` falls back to `cpu`.
 
 The peptide ion table is uploaded once and stays resident; for a human proteome at
@@ -160,19 +185,21 @@ into chunks automatically.
 
 ### Checking the GPU on your machine
 
-The GPU kernel is tested against the CPU reference. Run this on the machine with
-the GPU; it prints the adapter it used and fails if any survivor differs
-(peptide set, link site, matched ions, or score beyond 1e-3):
+The GPU kernel is tested against the CPU reference on every adapter of the machine
+(hardware and software). Run this on the machine with the GPU; it prints each
+adapter and fails if any survivor differs (peptide set, link site, matched ions, or
+score beyond 1e-3), including for peaks placed exactly on tolerance-window edges:
 
 ```
 cargo test -p sage-core --features gpu gpu_kernel -- --nocapture
 ```
 
-Real GPUs may round f32 differently from the CPU (fused multiply-add, `log`), so a
-borderline peak can in principle flip; if the test fails on your hardware, please
-report the adapter name and the failing message. The final scores are always
-recomputed exactly on the CPU, so such a flip can only change *which candidates*
-reach the exact rescoring, not a reported score.
+Window edges are computed so that every device rounds them identically: charges
+enter as reciprocals rounded once on the CPU (GPU division is not correctly
+rounded), and edges are `center * (1 + rel) + abs`, which a fused multiply-add
+cannot change (`abs` is 0 for ppm, the factor is 1 for Da). Only the survivor
+score passes through the GPU's `log`, hence the 1e-3 allowance. The final scores
+are always recomputed exactly on the CPU.
 
 ### How chain reflection works
 
@@ -219,6 +246,83 @@ peptides, but raise `chain_survivors` if you suspect misses.
 `link_a` / `link_b` are 1-based residue positions *within* `peptide_a` /
 `peptide_b`. For a loop-link, both are positions on `peptide_a`. `label` is 1 for
 target-target, -1 otherwise; `class` is `TT`/`TD`/`DD` (loop-links: `TT`/`DD`).
+`matched_a` / `matched_b` count all matched fragment ions of each peptide;
+`linked_a` / `linked_b` count those that carry the linker (non-cleavable linkers
+only, see `min_linked_peaks`).
+
+## Files for xiVIEW, ProXL and PRIDE
+
+Every crosslink search also writes three files for viewers and repositories, next
+to `crosslinks.sage.tsv`:
+
+* **`crosslinks.mzid`**: the standard format, mzIdentML 1.3.0 following the PSI
+  [crosslinking extension 1.0.0](https://github.com/HUPO-PSI/mzIdentML). This is
+  what the current xiVIEW takes (including a local installation, whose loader
+  reads mzIdentML only) and what PRIDE expects for crosslinking submissions.
+  * Each crosslinked species is a donor/acceptor pair of `<Peptide>`s; the donor
+    carries the linker mass and the reagent term (XLMOD; UNIMOD `Xlink:EDC` for
+    EDC), the acceptor a zero mass. The donor is the end that reacts with the
+    first site (EDC: the amine), otherwise the longer peptide.
+  * A crosslink-spectrum match is two `<SpectrumIdentificationItem>`s sharing
+    "crosslink spectrum identification item"; loop-links are included as
+    "looplink spectrum identification item" on a peptide with both ends.
+  * All matches and decoys are included (`isDecoy`), `passThreshold` is set at
+    crosslink q ≤ 0.01. Scores: `PSM-level q-value` (MS:1002354), and
+    `Sage:crosslink q-value`, `Sage:hyperscore`, `Sage:delta next` as user
+    parameters (PSI-MS has no Sage score terms).
+  * Cleavable linkers carry "crosslinker cleavage characteristics" for their
+    stubs (DSSO: `A:54.01056:ST`, `S:103.9932:A`, `T:85.98264:A`, as in the
+    specification).
+  * Fragment and precursor tolerances are written symmetric (the wider side):
+    xiVIEW rejects unequal plus and minus values.
+  * Modifications named `UNIMOD:n` for common entries get their UNIMOD term;
+    others are "unknown modification" with the name or mass.
+  * Spectra are referenced as in the table below (xiVIEW column); upload the
+    mzML/MGF files and the FASTA with it. It is not written when there are no
+    matches (mzIdentML needs at least one identification).
+* **`crosslinks_xiView.csv`** for [xiVIEW](https://github.com/colin-combe/CLMS-UI),
+  in the CSV layout its importer reads (`PepSeq1`, `PepPos1`, `LinkPos1`,
+  `Protein1`, `Decoy1`, ... `PeakListFileName`, `ScanId`). Upload it with the
+  FASTA (and, to see annotated spectra, the mzML files: `ScanId` is the mzML
+  spectrum id). All matches are included; decoys are flagged in `Decoy1`/`Decoy2`
+  and `PassThreshold` is `True` at crosslink q ≤ 0.01. Modifications follow their
+  residue as a mass, e.g. `M(15.9949)`. Loop-links are left out: the CSV format
+  cannot describe them (the log says how many).
+* **`crosslinks_proXL.xml`** for [ProXL](https://proxl-ms.org/), valid against the
+  ProXL XML schema. It holds rank-1 target-target crosslinks and loop-links grouped
+  into reported peptides, with Sage's `crosslink q-value`, `PSM q-value`,
+  `hyperscore` and `delta next` as filterable annotations (default filter:
+  crosslink q-value ≤ 0.01), the linker (mass, cleaved stub masses, reactive
+  ends), static and variable modifications, and the matched protein sequences.
+  Upload it with the same FASTA and mzML files. It is not written when there are
+  no target matches (ProXL rejects an empty file). The linker is named after the
+  reagent (`dss`, `bs3`, `dsg`, `bs2g`, `dsso`, `dsbu`, `clixlink`, `edc`, `dmtmm`; a custom
+  mass is `custom`) and always carries its mass and reactive ends.
+
+Peptide positions in proteins come from the FASTA; a decoy peptide is placed
+where its target peptide is.
+
+### Viewing spectra alongside the crosslinks
+
+Both viewers read the spectra from the files you searched; upload them together
+with the export and the FASTA, **under the names written in the export**:
+
+| Searched file | xiVIEW (`PeakListFileName`, `ScanId`) | ProXL (`scan_file_name`, `scan_number`) |
+|---|---|---|
+| `run.mzML` | `run.mzML`, the mzML spectrum id | `run.mzML`, the scan number (below) |
+| `run.mzML.gz` | `run.mzML` (xiVIEW also accepts the `.gz`) | `run.mzML`: upload it **uncompressed** |
+| `run.mgf` | `run.mgf`, `index=N` (position in the file) | none: ProXL does not read MGF |
+| Bruker `.d` | neither viewer reads `.d`; convert to mzML for spectra | none |
+
+ProXL numbers mzML scans like its reader (JRAP): the number after `scan=` (Thermo
+ids) or `scanId=`, or the id itself if it is a number, otherwise the spectrum's
+position in the file + 1. Where the ids alone are not enough (MGF; mzML ids such
+as `spectrum=2442`), Sage reads the spectrum positions from the file again after
+the search.
+
+These references were checked against the viewers' own readers: pyteomics
+`get_by_id` / MGF index lookup as xiVIEW's importer uses them, and JRAP's scan
+numbering from ProXL's importer.
 
 ## Quantification
 

@@ -118,6 +118,59 @@ pub fn read_mgf(url: &Url, file_id: usize) -> Result<Vec<RawSpectrum>, Error> {
     })
 }
 
+/// Position (0-based) of every spectrum in a spectrum file, by the id Sage gives
+/// it: the mzML `spectrum` `id` → its `index` attribute, or the MGF `TITLE` →
+/// its order in the file. Viewers such as xiVIEW (MGF `index=N`) and ProXL
+/// (mzML scan numbers without `scan=`) locate spectra by position.
+pub fn read_spectrum_positions(url: &Url) -> Result<std::collections::HashMap<String, usize>, Error> {
+    use quick_xml::events::Event;
+    use tokio::io::AsyncBufReadExt;
+    let lower = url.path().to_ascii_lowercase();
+    let mgf = lower.ends_with(".mgf") || lower.ends_with(".mgf.gz");
+    read_and_execute(url, |reader| async move {
+        let mut positions = std::collections::HashMap::new();
+        if mgf {
+            let mut lines = reader.lines();
+            let mut order = 0usize;
+            let mut in_spectrum = false;
+            while let Some(line) = lines.next_line().await? {
+                let line = line.trim();
+                if line == "BEGIN IONS" {
+                    in_spectrum = true;
+                } else if line == "END IONS" {
+                    in_spectrum = false;
+                    order += 1;
+                } else if let Some(title) = line.strip_prefix("TITLE=").filter(|_| in_spectrum) {
+                    positions.entry(title.to_string()).or_insert(order);
+                }
+            }
+            return Ok(positions);
+        }
+        let mut xml = quick_xml::Reader::from_reader(reader);
+        let mut buf = Vec::new();
+        loop {
+            match xml.read_event_into_async(&mut buf).await {
+                Ok(Event::Start(ref ev)) | Ok(Event::Empty(ref ev)) if ev.name().into_inner() == b"spectrum" => {
+                    let attr = |key: &[u8]| {
+                        ev.try_get_attribute(key)
+                            .ok()
+                            .flatten()
+                            .and_then(|a| String::from_utf8(a.value.into_owned()).ok())
+                    };
+                    if let (Some(id), Some(index)) = (attr(b"id"), attr(b"index").and_then(|i| i.parse().ok())) {
+                        positions.insert(id, index);
+                    }
+                }
+                Ok(Event::Eof) => break,
+                Err(e) => return Err(Error::MzML(crate::mzml::MzMLError::XMLError(e))),
+                _ => {}
+            }
+            buf.clear();
+        }
+        Ok(positions)
+    })
+}
+
 pub fn read_fasta<S>(
     url: &Url,
     decoy_tag: S,
@@ -171,6 +224,25 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn spectrum_positions_by_id() {
+        let mzml = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/LQSRPAAPPAPGPGQLTLR.mzML");
+        let url = crate::to_url(mzml.to_str().unwrap()).unwrap();
+        let positions = read_spectrum_positions(&url).unwrap();
+        assert_eq!(positions.get("controllerType=0 controllerNumber=1 scan=30069"), Some(&0));
+
+        // MGF: titles in file order, also gzipped
+        let dir = std::env::temp_dir().join(format!("sage-positions-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgf = "BEGIN IONS\nTITLE=first\nPEPMASS=500\n100 1\nEND IONS\n\
+                   BEGIN IONS\nTITLE=second spectrum\nPEPMASS=600\n100 1\nEND IONS\n";
+        let plain = dir.join("x.mgf");
+        std::fs::write(&plain, mgf).unwrap();
+        let p = read_spectrum_positions(&crate::to_url(plain.to_str().unwrap()).unwrap()).unwrap();
+        assert_eq!((p["first"], p["second spectrum"]), (0, 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_identify_format() {

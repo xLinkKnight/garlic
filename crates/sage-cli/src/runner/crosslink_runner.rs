@@ -20,6 +20,11 @@ use std::time::Instant;
 
 /// Isobaric reporter intensities of one MS2 spectrum: (ion injection time,
 /// reporter intensities), keyed by (file id, MS2 spectrum id)
+/// CSM-level q-value cutoff of the filtered report
+const FDR_CUTOFF: f32 = 0.01;
+/// Target-target CSMs that pass [`FDR_CUTOFF`], same columns as `crosslinks.sage.tsv`
+const FDR_FILTERED: &str = "crosslinks_FDRfiltered.sage.tsv";
+
 type Reporters = HashMap<(usize, String), (f32, Vec<f32>)>;
 
 impl Runner {
@@ -129,8 +134,19 @@ impl Runner {
             })
             .collect::<Vec<_>>();
 
-        let path = self.write_crosslinks(&matches, &filenames, tmt.as_ref().map(|_| &reporters))?;
+        let reporters_out = tmt.as_ref().map(|_| &reporters);
+        let path = self.write_crosslinks("crosslinks.sage.tsv", &matches, &filenames, reporters_out)?;
         self.parameters.output_paths.push(path);
+        // Only the accepted results: target-target CSMs at 1% FDR
+        let accepted = matches
+            .iter()
+            .filter(|m| m.class == PairClass::TT && m.spectrum_q <= FDR_CUTOFF)
+            .cloned()
+            .collect::<Vec<_>>();
+        let path = self.write_crosslinks(FDR_FILTERED, &accepted, &filenames, reporters_out)?;
+        info!("wrote {} ({} target crosslink-spectrum matches at 1% FDR)", FDR_FILTERED, accepted.len());
+        self.parameters.output_paths.push(path);
+        self.write_viewer_exports(&matches, &settings, &filenames)?;
         if tmt.is_some() {
             let quantified = matches
                 .iter()
@@ -176,11 +192,12 @@ impl Runner {
 
     fn write_crosslinks(
         &self,
+        name: &str,
         matches: &[CrosslinkMatch],
         filenames: &[String],
         reporters: Option<&Reporters>,
     ) -> anyhow::Result<sage_cloudpath::Url> {
-        let path = self.make_path("crosslinks.sage.tsv");
+        let path = self.make_path(name);
         let db = &self.database;
 
         let mut wtr = csv::WriterBuilder::new()
@@ -216,6 +233,8 @@ impl Runner {
             "score_b",
             "matched_a",
             "matched_b",
+            "linked_a",
+            "linked_b",
             "delta_next",
             "pairs_scored",
             "stub_peaks",
@@ -275,6 +294,8 @@ impl Runner {
                 m.beta_score.to_string(),
                 m.alpha_matched.to_string(),
                 m.beta_matched.to_string(),
+                m.alpha_linked.to_string(),
+                m.beta_linked.to_string(),
                 m.delta_next.to_string(),
                 m.pairs_scored.to_string(),
                 m.stub_peaks.to_string(),
@@ -299,6 +320,111 @@ impl Runner {
         let bytes = wtr.into_inner()?;
         sage_cloudpath::write_bytes_sync(&path, bytes)?;
         Ok(path)
+    }
+
+    /// `crosslinks_xiView.csv` and `crosslinks_proXL.xml` for the xiVIEW and
+    /// ProXL viewers (see `crosslink_export`)
+    fn write_viewer_exports(
+        &mut self,
+        matches: &[CrosslinkMatch],
+        settings: &sage_core::crosslink::CrosslinkSettings,
+        filenames: &[String],
+    ) -> anyhow::Result<()> {
+        use super::crosslink_export::{proxl_xml, xiview_csv, ExportContext, SpectrumFile};
+        // Protein sequences locate each peptide in its protein
+        let fasta_url = sage_cloudpath::to_url(&self.parameters.database.fasta)?;
+        let fasta = sage_cloudpath::util::read_fasta(
+            &fasta_url,
+            &self.parameters.database.decoy_tag,
+            self.parameters.database.generate_decoys,
+        )?;
+        let wanted: std::collections::HashSet<&str> = matches
+            .iter()
+            .flat_map(|m| std::iter::once(m.alpha).chain(m.beta))
+            .flat_map(|ix| self.database[ix].proteins.iter().map(|p| p.as_ref()))
+            .collect();
+        let proteins: HashMap<String, String> = fasta
+            .targets
+            .iter()
+            .filter(|(acc, _)| wanted.contains(acc.as_ref()))
+            .map(|(acc, seq)| (acc.to_string(), seq.clone()))
+            .collect();
+        let fasta_name = sage_cloudpath::filename(&fasta_url)
+            .unwrap_or(&self.parameters.database.fasta)
+            .to_string();
+
+        // How the viewers find each match's spectrum; spectrum positions are
+        // read again only where ids alone are not enough (MGF, mzML without scan=)
+        let files: Vec<SpectrumFile> = filenames
+            .iter()
+            .enumerate()
+            .map(|(file_id, name)| {
+                let mut file = SpectrumFile::from_name(name);
+                let ids = matches.iter().filter(|m| m.file_id == file_id).map(|m| m.spec_id.as_str());
+                if file.needs_positions(ids) {
+                    match self
+                        .parameters
+                        .mzml_paths
+                        .get(file_id)
+                        .ok_or_else(|| anyhow::anyhow!("no path"))
+                        .and_then(|url| Ok(sage_cloudpath::util::read_spectrum_positions(url)?))
+                    {
+                        Ok(positions) => file.positions = Some(positions),
+                        Err(e) => log::warn!(
+                            "could not read spectrum positions of {name} ({e}): xiVIEW/ProXL may not find its spectra"
+                        ),
+                    }
+                }
+                file
+            })
+            .collect();
+        let ctx = ExportContext {
+            db: &self.database,
+            settings,
+            files: &files,
+            proteins: &proteins,
+            fasta_name: &fasta_name,
+            fragment_tol: self.parameters.fragment_tol,
+            ion_kinds: &self.database.ion_kinds,
+            static_mods: &self.parameters.database.modifications.static_mods,
+            variable_mods: &self.parameters.database.modifications.variable_mods,
+            precursor_tol: self.parameters.precursor_tol,
+            version: &self.parameters.version,
+        };
+
+        let (csv, loops) = xiview_csv(&ctx, matches)?;
+        let path = self.make_path("crosslinks_xiView.csv");
+        sage_cloudpath::write_bytes_sync(&path, csv)?;
+        if loops > 0 {
+            info!("{} loop-link matches are not in crosslinks_xiView.csv: xiVIEW's CSV format cannot describe them", loops);
+        }
+        let mut written = vec![path];
+
+        match proxl_xml(&ctx, matches) {
+            Some(xml) => {
+                let path = self.make_path("crosslinks_proXL.xml");
+                sage_cloudpath::write_bytes_sync(&path, xml.into_bytes())?;
+                written.push(path);
+            }
+            None => log::warn!("no target crosslink matches: crosslinks_proXL.xml was not written (ProXL needs at least one)"),
+        }
+
+        // mzIdentML 1.3.0 for xiVIEW (also a local installation) and PRIDE
+        match super::crosslink_mzid::mzid_xml(&ctx, matches) {
+            Some(xml) => {
+                let path = self.make_path("crosslinks.mzid");
+                sage_cloudpath::write_bytes_sync(&path, xml.into_bytes())?;
+                written.push(path);
+            }
+            None => log::warn!("no crosslink matches: crosslinks.mzid was not written (mzIdentML needs at least one)"),
+        }
+        let names = written
+            .iter()
+            .filter_map(|p| sage_cloudpath::filename(p).map(String::from))
+            .collect::<Vec<_>>();
+        info!("wrote {} for crosslink viewers", names.join(" and "));
+        self.parameters.output_paths.extend(written);
+        Ok(())
     }
 
     /// `crosslinks.lfq.tsv`: MS1 intensities of each quantified (target)

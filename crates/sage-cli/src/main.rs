@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
         .about("\u{1F52E} Sage \u{1F9D9} - Proteomics searching so fast it feels like magic!")
         .arg(
             Arg::new("parameters")
-                .required(true)
+                .required_unless_present("gpu-info")
                 .value_parser(clap::builder::NonEmptyStringValueParser::new())
                 .help("Path to configuration parameters (JSON file)")
                 .value_hint(ValueHint::FilePath),
@@ -90,6 +90,19 @@ fn main() -> anyhow::Result<()> {
                 .help("Disable sending telemetry data"),
         )
         .arg(
+            Arg::new("threads")
+                .long("threads")
+                .value_parser(value_parser!(u16).range(1..))
+                .help("Maximum number of CPU threads to use (default = all logical CPUs)")
+                .value_hint(ValueHint::Other),
+        )
+        .arg(
+            Arg::new("gpu-info")
+                .long("gpu-info")
+                .action(clap::ArgAction::SetTrue)
+                .help("Report whether this build can use a GPU, list the adapters it sees, and exit"),
+        )
+        .arg(
             Arg::new("stack-size")
                 .long("stack-size")
                 .value_parser(value_parser!(u32).range(1..))
@@ -104,21 +117,32 @@ fn main() -> anyhow::Result<()> {
         )
         .get_matches();
 
+    if matches.get_flag("gpu-info") {
+        gpu_info();
+        return Ok(());
+    }
+
     let stack_size_mib = matches.get_one::<u32>("stack-size").copied().unwrap_or(2);
     let stack_size_bytes = stack_size_mib as usize * 1024 * 1024;
     log::trace!(
         "setting Rayon worker thread stack size to {} MiB",
         stack_size_mib
     );
+    let threads = matches
+        .get_one::<u16>("threads")
+        .map(|&n| n as usize)
+        .unwrap_or_else(num_cpus::get);
+    log::info!("using {} CPU thread(s)", threads);
     ThreadPoolBuilder::new()
         .stack_size(stack_size_bytes)
+        .num_threads(threads)
         .build_global()
         .expect("configure Rayon pool");
 
     let parallel = matches
         .get_one::<u16>("batch-size")
-        .copied()
-        .unwrap_or_else(|| num_cpus::get() as u16 / 2) as usize;
+        .map(|&n| n as usize)
+        .unwrap_or_else(|| (threads / 2).max(1));
 
     let parquet = matches.get_one::<bool>("parquet").copied().unwrap_or(false);
     let send_telemetry = matches
@@ -139,4 +163,17 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// `--gpu-info`: one `key: value` line per fact, for people and for sage-gui
+fn gpu_info() {
+    #[cfg(feature = "gpu")]
+    {
+        println!("gpu-support: yes");
+        for adapter in sage_core::crosslink_gpu::adapters() {
+            println!("gpu-adapter: {adapter}");
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    println!("gpu-support: no (rebuild with `cargo build --release --features gpu`)");
 }

@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,6 +18,8 @@ pub struct Step {
     pub args: Vec<OsString>,
     /// Skip the step when this file already exists (converted RAW files)
     pub skip_if_exists: Option<PathBuf>,
+    /// Cap on the program's memory in bytes (see [`crate::system::MemoryCap`])
+    pub memory_limit: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -29,7 +31,10 @@ pub enum Status {
 }
 
 pub struct Job {
+    /// The latest output lines (older ones are dropped beyond `MAX_LOG_LINES`)
     pub log: Arc<Mutex<Vec<String>>>,
+    /// Lines ever written to `log`, so readers can tell which ones are new
+    pub total: Arc<AtomicUsize>,
     pub status: Arc<Mutex<Status>>,
     cancel: Arc<AtomicBool>,
 }
@@ -38,15 +43,17 @@ impl Job {
     pub fn start(steps: Vec<Step>, ctx: eframe::egui::Context) -> Job {
         let job = Job {
             log: Arc::new(Mutex::new(Vec::new())),
+            total: Arc::new(AtomicUsize::new(0)),
             status: Arc::new(Mutex::new(Status::Running("starting".into()))),
             cancel: Arc::new(AtomicBool::new(false)),
         };
         let log = job.log.clone();
+        let total = job.total.clone();
         let status = job.status.clone();
         let cancel = job.cancel.clone();
 
         std::thread::spawn(move || {
-            let push = |line: String| push_line(&log, &ctx, line);
+            let push = |line: String| push_line(&log, &total, &ctx, line);
             let result = run_steps(&steps, &push, &status, &cancel);
             let end = match result {
                 Ok(()) => Status::Finished,
@@ -78,9 +85,10 @@ impl Job {
     }
 }
 
-fn push_line(log: &Mutex<Vec<String>>, ctx: &eframe::egui::Context, line: String) {
+fn push_line(log: &Mutex<Vec<String>>, total: &AtomicUsize, ctx: &eframe::egui::Context, line: String) {
     let mut log = log.lock().unwrap();
     log.push(line);
+    total.fetch_add(1, Ordering::Relaxed);
     if log.len() > MAX_LOG_LINES {
         let excess = log.len() - MAX_LOG_LINES;
         log.drain(..excess);
@@ -136,6 +144,28 @@ fn run_one(step: &Step, push: &(dyn Fn(String) + Sync), cancel: &AtomicBool) -> 
     let mut child: Child = cmd
         .spawn()
         .map_err(|e| format!("could not start {}: {e}", step.program.display()))?;
+    let cap = match step.memory_limit {
+        Some(limit) => match crate::system::MemoryCap::apply(&child, limit) {
+            Ok(cap) => {
+                push(format!("RAM limit: {}", crate::system::format_memory(limit)));
+                Some(cap)
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(e);
+            }
+        },
+        None => None,
+    };
+    let over_limit = |code| match &cap {
+        Some(cap) if cap.reached() => format!(
+            "{} ran out of memory: it needed more than the {} RAM limit (Files > Resources); \
+             raise the limit, or search fewer files at once",
+            step.title,
+            crate::system::format_memory(cap.limit())
+        ),
+        _ => format!("{} exited with {code}", step.title),
+    };
 
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -151,7 +181,7 @@ fn run_one(step: &Step, push: &(dyn Fn(String) + Sync), cancel: &AtomicBool) -> 
             }
             match child.try_wait() {
                 Ok(Some(code)) if code.success() => return Ok(()),
-                Ok(Some(code)) => return Err(format!("{} exited with {code}", step.title)),
+                Ok(Some(code)) => return Err(over_limit(code)),
                 Ok(None) => std::thread::sleep(Duration::from_millis(100)),
                 Err(e) => return Err(e.to_string()),
             }
@@ -251,6 +281,7 @@ pub fn conversion_step(converter: &Path, raw: &Path, out_dir: &Path) -> Step {
         program: converter.to_path_buf(),
         args,
         skip_if_exists: Some(output),
+        memory_limit: None,
     }
 }
 

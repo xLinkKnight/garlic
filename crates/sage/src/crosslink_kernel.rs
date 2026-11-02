@@ -139,12 +139,23 @@ impl From<Tolerance> for LinearTol {
 }
 
 impl LinearTol {
+    /// Window multipliers `1 + rel`, rounded once to f32
+    #[inline]
+    pub fn factors(&self) -> (f32, f32) {
+        ((1.0 + self.rel_lo as f64) as f32, (1.0 + self.rel_hi as f64) as f32)
+    }
+
+    /// `[center * (1 + rel_lo) + abs_lo, center * (1 + rel_hi) + abs_hi]`.
+    ///
+    /// Every kernel must compute window edges exactly like this so that a peak
+    /// on an edge is in or out on every device. The form is immune to fused
+    /// multiply-add, which GPU drivers apply at will: a tolerance is either
+    /// relative (`abs` = 0, so the product is rounded once either way) or
+    /// absolute (factor = 1, so the product is exact).
     #[inline]
     pub fn bounds(&self, center: f32) -> (f32, f32) {
-        (
-            center + center * self.rel_lo + self.abs_lo,
-            center + center * self.rel_hi + self.abs_hi,
-        )
+        let (lo, hi) = self.factors();
+        (center * lo + self.abs_lo, center * hi + self.abs_hi)
     }
 }
 
@@ -162,6 +173,19 @@ pub struct KernelParams {
     pub min_matched: u16,
     /// Keep at most this many survivors: the highest-scoring (ties: lowest index)
     pub max_survivors: usize,
+}
+
+impl KernelParams {
+    /// `(1/z, slack/z)` for each fragment charge `z` in `1..max_fragment_charge`.
+    ///
+    /// Rounded once here and shared by every kernel: GPU division is not
+    /// correctly rounded (WGSL allows 2.5 ulp), multiplication is.
+    pub fn charge_terms(&self) -> impl Iterator<Item = (f32, f32)> + '_ {
+        (1..self.max_fragment_charge).map(|z| {
+            let z = z as f64;
+            ((1.0 / z) as f32, (self.slack as f64 / z) as f32)
+        })
+    }
 }
 
 /// A peptide that passed the chain filter
@@ -255,15 +279,14 @@ pub fn score_peptide(
     for ion in i0..i1 {
         let mass = table.ion_mass[ion];
         let (mut un, mut ui, mut sn, mut si) = (0u32, 0f32, 0u32, 0f32);
-        for charge in 1..params.max_fragment_charge {
-            let z = charge as f32;
-            let (lo, hi) = params.fragment_tol.bounds(mass / z);
+        for (inv_z, slack_z) in params.charge_terms() {
+            let (lo, hi) = params.fragment_tol.bounds(mass * inv_z);
             if let Some(i) = best_peak(masses, intensities, lo, hi) {
                 un += 1;
                 ui += i;
             }
-            let (lo, hi) = params.fragment_tol.bounds((mass + shift) / z);
-            let (lo, hi) = (lo - params.slack / z, hi + params.slack / z);
+            let (lo, hi) = params.fragment_tol.bounds((mass + shift) * inv_z);
+            let (lo, hi) = (lo - slack_z, hi + slack_z);
             if let Some(i) = best_peak(masses, intensities, lo, hi) {
                 sn += 1;
                 si += i;

@@ -153,11 +153,12 @@ pub enum Reagent {
     Dsbu,
     Edc,
     Dmtmm,
+    Clixlink,
     Custom,
 }
 
 impl Reagent {
-    pub const ALL: [Reagent; 9] = [
+    pub const ALL: [Reagent; 10] = [
         Reagent::Dss,
         Reagent::Bs3,
         Reagent::Dsg,
@@ -166,6 +167,7 @@ impl Reagent {
         Reagent::Dsbu,
         Reagent::Edc,
         Reagent::Dmtmm,
+        Reagent::Clixlink,
         Reagent::Custom,
     ];
 
@@ -179,6 +181,7 @@ impl Reagent {
             Reagent::Dsbu => "dsbu",
             Reagent::Edc => "edc",
             Reagent::Dmtmm => "dmtmm",
+            Reagent::Clixlink => "clixlink",
             Reagent::Custom => "custom",
         }
     }
@@ -193,12 +196,45 @@ impl Reagent {
             Reagent::Dsbu => "DSBU (196.085 Da, MS-cleavable)",
             Reagent::Edc => "EDC (zero-length, -18.011 Da)",
             Reagent::Dmtmm => "DMTMM (zero-length, -18.011 Da)",
+            Reagent::Clixlink => "cliXlink (267.057 Da, MS-cleavable, asymmetric)",
             Reagent::Custom => "Custom mass",
         }
     }
 
     pub fn is_cleavable(self) -> bool {
-        matches!(self, Reagent::Dsso | Reagent::Dsbu)
+        self.stubs().is_some()
+    }
+
+    /// Linker mass of a preset (Da), as in `sage_core::crosslink::Reagent::mass`
+    pub fn mass(self) -> Option<f64> {
+        match self {
+            Reagent::Dss | Reagent::Bs3 => Some(138.06808),
+            Reagent::Dsg | Reagent::Bs2g => Some(96.02113),
+            Reagent::Dsso => Some(158.00376),
+            Reagent::Dsbu => Some(196.08479),
+            Reagent::Edc | Reagent::Dmtmm => Some(-18.010565),
+            Reagent::Clixlink => Some(267.05653),
+            Reagent::Custom => None,
+        }
+    }
+
+    /// Preset `(short, long, alt)` stub masses of an MS-cleavable reagent
+    /// (for an asymmetric one, its first arm)
+    pub fn stubs(self) -> Option<(f64, f64, &'static [f64])> {
+        match self {
+            Reagent::Dsso | Reagent::Clixlink => Some((54.01056, 103.9932, &[85.98264])),
+            Reagent::Dsbu => Some((85.05276, 111.03203, &[])),
+            _ => None,
+        }
+    }
+
+    /// Asymmetric cleavable reagents: the stubs of the second arm
+    pub fn second_arm(self) -> Option<(f64, f64, &'static [f64])> {
+        match self {
+            // the alkyne-tagged arm: alkene / sulfenic acid / thiol
+            Reagent::Clixlink => Some((163.06333, 213.04596, &[195.0354])),
+            _ => None,
+        }
     }
 
     /// Default `(site1, site2)` for reagents with two different reactive ends
@@ -270,10 +306,17 @@ pub struct Crosslink {
     pub reagent: Reagent,
     pub custom_mass: f64,
     pub custom_cleavable: bool,
+    /// Fragment (stub) masses of an MS-cleavable linker, preset or custom
     pub stub_short: f64,
     pub stub_long: f64,
     /// Extra stub masses, comma separated
     pub stub_alt: String,
+    /// Custom cleavable linkers: the two arms leave different stubs
+    pub asymmetric: bool,
+    /// Asymmetric linkers: stubs of the second arm
+    pub stub2_short: f64,
+    pub stub2_long: f64,
+    pub stub2_alt: String,
     /// Homobifunctional: residues both ends react with
     pub residues: String,
     pub protein_nterm: bool,
@@ -288,6 +331,10 @@ pub struct Crosslink {
     pub require_complete_doublets: bool,
     pub backend: Backend,
     pub chain_survivors: u32,
+    /// Also run a linear peptide search (results.sage.tsv)
+    pub linear_search: bool,
+    /// Non-cleavable: matched linker-carrying ions required per chain
+    pub min_linked_peaks: u32,
 }
 
 impl Default for Crosslink {
@@ -301,6 +348,10 @@ impl Default for Crosslink {
             stub_short: 54.01056,
             stub_long: 103.9932,
             stub_alt: String::new(),
+            asymmetric: false,
+            stub2_short: 163.06333,
+            stub2_long: 213.04596,
+            stub2_alt: String::new(),
             residues: "K".into(),
             two_sites: false,
             site1,
@@ -313,27 +364,94 @@ impl Default for Crosslink {
             require_complete_doublets: false,
             backend: Backend::Cpu,
             chain_survivors: 20000,
+            linear_search: false,
+            min_linked_peaks: 2,
         }
     }
 }
 
 impl Crosslink {
+    /// Is the selected linker MS-cleavable (a cleavable preset, or custom with stubs)?
+    pub fn is_cleavable(&self) -> bool {
+        self.reagent.is_cleavable() || (self.reagent == Reagent::Custom && self.custom_cleavable)
+    }
+
+    /// Mass the linker adds to the peptide pair (Da)
+    pub fn linker_mass(&self) -> f64 {
+        self.reagent.mass().unwrap_or(self.custom_mass)
+    }
+
+    /// Does the linker leave different stubs on its two arms?
+    pub fn has_second_arm(&self) -> bool {
+        match self.reagent {
+            Reagent::Custom => self.custom_cleavable && self.asymmetric,
+            r => r.second_arm().is_some(),
+        }
+    }
+
+    /// Load the selected preset's stub masses (no change for non-cleavable / custom)
+    pub fn reset_stubs(&mut self) {
+        let list = |alt: &[f64]| alt.iter().map(f64::to_string).collect::<Vec<_>>().join(", ");
+        if let Some((short, long, alt)) = self.reagent.stubs() {
+            self.stub_short = short;
+            self.stub_long = long;
+            self.stub_alt = list(alt);
+        }
+        if let Some((short, long, alt)) = self.reagent.second_arm() {
+            self.stub2_short = short;
+            self.stub2_long = long;
+            self.stub2_alt = list(alt);
+        }
+    }
+
+    /// Have the stub masses of a cleavable preset been changed from its defaults?
+    pub fn stubs_edited(&self) -> bool {
+        let Some(first) = self.reagent.stubs() else {
+            return false;
+        };
+        let same = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        let arm_same = |(short, long, alt): (f64, f64, &[f64]), (s, l, a): (f64, f64, &str)| {
+            same(s, short)
+                && same(l, long)
+                && parse_list(a).is_ok_and(|v| v.len() == alt.len() && v.iter().zip(alt).all(|(x, y)| same(*x, *y)))
+        };
+        let first_same = arm_same(first, (self.stub_short, self.stub_long, &self.stub_alt));
+        let second_same = self
+            .reagent
+            .second_arm()
+            .is_none_or(|second| arm_same(second, (self.stub2_short, self.stub2_long, &self.stub2_alt)));
+        !(first_same && second_same)
+    }
+
+    fn stubs_json(&self) -> Value {
+        let mut stubs = json!({
+            "short": self.stub_short,
+            "long": self.stub_long,
+            "alt": parse_list(&self.stub_alt).unwrap_or_default(),
+        });
+        if self.has_second_arm() {
+            stubs["other"] = json!({
+                "short": self.stub2_short,
+                "long": self.stub2_long,
+                "alt": parse_list(&self.stub2_alt).unwrap_or_default(),
+            });
+        }
+        stubs
+    }
+
     fn to_json(&self) -> Value {
         let mut m = Map::new();
         if self.reagent == Reagent::Custom {
             m.insert("mass".into(), json!(self.custom_mass));
             if self.custom_cleavable {
-                m.insert(
-                    "cleavable".into(),
-                    json!({
-                        "short": self.stub_short,
-                        "long": self.stub_long,
-                        "alt": parse_list(&self.stub_alt).unwrap_or_default(),
-                    }),
-                );
+                m.insert("cleavable".into(), self.stubs_json());
             }
         } else {
             m.insert("reagent".into(), json!(self.reagent.key()));
+            // Preset stubs are implied by the reagent; write them only when edited
+            if self.stubs_edited() {
+                m.insert("cleavable".into(), self.stubs_json());
+            }
         }
         if self.two_sites {
             m.insert("site1".into(), json!(self.site1.to_spec()));
@@ -352,6 +470,14 @@ impl Crosslink {
         );
         m.insert("backend".into(), json!(self.backend.key()));
         m.insert("chain_survivors".into(), json!(self.chain_survivors));
+        // only when on, so configs still run in a sage.exe without this option
+        if self.linear_search {
+            m.insert("linear_search".into(), json!(true));
+        }
+        // Sage's default (2) is left out, so configs still run in an older sage.exe
+        if self.min_linked_peaks != 2 {
+            m.insert("min_linked_peaks".into(), json!(self.min_linked_peaks));
+        }
         Value::Object(m)
     }
 
@@ -368,13 +494,23 @@ impl Crosslink {
             c.reagent = Reagent::Custom;
             c.custom_mass = mass;
         }
+        c.reset_stubs();
         if let Some(stubs) = v.get("cleavable").and_then(Value::as_object) {
-            c.custom_cleavable = true;
+            c.custom_cleavable = c.reagent == Reagent::Custom;
             c.stub_short = f64_or(stubs.get("short"), c.stub_short);
             c.stub_long = f64_or(stubs.get("long"), c.stub_long);
-            if let Some(alt) = stubs.get("alt").and_then(Value::as_array) {
-                let alt: Vec<String> = alt.iter().filter_map(Value::as_f64).map(|x| x.to_string()).collect();
-                c.stub_alt = alt.join(", ");
+            let list = |v: Option<&Value>| {
+                v.and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_f64).map(|x| x.to_string()).collect::<Vec<_>>().join(", "))
+                    .unwrap_or_default()
+            };
+            // Sage's default `alt` is empty, not the preset's
+            c.stub_alt = list(stubs.get("alt"));
+            if let Some(other) = stubs.get("other").and_then(Value::as_object) {
+                c.asymmetric = true;
+                c.stub2_short = f64_or(other.get("short"), c.stub2_short);
+                c.stub2_long = f64_or(other.get("long"), c.stub2_long);
+                c.stub2_alt = list(other.get("alt"));
             }
         }
         if let Some(r) = v.get("residues").and_then(Value::as_str) {
@@ -405,6 +541,8 @@ impl Crosslink {
             }
         }
         c.chain_survivors = u32_or(v.get("chain_survivors"), c.chain_survivors);
+        c.linear_search = bool_or(v.get("linear_search"), c.linear_search);
+        c.min_linked_peaks = u32_or(v.get("min_linked_peaks"), c.min_linked_peaks);
         c
     }
 }
@@ -1207,18 +1345,36 @@ impl Settings {
             } else if xl.residues.is_empty() || !xl.residues.chars().all(|c| VALID_AA.contains(c)) {
                 errors.push(format!("Crosslink residues must be amino acids from {VALID_AA}."));
             }
-            if xl.reagent == Reagent::Custom && xl.custom_cleavable {
-                if (xl.stub_short + xl.stub_long - xl.custom_mass).abs() > 1e-3 {
-                    errors.push("Custom cleavable linker: short + long stub must equal the linker mass.".into());
+            if xl.is_cleavable() {
+                let mut arms = vec![("", xl.stub_short, xl.stub_long, &xl.stub_alt)];
+                if xl.has_second_arm() {
+                    arms[0].0 = "arm 1 ";
+                    arms.push(("arm 2 ", xl.stub2_short, xl.stub2_long, &xl.stub2_alt));
                 }
-                if let Err(e) = parse_list(&xl.stub_alt) {
-                    errors.push(format!("Additional stub masses: {e}"));
+                for &(arm, short, long, alt) in &arms {
+                    if !(short > 0.0 && long > short) {
+                        errors.push(format!("Cleavable linker: {arm}stub masses need 0 < short < long."));
+                    }
+                    match parse_list(alt) {
+                        Err(e) => errors.push(format!("Additional {arm}stub masses: {e}")),
+                        Ok(alt) if alt.iter().any(|&m| m <= 0.0) => {
+                            errors.push(format!("Additional {arm}stub masses must be positive."))
+                        }
+                        Ok(_) => {}
+                    }
                 }
-            }
-            if xl.backend == Backend::Gpu {
-                warnings.push(
-                    "The GPU backend only works if sage.exe was built with `--features gpu`.".into(),
-                );
+                // a cleavage leaves one arm's short stub and the other arm's long stub
+                let last = arms.len() - 1;
+                for (i, &(arm, short, ..)) in arms.iter().enumerate() {
+                    let (other, _, long, _) = arms[last - i];
+                    if (short + long - xl.linker_mass()).abs() > 1e-3 {
+                        errors.push(format!(
+                            "Cleavable linker: {arm}short + {other}long stub ({:.5} Da) must equal the linker mass ({:.5} Da).",
+                            short + long,
+                            xl.linker_mass()
+                        ));
+                    }
+                }
             }
         }
 
@@ -1318,6 +1474,78 @@ mod test {
     }
 
     #[test]
+    fn preset_stub_masses_are_editable() {
+        let mut s = Settings::default();
+        s.crosslink.enabled = true;
+        s.crosslink.reagent = Reagent::Dsso;
+        s.crosslink.reset_stubs();
+        // unedited preset stubs are implied by the reagent
+        let v = s.to_json(&[]);
+        assert!(v["crosslink"].get("cleavable").is_none());
+        let back = Settings::from_json(&v).unwrap();
+        assert_eq!((back.crosslink.stub_short, back.crosslink.stub_long), (54.01056, 103.9932));
+        assert_eq!(back.crosslink.stub_alt, "85.98264");
+        assert!(!back.crosslink.stubs_edited());
+
+        // dropping the sulfenic acid stub writes an override next to the reagent
+        s.crosslink.stub_alt.clear();
+        let v = s.to_json(&[]);
+        assert_eq!(v["crosslink"]["reagent"], json!("dsso"));
+        assert_eq!(v["crosslink"]["cleavable"], json!({"short": 54.01056, "long": 103.9932, "alt": []}));
+        let back = Settings::from_json(&v).unwrap();
+        assert_eq!(back.crosslink.reagent, Reagent::Dsso);
+        assert!(back.crosslink.stub_alt.is_empty());
+        assert_eq!(back.to_json(&[]), v);
+
+        // stubs must still add up to the linker mass
+        s.crosslink.stub_long = 100.0;
+        assert!(s.check().0.iter().any(|e| e.contains("must equal the linker mass")));
+    }
+
+    #[test]
+    fn asymmetric_linkers_have_two_arms() {
+        let mut s = Settings::default();
+        s.crosslink.enabled = true;
+        s.crosslink.reagent = Reagent::Clixlink;
+        s.crosslink.reset_stubs();
+        assert!(s.crosslink.has_second_arm());
+        assert!(s.check().0.iter().all(|e| !e.contains("Cleavable")), "{:?}", s.check().0);
+        // the preset is implied by the reagent
+        let v = s.to_json(&[]);
+        assert_eq!(v["crosslink"]["reagent"], json!("clixlink"));
+        assert!(v["crosslink"].get("cleavable").is_none());
+
+        // an edited second arm writes both arms
+        s.crosslink.stub2_alt.clear();
+        let v = s.to_json(&[]);
+        assert_eq!(v["crosslink"]["cleavable"]["other"], json!({"short": 163.06333, "long": 213.04596, "alt": []}));
+        let back = Settings::from_json(&v).unwrap();
+        assert_eq!(back.crosslink.reagent, Reagent::Clixlink);
+        assert_eq!(back.crosslink.stub_alt, "85.98264");
+        assert!(back.crosslink.stub2_alt.is_empty());
+        assert_eq!(back.to_json(&[]), v);
+
+        // each arm's short stub + the other arm's long stub must make the linker
+        s.crosslink.stub2_long = 200.0;
+        assert!(s.check().0.iter().any(|e| e.contains("arm 1 short + arm 2 long")));
+
+        // custom asymmetric linkers
+        let mut s = Settings::default();
+        s.crosslink.enabled = true;
+        s.crosslink.reagent = Reagent::Custom;
+        s.crosslink.custom_mass = 267.05653;
+        s.crosslink.custom_cleavable = true;
+        s.crosslink.asymmetric = true;
+        s.crosslink.stub_short = 54.01056;
+        s.crosslink.stub_long = 103.9932;
+        let v = s.to_json(&[]);
+        assert!(v["crosslink"]["cleavable"].get("other").is_some());
+        let back = Settings::from_json(&v).unwrap();
+        assert!(back.crosslink.custom_cleavable && back.crosslink.asymmetric);
+        assert_eq!(back.to_json(&[]), v);
+    }
+
+    #[test]
     fn missing_keys_take_sage_defaults() {
         let s = Settings::from_json(&json!({"database": {"fasta": "x.fasta"}})).unwrap();
         assert_eq!(s.missed_cleavages, 0);
@@ -1341,7 +1569,11 @@ mod test {
         let mut dsso = Settings::default();
         dsso.crosslink.enabled = true;
         dsso.crosslink.reagent = Reagent::Dsso;
-        cases.push(("dsso", dsso));
+        cases.push(("dsso", dsso.clone()));
+        // edited preset stubs, wider charge range
+        dsso.crosslink.stub_alt.clear();
+        dsso.precursor_charge = (3, 6);
+        cases.push(("dsso_edited_stubs", dsso));
         let mut reflect = Settings::default();
         reflect.crosslink.enabled = true;
         reflect.crosslink.backend = Backend::Reflect;
@@ -1362,6 +1594,16 @@ mod test {
         quant.tmt = Tmt::Tmt6;
         quant.tmt_level = 2;
         cases.push(("xl_quant", quant));
+        let mut clixlink = Settings::default();
+        clixlink.crosslink.enabled = true;
+        clixlink.crosslink.reagent = Reagent::Clixlink;
+        clixlink.crosslink.reset_stubs();
+        clixlink.crosslink.stub2_alt.clear();
+        cases.push(("clixlink_edited_stubs", clixlink));
+        let mut with_linear = Settings::default();
+        with_linear.crosslink.enabled = true;
+        with_linear.crosslink.linear_search = true;
+        cases.push(("xl_with_linear", with_linear));
 
         for (name, mut s) in cases {
             let out = std::env::temp_dir().join(format!("sage-gui-test-{name}"));
@@ -1377,14 +1619,16 @@ mod test {
             std::fs::write(&config, serde_json::to_string_pretty(&s.to_json(&s.spectra)).unwrap()).unwrap();
             let run = std::process::Command::new(&sage)
                 .arg(&config)
+                .args(["--threads", "2"])
                 .arg("--disable-telemetry-i-dont-want-to-improve-sage")
                 .output()
                 .unwrap();
             assert!(run.status.success(), "{name}: {}", String::from_utf8_lossy(&run.stderr));
             let results = if s.crosslink.enabled { "crosslinks.sage.tsv" } else { "results.sage.tsv" };
             let tsv = std::fs::read_to_string(out.join(results)).unwrap();
-            if name == "linear" {
-                assert!(tsv.contains("LQSRPAAPPAPGPGQLTLR"), "linear search should identify the peptide");
+            if name == "linear" || name == "xl_with_linear" {
+                let linear = std::fs::read_to_string(out.join("results.sage.tsv")).unwrap();
+                assert!(linear.contains("LQSRPAAPPAPGPGQLTLR"), "{name}: linear search should identify the peptide");
             }
             if name == "xl_quant" {
                 // reporter columns on every crosslink match, and an LFQ table

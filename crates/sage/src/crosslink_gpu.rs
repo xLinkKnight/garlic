@@ -1,7 +1,7 @@
 //! GPU implementation of the chain-scoring kernel (see `crosslink_kernel`).
 //!
-//! Built with `--features gpu`; uses `wgpu`, so the same code runs on Vulkan
-//! (Linux/Windows/Android), DirectX 12 (Windows) and Metal (macOS).
+//! Built with `--features gpu`; uses `wgpu`, so the same code runs on DirectX 12
+//! (Windows), Vulkan (Linux/Android) and Metal (macOS).
 //!
 //! One GPU thread scores one peptide, exactly as
 //! [`crate::crosslink_kernel::score_peptide`] does on the CPU. The ion table is
@@ -32,13 +32,16 @@ struct Params {
     pad0: u32,
     pad1: u32,
     precursor_mass: f32,
-    slack: f32,
-    rel_lo: f32,
-    rel_hi: f32,
+    pad2: f32,
+    // 1 + rel of the fragment tolerance (LinearTol::factors)
+    lo_factor: f32,
+    hi_factor: f32,
     abs_lo: f32,
     abs_hi: f32,
-    pad2: f32,
     pad3: f32,
+    pad4: f32,
+    // per fragment charge z = 1, 2, ...: x = 1/z, y = slack/z (KernelParams::charge_terms)
+    charges: array<vec4<f32>, 32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -117,19 +120,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         var ui = 0.0;
         var sn = 0u;
         var si = 0.0;
+        // Window edges exactly as LinearTol::bounds computes them, so that a
+        // peak on an edge is in or out on every device (see its docs)
         for (var c = 1u; c < params.max_charge; c = c + 1u) {
-            let z = f32(c);
-            let t = mass / z;
-            let lo = t + t * params.rel_lo + params.abs_lo;
-            let hi = t + t * params.rel_hi + params.abs_hi;
+            let k = params.charges[c - 1u];
+            let t = mass * k.x;
+            let lo = t * params.lo_factor + params.abs_lo;
+            let hi = t * params.hi_factor + params.abs_hi;
             let a = best_peak(lo, hi);
             if (a >= 0.0) {
                 un = un + 1u;
                 ui = ui + a;
             }
-            let ts = (mass + shift) / z;
-            let slo = ts + ts * params.rel_lo + params.abs_lo - params.slack / z;
-            let shi = ts + ts * params.rel_hi + params.abs_hi + params.slack / z;
+            let ts = (mass + shift) * k.x;
+            let slo = ts * params.lo_factor + params.abs_lo - k.y;
+            let shi = ts * params.hi_factor + params.abs_hi + k.y;
             let b = best_peak(slo, shi);
             if (b >= 0.0) {
                 sn = sn + 1u;
@@ -179,7 +184,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// Uniform block, must match `Params` in the shader (16 four-byte words)
+/// Fragment charges the shader's `charges` table holds
+const MAX_CHARGE_TERMS: usize = 32;
+
+/// Uniform block, must match `Params` in the shader (16 four-byte words,
+/// then the per-charge table)
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct GpuParams {
@@ -192,13 +201,14 @@ struct GpuParams {
     pad0: u32,
     pad1: u32,
     precursor_mass: f32,
-    slack: f32,
-    rel_lo: f32,
-    rel_hi: f32,
+    pad2: f32,
+    lo_factor: f32,
+    hi_factor: f32,
     abs_lo: f32,
     abs_hi: f32,
-    pad2: f32,
     pad3: f32,
+    pad4: f32,
+    charges: [[f32; 4]; MAX_CHARGE_TERMS],
 }
 
 fn bytes_of<T: Copy>(v: &[T]) -> &[u8] {
@@ -225,6 +235,43 @@ struct Chunk {
     read_info: wgpu::Buffer,
 }
 
+/// Adapters on the backends the kernel uses, as `name | backend | device type`.
+/// Software adapters are listed too; the kernel skips them unless asked.
+pub fn adapters() -> Vec<String> {
+    all_adapters()
+        .into_iter()
+        .map(|a| {
+            let info = a.get_info();
+            format!("{} | {:?} | {:?}", info.name, info.backend, info.device_type)
+        })
+        .collect()
+}
+
+/// Graphics APIs used: DirectX 12 on Windows, where it is the native API (some
+/// Vulkan drivers there, e.g. Intel UHD 31.0.101.2145, crash opening a device);
+/// Vulkan and Metal elsewhere. Never GL: slow and noisy.
+fn backends() -> wgpu::Backends {
+    if cfg!(windows) {
+        wgpu::Backends::DX12
+    } else {
+        wgpu::Backends::PRIMARY
+    }
+}
+
+/// One instance for the whole program: adapters and devices must not outlive it
+fn instance() -> &'static wgpu::Instance {
+    static INSTANCE: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = backends();
+        wgpu::Instance::new(descriptor)
+    })
+}
+
+fn all_adapters() -> Vec<wgpu::Adapter> {
+    pollster::block_on(instance().enumerate_adapters(backends()))
+}
+
 pub struct GpuKernel {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -245,11 +292,7 @@ impl GpuKernel {
     /// slower than the `cpu` backend, so they are used only when `allow_software`
     /// is set (explicit `"backend": "gpu"`, or testing).
     pub fn new(table: IonTable, allow_software: bool) -> Result<Self, String> {
-        // Primary backends only: Vulkan, DX12, Metal (the GL fallback is slow and noisy)
-        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-        descriptor.backends = wgpu::Backends::PRIMARY;
-        let instance = wgpu::Instance::new(descriptor);
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        let adapter = pollster::block_on(instance().request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             ..Default::default()
         }))
@@ -258,6 +301,18 @@ impl GpuKernel {
         if info.device_type == wgpu::DeviceType::Cpu && !allow_software {
             return Err(format!("only a software adapter ({}) is available", info.name));
         }
+        Self::on_adapter(table, adapter)
+    }
+
+    /// One kernel per adapter on this machine, software ones included, so
+    /// that tests can check every device and driver
+    #[cfg(test)]
+    pub(crate) fn on_every_adapter(table: impl Fn() -> IonTable) -> Vec<Result<Self, String>> {
+        all_adapters().into_iter().map(|a| Self::on_adapter(table(), a)).collect()
+    }
+
+    fn on_adapter(table: IonTable, adapter: wgpu::Adapter) -> Result<Self, String> {
+        let info = adapter.get_info();
         let limits = adapter.limits();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("sage-crosslink"),
@@ -399,25 +454,35 @@ impl ChainKernel for GpuKernel {
         let peaks_mass = make_buffer(&self.device, "peaks_mass", bytes_of(&query.masses), st);
         let peaks_int = make_buffer(&self.device, "peaks_int", bytes_of(&query.intensities), st);
 
+        // Fragment charges beyond the table (precursors above 33+) are not tried
+        let mut charges = [[0f32; 4]; MAX_CHARGE_TERMS];
+        let mut n_charges = 0;
+        for (slot, (inv_z, slack_z)) in charges.iter_mut().zip(params.charge_terms()) {
+            *slot = [inv_z, slack_z, 0.0, 0.0];
+            n_charges += 1;
+        }
+        let (lo_factor, hi_factor) = params.fragment_tol.factors();
+
         let mut all = Vec::new();
         for chunk in &self.chunks {
             let gp = GpuParams {
                 n_peaks: query.masses.len() as u32,
                 n_pep: chunk.count as u32,
-                max_charge: params.max_fragment_charge as u32,
+                max_charge: n_charges as u32 + 1,
                 min_matched: params.min_matched as u32,
                 ion_base: chunk.ion_base,
                 site_base: chunk.site_base,
                 pad0: 0,
                 pad1: 0,
                 precursor_mass: params.precursor_mass,
-                slack: params.slack,
-                rel_lo: params.fragment_tol.rel_lo,
-                rel_hi: params.fragment_tol.rel_hi,
+                pad2: 0.0,
+                lo_factor,
+                hi_factor,
                 abs_lo: params.fragment_tol.abs_lo,
                 abs_hi: params.fragment_tol.abs_hi,
-                pad2: 0.0,
                 pad3: 0.0,
+                pad4: 0.0,
+                charges,
             };
             let uniform = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("params"),
@@ -499,3 +564,4 @@ fn cast<T: Copy>(bytes: &[u8]) -> &[T] {
     // Safety: mapped ranges are 4-byte aligned and sized in whole words
     unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, bytes.len() / std::mem::size_of::<T>()) }
 }
+

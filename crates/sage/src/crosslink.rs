@@ -64,6 +64,10 @@ fn default_true() -> bool {
 fn default_candidates() -> usize {
     30
 }
+fn default_linked_peaks() -> u16 {
+    2
+}
+
 fn default_chain_survivors() -> usize {
     20_000
 }
@@ -72,10 +76,19 @@ fn default_chain_peaks() -> u16 {
 }
 
 /// Mass remnants ("stubs") left on each peptide when an MS-cleavable linker
-/// breaks in the collision cell. The two stubs of one linker sum to its mass.
+/// breaks in the collision cell. One cleavage leaves the short stub on one
+/// peptide and the long stub on the other, so a short and a long stub sum to
+/// the linker mass.
 ///
-/// DSSO: short = alkene 54.01056, long = thiol 103.99320 (doublet spacing 49.98264);
-/// `alt` may hold the sulfenic acid 85.98264. DSBU: 85.05276 / 111.03203.
+/// DSSO: short = alkene 54.01056, long = sulfenic acid 103.99320 (doublet
+/// spacing 49.98264); `alt` may hold the unsaturated thiol 85.98264 (sulfenic
+/// acid - H2O). DSBU: 85.05276 / 111.03203.
+///
+/// Asymmetric linkers leave different stubs depending on the arm: `short`,
+/// `long` and `alt` then describe the first arm and `other` the second. A
+/// cleavage leaves one arm's short stub and the other arm's long stub, so
+/// `short + other.long` and `other.short + long` both equal the linker mass
+/// (cliXlink: 54.01056 + 213.04596 = 163.06333 + 103.99320 = 267.05653).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CleavableStubs {
@@ -84,6 +97,54 @@ pub struct CleavableStubs {
     /// Additional observed stub masses (e.g. DSSO's 85.98264)
     #[serde(default)]
     pub alt: Vec<f32>,
+    /// Asymmetric linkers: the stubs of the second arm; absent when both arms
+    /// leave the same stubs
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other: Option<ArmStubs>,
+}
+
+/// The stubs one arm of an MS-cleavable linker can leave on its peptide
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ArmStubs {
+    pub short: f32,
+    pub long: f32,
+    #[serde(default)]
+    pub alt: Vec<f32>,
+}
+
+impl ArmStubs {
+    /// Spacing of the doublet (short / long stub) of a peptide on this arm
+    pub fn delta(&self) -> f32 {
+        self.long - self.short
+    }
+
+    /// Every stub mass of this arm
+    pub fn all(&self) -> Vec<f32> {
+        [self.short, self.long].into_iter().chain(self.alt.iter().copied()).collect()
+    }
+}
+
+impl CleavableStubs {
+    /// The stubs of each arm: one entry when both arms are alike, two for an
+    /// asymmetric linker (first arm, second arm)
+    pub fn arms(&self) -> Vec<ArmStubs> {
+        let first = ArmStubs { short: self.short, long: self.long, alt: self.alt.clone() };
+        match &self.other {
+            None => vec![first],
+            Some(second) => vec![first, second.clone()],
+        }
+    }
+
+    /// Ways to place the arms on (peptide a, peptide b), as indices into
+    /// [`CleavableStubs::arms`]: an asymmetric linker may sit either way round
+    pub fn arm_pairs(&self) -> Vec<(usize, usize)> {
+        if self.other.is_some() {
+            vec![(0, 1), (1, 0)]
+        } else {
+            vec![(0, 0)]
+        }
+    }
 }
 
 /// Common reagents. Selecting one fixes the linker mass (and, for cleavable
@@ -101,6 +162,9 @@ pub enum Reagent {
     Edc,
     /// Zero-length triazine coupling reagent, same chemistry as EDC
     Dmtmm,
+    /// Asymmetric MS-cleavable sulfoxide with an alkyne handle for click
+    /// enrichment (XLMOD:02253; PMID 31593346)
+    Clixlink,
 }
 
 /// Zero-length amide bond formation releases one water
@@ -125,6 +189,8 @@ impl Reagent {
             Reagent::Dsso => 158.00376,
             Reagent::Dsbu => 196.08479,
             Reagent::Edc | Reagent::Dmtmm => ZERO_LENGTH,
+            // C12H13NO4S
+            Reagent::Clixlink => 267.05653,
         }
     }
 
@@ -143,11 +209,27 @@ impl Reagent {
                 short: 54.01056,
                 long: 103.99320,
                 alt: vec![85.98264],
+                other: None,
             }),
             Reagent::Dsbu => Some(CleavableStubs {
                 short: 85.05276,
                 long: 111.03203,
                 alt: vec![],
+                other: None,
+            }),
+            // Sulfoxide cleavage on either side, as for DSSO: one arm keeps an
+            // alkene, the other a sulfenic acid (or the thiol, after losing water).
+            // Plain arm: C3H2O / C3H4O2S / C3H2OS. Alkyne-tagged arm:
+            // C9H9NO2 / C9H11NO3S / C9H9NO2S.
+            Reagent::Clixlink => Some(CleavableStubs {
+                short: 54.01056,
+                long: 103.99320,
+                alt: vec![85.98264],
+                other: Some(ArmStubs {
+                    short: 163.06333,
+                    long: 213.04596,
+                    alt: vec![195.03540],
+                }),
             }),
             _ => None,
         }
@@ -189,7 +271,8 @@ pub struct CrosslinkSettings {
     /// Only for custom reagents; cannot be combined with `reagent`.
     #[serde(default)]
     pub mass: Option<f32>,
-    /// Custom MS-cleavable stub masses; cannot be combined with `reagent`.
+    /// Custom MS-cleavable stub masses. With a cleavable `reagent` (DSSO, DSBU)
+    /// they replace its preset stubs; not allowed with a non-cleavable one.
     #[serde(default)]
     pub cleavable: Option<CleavableStubs>,
     /// Residues the linker can react with (both ends alike)
@@ -235,6 +318,17 @@ pub struct CrosslinkSettings {
     /// sensitive and slower; a true chain usually ranks far inside the top few hundred.
     #[serde(default = "default_chain_survivors")]
     pub chain_survivors: usize,
+    /// Also run an ordinary linear peptide search on the same spectra
+    /// (`results.sage.tsv` next to `crosslinks.sage.tsv`)
+    #[serde(default)]
+    pub linear_search: bool,
+    /// Non-cleavable linkers: matched fragment ions that carry the linker
+    /// (contain the link site; loop-links: both sites) required on *each*
+    /// chain. These are the only direct evidence of the link: without them a
+    /// correct peptide with any modification of about the linker's mass, or a
+    /// strong peptide with a barely matched partner, passes as a crosslink.
+    #[serde(default = "default_linked_peaks")]
+    pub min_linked_peaks: u16,
 }
 
 impl Default for CrosslinkSettings {
@@ -254,6 +348,8 @@ impl Default for CrosslinkSettings {
             require_complete_doublets: false,
             backend: Backend::Cpu,
             chain_survivors: default_chain_survivors(),
+            linear_search: false,
+            min_linked_peaks: default_linked_peaks(),
         }
     }
 }
@@ -278,9 +374,16 @@ impl CrosslinkSettings {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.reagent.is_some() && (self.mass.is_some() || self.cleavable.is_some()) {
+        if self.reagent.is_some() && self.mass.is_some() {
             return Err(
                 "crosslink: set either `reagent`, or a custom `mass` (+ `cleavable`), not both"
+                    .into(),
+            );
+        }
+        // `cleavable` may override the stub masses of an MS-cleavable preset
+        if self.cleavable.is_some() && self.reagent.is_some_and(|r| r.stubs().is_none()) {
+            return Err(
+                "crosslink.cleavable can only be combined with an MS-cleavable reagent (dsso, dsbu)"
                     .into(),
             );
         }
@@ -293,18 +396,28 @@ impl CrosslinkSettings {
             ));
         }
         if let Some(stubs) = self.stubs() {
-            if !(stubs.short > 0.0 && stubs.long > stubs.short) {
-                return Err("crosslink.cleavable requires 0 < short < long".into());
+            let arms = stubs.arms();
+            for arm in &arms {
+                if !(arm.short > 0.0 && arm.long > arm.short) {
+                    return Err("crosslink.cleavable requires 0 < short < long (on each arm)".into());
+                }
+                if arm.alt.iter().any(|&m| !(m > 0.0)) {
+                    return Err("crosslink.cleavable.alt masses must be positive".into());
+                }
             }
-            if (stubs.short + stubs.long - mass).abs() > 0.02 {
-                return Err(format!(
-                    "crosslink.cleavable: short + long stubs ({}) must equal the linker mass ({})",
-                    stubs.short + stubs.long,
-                    mass
-                ));
-            }
-            if stubs.alt.iter().any(|&m| !(m > 0.0)) {
-                return Err("crosslink.cleavable.alt masses must be positive".into());
+            // a cleavage leaves one arm's short stub and the other arm's long stub
+            for (a, b) in stubs.arm_pairs() {
+                let sum = arms[a].short + arms[b].long;
+                if (sum - mass).abs() > 0.02 {
+                    let what = if stubs.other.is_some() {
+                        "one arm's short stub + the other arm's long stub"
+                    } else {
+                        "short + long stubs"
+                    };
+                    return Err(format!(
+                        "crosslink.cleavable: {what} ({sum}) must equal the linker mass ({mass})"
+                    ));
+                }
             }
         }
         match (&self.site1, &self.site2) {
@@ -360,6 +473,7 @@ impl CrosslinkSettings {
             Reagent::Dsso => (6, 1),                 // C6H6O3S
             Reagent::Dsbu => (9, 0),                 // C9H14N2O3
             Reagent::Edc | Reagent::Dmtmm => (0, 0), // -H2O
+            Reagent::Clixlink => (12, 1),            // C12H13NO4S
         }
     }
 
@@ -513,6 +627,10 @@ pub struct CrosslinkMatch {
     pub beta_score: f64,
     pub alpha_matched: u16,
     pub beta_matched: u16,
+    /// Non-cleavable linkers: matched ions carrying the linker, per chain
+    /// (loop-links: `alpha_linked` only)
+    pub alpha_linked: u16,
+    pub beta_linked: u16,
     pub delta_next: f64,
     /// Number of candidate pairs scored for this spectrum
     pub pairs_scored: u32,
@@ -608,6 +726,21 @@ pub fn chain_ions(
         }
     }
     ions
+}
+
+/// The ions of [`chain_ions`] that carry the link's `shift`: the ones that
+/// contain the link site (loop-links: both sites)
+pub fn linked_ions(peptide: &Peptide, mods: &Modifications, kinds: &[Kind], link: Link) -> Vec<(Kind, f32)> {
+    let unshifted = match link {
+        Link::Single { site, .. } => Link::Single { site, shift: 0.0 },
+        Link::Loop { first, second, .. } => Link::Loop { first, second, shift: 0.0 },
+    };
+    chain_ions(peptide, mods, kinds, link)
+        .into_iter()
+        .zip(chain_ions(peptide, mods, kinds, unshifted))
+        .filter(|(shifted, plain)| shifted.1 != plain.1)
+        .map(|(ion, _)| ion)
+        .collect()
 }
 
 fn frag_charge_bound(max_fragment_charge: Option<u8>, precursor_charge: u8) -> u8 {
@@ -1024,7 +1157,7 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
             }
         }
 
-        self.finalize(found, pairs_scored)
+        self.finalize(query, found, pairs_scored)
     }
 
     /// Assemble the match for an inter-peptide pair; `a`/`b` are database indices
@@ -1205,12 +1338,20 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                 }
             }
         }
-        self.finalize(found, pairs_scored)
+        self.finalize(query, found, pairs_scored)
     }
 
     /// Rank candidate matches for one spectrum and keep the best `report_psms`
-    fn finalize(&self, mut found: Vec<CrosslinkMatch>, pairs_scored: u32) -> Vec<CrosslinkMatch> {
+    fn finalize(&self, query: &ProcessedSpectrum, mut found: Vec<CrosslinkMatch>, pairs_scored: u32) -> Vec<CrosslinkMatch> {
         found.retain(|m| m.hyperscore.is_finite());
+        if !self.settings.is_cleavable() {
+            // cleavable links are evidenced by their stub doublets instead
+            for m in &mut found {
+                (m.alpha_linked, m.beta_linked) = self.linked_peaks(query, m);
+            }
+            let min = self.settings.min_linked_peaks;
+            found.retain(|m| m.alpha_linked >= min && (m.beta.is_none() || m.beta_linked >= min));
+        }
         found.sort_by(|a, b| b.hyperscore.total_cmp(&a.hyperscore));
         found.truncate(self.scorer.report_psms.max(1));
         for idx in 0..found.len() {
@@ -1220,6 +1361,30 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
             found[idx].pairs_scored = pairs_scored;
         }
         found
+    }
+
+    /// Matched ions carrying the linker on each chain of a non-cleavable match
+    fn linked_peaks(&self, query: &ProcessedSpectrum, m: &CrosslinkMatch) -> (u16, u16) {
+        let db = self.scorer.db;
+        let max_fc = frag_charge_bound(self.scorer.max_fragment_charge, m.charge);
+        let count = |peptide: &Peptide, link: Link| {
+            let ions = linked_ions(peptide, &db.modifications, &db.ion_kinds, link);
+            match_ions(query, &ions, max_fc, self.scorer.fragment_tol).matched()
+        };
+        let linker = self.settings.linker_mass();
+        let a = &db[m.alpha];
+        match m.beta {
+            None => {
+                let link = Link::Loop { first: m.alpha_site as usize, second: m.beta_site as usize, shift: linker };
+                (count(a, link), 0)
+            }
+            Some(beta) => {
+                let b = &db[beta];
+                let on_a = Link::Single { site: m.alpha_site as usize, shift: b.monoisotopic + linker };
+                let on_b = Link::Single { site: m.beta_site as usize, shift: a.monoisotopic + linker };
+                (count(a, on_a), count(b, on_b))
+            }
+        }
     }
 
     /// Peptides whose mass lies within the fragment tolerance of `mass`
@@ -1239,14 +1404,15 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
     /// separately for each end of the linker: `[best SITE1 site, best SITE2 site]`
     /// (identical for homobifunctional reagents).
     ///
-    /// Fragment ions that contain the linked residue carry *a* stub, but which
-    /// one (short, long, or alt) is not known, so each is a candidate; ions
-    /// outside the linked residue are ordinary linear ions.
+    /// Fragment ions that contain the linked residue carry *a* stub of the
+    /// linker arm on this peptide, but which one (short, long, or alt) is not
+    /// known, so each is a candidate; ions outside the linked residue are
+    /// ordinary linear ions.
     fn score_stubbed_chain(
         &self,
         query: &ProcessedSpectrum,
         peptide: &Peptide,
-        stubs: &CleavableStubs,
+        arm: &ArmStubs,
         max_fragment_charge: u8,
     ) -> [Option<(usize, Tally)>; 2] {
         let db = self.scorer.db;
@@ -1254,11 +1420,7 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
         if sites.is_empty() {
             return [None, None];
         }
-        let all_stubs = std::iter::once(stubs.short)
-            .chain(std::iter::once(stubs.long))
-            .chain(stubs.alt.iter().copied())
-            .collect::<Vec<_>>();
-
+        let all_stubs = arm.all();
         let mut best: [Option<(usize, Tally, f64)>; 2] = [None, None];
         for &(site, roles) in &sites {
             let with_stub = |shift: f32| {
@@ -1302,9 +1464,11 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
     /// Search for an MS-cleavable crosslink (DSSO, DSBU, ...).
     ///
     /// 1. A stub-bearing peptide appears in the spectrum as a *doublet* (short
-    ///    and long stub), spaced `long - short` apart.
+    ///    and long stub of its linker arm), spaced `long - short` apart.
     /// 2. If `a = m(A) + short` is the first peak of A's doublet, the partner
-    ///    peptide B shows up at `M - a` (= m(B) + long) and `M - a - delta`.
+    ///    peptide B (with mass `M - m(A) - linker`) shows up at `m(B) + short`
+    ///    and `m(B) + long` of the other arm. For symmetric linkers both arms
+    ///    are alike; an asymmetric linker (cliXlink) is tried both ways round.
     /// 3. Both peptide masses are therefore known directly; each is looked up in
     ///    the (mass-sorted) database with a narrow window and scored on its own
     ///    as a linear peptide bearing a stub. No pairwise enumeration is needed.
@@ -1322,7 +1486,8 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
             return Vec::new();
         }
         let min_peptide_mass = db.peptides[0].monoisotopic;
-        let delta = stubs.long - stubs.short;
+        let arms = stubs.arms();
+        let linker = cfg.linker_mass();
         let mz = precursor.mz - PROTON;
 
         let charges: Vec<u8> = match precursor.charge {
@@ -1332,7 +1497,8 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
 
         let mut found: Vec<CrosslinkMatch> = Vec::new();
         let mut pairs_scored = 0u32;
-        let mut chain_cache: HashMap<u32, [Option<(usize, Tally)>; 2]> = HashMap::new();
+        // (peptide, arm) -> best site per linker end
+        let mut chain_cache: HashMap<(u32, usize), [Option<(usize, Tally)>; 2]> = HashMap::new();
         // Homobifunctional: both ends are alike, so one entry per peptide suffices
         let ends = if cfg.is_heterobifunctional() { 2 } else { 1 };
 
@@ -1347,34 +1513,36 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                 i < peaks.len() && peaks[i] <= hi
             };
 
-            let mut seen: HashSet<(u32, u32)> = HashSet::new();
+            // each peptide pair once per precursor charge: the best-scoring way round
+            let mut seen: HashMap<(u32, u32), usize> = HashMap::new();
             for iso in sc.min_isotope_err..=sc.max_isotope_err {
                 let m = mass - iso as f32 * NEUTRON;
+                for &(arm_a, arm_b) in &stubs.arm_pairs() {
+                let (x, y) = (&arms[arm_a], &arms[arm_b]);
                 for &a in &peaks {
-                    // A's complete doublet
-                    if !has_peak(a + delta) {
+                    // A's complete doublet on its arm
+                    if !has_peak(a + x.delta()) {
                         continue;
                     }
-                    // B's doublet: B+long = m - a, B+short = m - a - delta
-                    let comp_long = has_peak(m - a);
-                    let comp_short = has_peak(m - a - delta);
+                    let mass_a = a - x.short;
+                    let mass_b = m - mass_a - linker;
+                    // B's doublet on the other arm
+                    let comp_long = has_peak(mass_b + y.long);
+                    let comp_short = has_peak(mass_b + y.short);
                     let complement = comp_long as u8 + comp_short as u8;
                     let needed = if cfg.require_complete_doublets { 2 } else { 1 };
                     if complement < needed {
                         continue;
                     }
-                    let mass_a = a - stubs.short;
-                    let mass_b = m - a - stubs.long;
                     if mass_a < min_peptide_mass || mass_b < min_peptide_mass {
                         continue;
                     }
-
                     // (peptide, linker end, site, tally, chain score)
-                    let mut side = |mass: f32| -> Vec<(u32, usize, usize, Tally, f64)> {
+                    let mut side = |mass: f32, arm: usize| -> Vec<(u32, usize, usize, Tally, f64)> {
                         let mut v = Vec::new();
                         for ix in self.peptides_with_mass(mass) {
-                            let entry = chain_cache.entry(ix as u32).or_insert_with(|| {
-                                self.score_stubbed_chain(query, &db.peptides[ix], &stubs, max_fc)
+                            let entry = chain_cache.entry((ix as u32, arm)).or_insert_with(|| {
+                                self.score_stubbed_chain(query, &db.peptides[ix], &arms[arm], max_fc)
                             });
                             for (end, best) in entry.iter().enumerate().take(ends) {
                                 if let Some((site, tally)) = *best {
@@ -1386,8 +1554,8 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                         v.truncate(ends * MAX_CHAINS_PER_SIDE.min(cfg.candidates));
                         v
                     };
-                    let side_a = side(mass_a);
-                    let side_b = side(mass_b);
+                    let side_a = side(mass_a, arm_a);
+                    let side_b = side(mass_b, arm_b);
 
                     // Best end assignment per peptide pair: the two peptides must
                     // carry different ends of a heterobifunctional linker
@@ -1411,19 +1579,24 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
 
                     for (ix_a, site_a, tally_a, score_a, ix_b, site_b, tally_b, score_b) in pairs {
                         let key = (ix_a.min(ix_b), ix_a.max(ix_b));
-                        if !seen.insert(key) {
-                            continue;
+                        let joint = tally_a.combine(&tally_b).score(sc.score_type);
+                        let replace = match seen.get(&key) {
+                            Some(&i) if found[i].hyperscore >= joint => continue,
+                            Some(&i) => Some(i),
+                            None => None,
+                        };
+                        if replace.is_none() {
+                            pairs_scored += 1;
                         }
-                        pairs_scored += 1;
                         let (pa, pb) = (&db.peptides[ix_a as usize], &db.peptides[ix_b as usize]);
-                        let calc = pa.monoisotopic + pb.monoisotopic + stubs.short + stubs.long;
+                        let calc = pa.monoisotopic + pb.monoisotopic + linker;
                         let swap = score_b > score_a;
                         let (alpha, beta, s_a, s_b, sc_a, sc_b, n_a, n_b) = if swap {
                             (ix_b, ix_a, site_b, site_a, score_b, score_a, tally_b, tally_a)
                         } else {
                             (ix_a, ix_b, site_a, site_b, score_a, score_b, tally_a, tally_b)
                         };
-                        found.push(CrosslinkMatch {
+                        let csm = CrosslinkMatch {
                             psm_id: CSM_COUNTER.fetch_add(1, Ordering::Relaxed),
                             spec_id: query.id.clone(),
                             file_id: query.file_id,
@@ -1447,12 +1620,20 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                             beta_matched: n_b.matched(),
                             stub_peaks: 2 + complement,
                             ..Default::default()
-                        });
+                        };
+                        match replace {
+                            Some(i) => found[i] = csm,
+                            None => {
+                                seen.insert(key, found.len());
+                                found.push(csm);
+                            }
+                        }
                     }
+                }
                 }
             }
         }
-        self.finalize(found, pairs_scored)
+        self.finalize(query, found, pairs_scored)
     }
 }
 
@@ -2083,6 +2264,35 @@ mod test {
         assert_eq!((hits[0].alpha_site, hits[0].beta_site), (9, 18));
         assert!(hits[0].intra_protein);
         assert!(hits[0].precursor_ppm.abs() < 1.0);
+        assert!(hits[0].alpha_linked >= cfg.min_linked_peaks, "{:?}", hits[0]);
+    }
+
+    #[test]
+    fn loop_link_needs_linker_carrying_ions() {
+        // The right peptide with some other modification of about the linker's
+        // mass: its spectrum has the ions outside the ring but none that carry
+        // the linker, so only the precursor mass says "loop-link"
+        let l = peptide("AEFGHDSTWKLMNPQSTVKGYEDFAR", "PROT_L", Position::Internal);
+        let mut targets = distractors(400);
+        targets.push(l.clone());
+        let db = database(targets);
+        let sc = scorer(&db);
+        let link = Link::Loop { first: 9, second: 18, shift: DSS };
+        let all = chain_ions(&l, &db.modifications, &[Kind::B, Kind::Y], link);
+        let linked = linked_ions(&l, &db.modifications, &[Kind::B, Kind::Y], link);
+        // ions that span the whole ring: b19 and longer, and the y ions that
+        // still contain K10
+        assert_eq!(linked.len(), (l.sequence.len() - 1 - 18) + 9);
+        let unlinked = all.iter().filter(|ion| !linked.contains(ion)).copied().collect::<Vec<_>>();
+        let query = spectrum(l.monoisotopic + DSS, 3, &unlinked);
+
+        let cfg = CrosslinkSettings::default();
+        assert!(CrosslinkScorer::new(&sc, &cfg).score(&query).is_empty());
+        // the check can be switched off
+        let off = CrosslinkSettings { min_linked_peaks: 0, ..Default::default() };
+        let hits = CrosslinkScorer::new(&sc, &off).score(&query);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].alpha_linked, 0);
     }
 
     #[test]
@@ -2167,6 +2377,19 @@ mod test {
         let both: CrosslinkSettings =
             serde_json::from_str(r#"{"reagent": "dsso", "mass": 100.0}"#).unwrap();
         assert!(both.validate().is_err());
+
+        // a cleavable preset's stubs can be overridden, a non-cleavable one has none
+        let dsso: CrosslinkSettings = serde_json::from_str(
+            r#"{"reagent": "dsso", "cleavable": {"short": 54.01056, "long": 103.9932, "alt": []}}"#,
+        )
+        .unwrap();
+        assert!(dsso.validate().is_ok());
+        assert!(dsso.stubs().unwrap().alt.is_empty());
+        let bs3: CrosslinkSettings = serde_json::from_str(
+            r#"{"reagent": "bs3", "cleavable": {"short": 54.01056, "long": 84.0575}}"#,
+        )
+        .unwrap();
+        assert!(bs3.validate().is_err());
 
         // custom cleavable: stubs must add up to the linker mass
         let bad: CrosslinkSettings = serde_json::from_str(
@@ -2363,6 +2586,94 @@ mod test {
         assert_eq!(found, expected);
     }
 
+    /// Stub-bearing ions of a chain on one arm of an asymmetric linker
+    fn arm_ions(p: &Peptide, mods: &Modifications, site: usize, arm: &ArmStubs) -> Vec<(Kind, f32)> {
+        let stubs = CleavableStubs { short: arm.short, long: arm.long, alt: arm.alt.clone(), other: None };
+        stubbed_ions(p, mods, site, &stubs)
+    }
+
+    #[test]
+    fn clixlink_stubs_and_validation() {
+        let cfg: CrosslinkSettings = serde_json::from_str(r#"{"reagent": "clixlink"}"#).unwrap();
+        assert!(cfg.validate().is_ok());
+        assert!((cfg.linker_mass() - 267.05653).abs() < 1e-3);
+        let stubs = cfg.stubs().unwrap();
+        let arms = stubs.arms();
+        assert_eq!(arms.len(), 2);
+        // a cleavage leaves one arm's alkene and the other arm's sulfenic acid
+        assert!((arms[0].short + arms[1].long - cfg.linker_mass()).abs() < 1e-3);
+        assert!((arms[1].short + arms[0].long - cfg.linker_mass()).abs() < 1e-3);
+        // both arms: alkene / sulfenic acid doublets 49.98 apart, thiol = sulfenic - H2O
+        for arm in &arms {
+            assert!((arm.delta() - 49.98264).abs() < 1e-3);
+            assert!((arm.long - arm.alt[0] - 18.010565).abs() < 1e-3);
+        }
+
+        // custom asymmetric linker: the cross sums must match the linker mass
+        let bad: CrosslinkSettings = serde_json::from_str(
+            r#"{"mass": 267.05653, "cleavable": {"short": 54.01056, "long": 103.9932,
+                "other": {"short": 160.0, "long": 213.04596}}}"#,
+        )
+        .unwrap();
+        assert!(bad.validate().unwrap_err().contains("other arm's long stub"));
+        let good: CrosslinkSettings = serde_json::from_str(
+            r#"{"mass": 267.05653, "cleavable": {"short": 54.01056, "long": 103.9932, "alt": [85.98264],
+                "other": {"short": 163.06333, "long": 213.04596, "alt": [195.0354]}}}"#,
+        )
+        .unwrap();
+        assert!(good.validate().is_ok());
+        assert_eq!(good.stubs(), cfg.stubs());
+    }
+
+    /// cliXlink leaves different stubs on its two arms; either arm may sit on
+    /// either peptide, and both ways round must be found
+    #[test]
+    fn finds_asymmetric_cleavable_crosslink_both_ways() {
+        let a = peptide("GLEKVSTAAMQR", "PROT_A", Position::Internal);
+        let b = peptide("TDYHFPNEWKLIR", "PROT_B", Position::Internal);
+        let (site_a, site_b) = (3usize, 9usize);
+        let cfg = CrosslinkSettings { reagent: Some(Reagent::Clixlink), ..Default::default() };
+        let arms = cfg.stubs().unwrap().arms();
+
+        let mut targets = distractors(400);
+        targets.push(a.clone());
+        targets.push(b.clone());
+        let db = database(targets);
+        let sc = scorer(&db);
+        let xl = CrosslinkScorer::new(&sc, &cfg);
+        let precursor = a.monoisotopic + b.monoisotopic + cfg.linker_mass();
+
+        for (arm_a, arm_b) in [(0usize, 1usize), (1, 0)] {
+            let (x, y) = (&arms[arm_a], &arms[arm_b]);
+            let mut ions = arm_ions(&a, &db.modifications, site_a, x);
+            ions.extend(arm_ions(&b, &db.modifications, site_b, y));
+            // each peptide's doublet at its own arm's stubs
+            ions.push((Kind::B, a.monoisotopic + x.short));
+            ions.push((Kind::B, a.monoisotopic + x.long));
+            ions.push((Kind::B, b.monoisotopic + y.short));
+            ions.push((Kind::B, b.monoisotopic + y.long));
+            let hits = xl.score(&spectrum(precursor, 4, &ions));
+            assert_eq!(hits.len(), 1, "arms {arm_a}/{arm_b}: {hits:?}");
+            let hit = &hits[0];
+            assert_eq!(hit.stub_peaks, 4);
+            assert!(hit.precursor_ppm.abs() < 1.0, "ppm {}", hit.precursor_ppm);
+            assert_eq!(
+                pair_set(&db, hit),
+                vec![("GLEKVSTAAMQR".to_string(), site_a), ("TDYHFPNEWKLIR".to_string(), site_b)]
+            );
+        }
+
+        // DSSO-like doublets on both peptides are not cliXlink: the tagged arm
+        // (+163.06 / +213.05) is missing
+        let mut ions = arm_ions(&a, &db.modifications, site_a, &arms[0]);
+        ions.extend(arm_ions(&b, &db.modifications, site_b, &arms[0]));
+        for p in [&a, &b] {
+            ions.push((Kind::B, p.monoisotopic + arms[0].short));
+            ions.push((Kind::B, p.monoisotopic + arms[0].long));
+        }
+        assert!(xl.score(&spectrum(precursor, 4, &ions)).is_empty());
+    }
+
     #[test]
     fn cleavable_search_needs_the_doublets() {
         let a = peptide("GLEKVSTAAMQR", "PROT_A", Position::Internal);
@@ -2554,10 +2865,48 @@ mod test {
         assert!(serde_json::from_str::<CrosslinkSettings>(r#"{"backend":"cuda"}"#).is_err());
     }
 
+    /// The GPU kernel on every adapter of this machine (hardware and software,
+    /// each driver API), or none when there is no GPU support
+    #[cfg(feature = "gpu")]
+    fn gpu_kernels(db: &IndexedDatabase, cfg: &CrosslinkSettings) -> Vec<crate::crosslink_gpu::GpuKernel> {
+        use crate::crosslink_kernel::{ChainKernel, IonTable};
+        crate::crosslink_gpu::GpuKernel::on_every_adapter(|| IonTable::build(db, |p| cfg.link_sites(p)))
+            .into_iter()
+            .filter_map(|k| match k {
+                Ok(k) => {
+                    eprintln!("GPU kernel on: {}", k.name());
+                    Some(k)
+                }
+                Err(e) => {
+                    eprintln!("adapter skipped: {e}");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Survivors of `gpu` must equal the CPU reference exactly (score to float accuracy)
+    #[cfg(feature = "gpu")]
+    fn assert_same_survivors(
+        want: &[crate::crosslink_kernel::Survivor],
+        got: &[crate::crosslink_kernel::Survivor],
+        what: &str,
+    ) {
+        assert_eq!(
+            want.iter().map(|s| s.peptide).collect::<Vec<_>>(),
+            got.iter().map(|s| s.peptide).collect::<Vec<_>>(),
+            "survivor sets differ ({what})"
+        );
+        for (w, g) in want.iter().zip(got) {
+            assert_eq!((w.site, w.matched), (g.site, g.matched), "peptide {} ({what})", w.peptide);
+            assert!((w.score - g.score).abs() < 1e-3, "peptide {}: {} vs {} ({what})", w.peptide, w.score, g.score);
+        }
+    }
+
     #[cfg(feature = "gpu")]
     #[test]
     fn gpu_kernel_matches_cpu_reference() {
-        use crate::crosslink_kernel::{ChainKernel, IonTable, KernelParams};
+        use crate::crosslink_kernel::{ChainKernel, KernelParams};
         let a = peptide("GLEKVSTAAMQR", "PROT_A", Position::Internal);
         let b = peptide("TDYHFPNEWKLIR", "PROT_B", Position::Internal);
         let c = peptide("AKCDKEFRQLMNR", "PROT_C", Position::Internal);
@@ -2569,42 +2918,97 @@ mod test {
         let sc = scorer(&db);
         let cfg = CrosslinkSettings::default();
         let cpu = kernel_for(&db, &cfg);
-        let gpu = match crate::crosslink_gpu::GpuKernel::new(IonTable::build(&db, |p| cfg.link_sites(p)), true) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("skipping GPU parity test: {e}");
-                return;
-            }
-        };
-        eprintln!("GPU parity test on: {}", gpu.name());
+        let gpus = gpu_kernels(&db, &cfg);
+        if gpus.is_empty() {
+            eprintln!("skipping GPU parity test: no adapter");
+            return;
+        }
 
-        let mut compared = 0usize;
-        for (x, y, sx, sy) in [(&a, &b, 3, 9), (&b, &c, 9, 1), (&a, &c, 3, 4), (&c, &c, 1, 4)] {
-            let q = pair_spectrum(&db, x, y, sx, sy);
-            for (max_charge, slack, min_matched) in [(2u8, 0.0f32, 1u16), (3, 0.05, 3), (4, 0.03, 2)] {
+        for gpu in &gpus {
+            let mut compared = 0usize;
+            for (x, y, sx, sy) in [(&a, &b, 3, 9), (&b, &c, 9, 1), (&a, &c, 3, 4), (&c, &c, 1, 4)] {
+                let q = pair_spectrum(&db, x, y, sx, sy);
+                for (max_charge, slack, min_matched) in [(2u8, 0.0f32, 1u16), (3, 0.05, 3), (4, 0.03, 2)] {
+                    let params = KernelParams {
+                        precursor_mass: x.monoisotopic + y.monoisotopic + DSS,
+                        max_fragment_charge: max_charge,
+                        fragment_tol: sc.fragment_tol.into(),
+                        slack,
+                        min_matched,
+                        max_survivors: usize::MAX,
+                    };
+                    let want = cpu.survivors(&q, &params);
+                    let what = format!("{}, charge<{max_charge}, slack {slack}, min {min_matched}", gpu.name());
+                    assert_same_survivors(&want, &gpu.survivors(&q, &params), &what);
+                    compared += want.len();
+                }
+            }
+            assert!(compared > 100, "parity test compared too little: {compared}");
+            eprintln!("{}: GPU and CPU agree on {compared} survivors", gpu.name());
+        }
+    }
+
+    /// Peaks exactly on a tolerance window's edges count on every device:
+    /// rounding differences (GPU division, fused multiply-add) once dropped them
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_kernel_agrees_on_window_edges() {
+        use crate::crosslink_kernel::{ChainKernel, IonTable, KernelParams};
+        let a = peptide("GLEKVSTAAMQR", "PROT_A", Position::Internal);
+        let b = peptide("TDYHFPNEWKLIR", "PROT_B", Position::Internal);
+        let mut targets = distractors(200);
+        targets.push(a.clone());
+        targets.push(b.clone());
+        let db = database(targets);
+        let cfg = CrosslinkSettings::default();
+        let cpu = kernel_for(&db, &cfg);
+        let gpus = gpu_kernels(&db, &cfg);
+        if gpus.is_empty() {
+            eprintln!("skipping GPU window-edge test: no adapter");
+            return;
+        }
+        let table = IonTable::build(&db, |p| cfg.link_sites(p));
+        let ia = db.peptides.iter().position(|p| p.sequence == a.sequence).unwrap();
+
+        for tol in [Tolerance::Ppm(-10.0, 10.0), Tolerance::Ppm(-7.0, 13.0), Tolerance::Da(-0.02, 0.02)] {
+            for slack in [0.0f32, 0.03] {
                 let params = KernelParams {
-                    precursor_mass: x.monoisotopic + y.monoisotopic + DSS,
-                    max_fragment_charge: max_charge,
-                    fragment_tol: sc.fragment_tol.into(),
+                    precursor_mass: a.monoisotopic + b.monoisotopic + DSS,
+                    max_fragment_charge: 4,
+                    fragment_tol: tol.into(),
                     slack,
-                    min_matched,
+                    min_matched: 1,
                     max_survivors: usize::MAX,
                 };
-                let (want, got) = (cpu.survivors(&q, &params), gpu.survivors(&q, &params));
-                assert_eq!(
-                    want.iter().map(|s| s.peptide).collect::<Vec<_>>(),
-                    got.iter().map(|s| s.peptide).collect::<Vec<_>>(),
-                    "survivor sets differ (charge<{max_charge}, slack {slack}, min {min_matched})"
-                );
-                for (w, g) in want.iter().zip(&got) {
-                    assert_eq!((w.site, w.matched), (g.site, g.matched), "peptide {}", w.peptide);
-                    assert!((w.score - g.score).abs() < 1e-3, "peptide {}: {} vs {}", w.peptide, w.score, g.score);
+                // a peak on each edge of every window of peptide `a`
+                let shift = params.precursor_mass - table.peptide_mass[ia];
+                let mut masses = Vec::new();
+                for &mass in &table.ion_mass[table.ion_off[ia] as usize..table.ion_off[ia + 1] as usize] {
+                    for (inv_z, slack_z) in params.charge_terms() {
+                        let (lo, hi) = params.fragment_tol.bounds(mass * inv_z);
+                        let (slo, shi) = params.fragment_tol.bounds((mass + shift) * inv_z);
+                        masses.extend([lo, hi, slo - slack_z, shi + slack_z]);
+                    }
                 }
-                compared += want.len();
+                masses.sort_by(f32::total_cmp);
+                masses.dedup();
+                let q = ProcessedSpectrum {
+                    level: 2,
+                    id: "edges".into(),
+                    intensities: (0..masses.len()).map(|i| 50.0 + (i % 11) as f32).collect(),
+                    charges: vec![1; masses.len()],
+                    masses,
+                    ..Default::default()
+                };
+
+                let want = cpu.survivors(&q, &params);
+                let on_a = want.iter().find(|s| s.peptide as usize == ia).expect("peptide a survives");
+                assert!(on_a.matched >= 20, "edge peaks should count: {on_a:?}");
+                for gpu in &gpus {
+                    assert_same_survivors(&want, &gpu.survivors(&q, &params), &format!("{}, {tol:?}, slack {slack}", gpu.name()));
+                }
             }
         }
-        assert!(compared > 100, "parity test compared too little: {compared}");
-        eprintln!("GPU and CPU agree on {compared} survivors");
     }
 
     fn csm(score: f64, class: PairClass, kind: LinkKind, alpha: u32, beta: Option<u32>) -> CrosslinkMatch {

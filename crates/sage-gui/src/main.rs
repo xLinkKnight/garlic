@@ -3,8 +3,13 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod progress;
 mod runner;
 mod settings;
+mod system;
+mod usage;
+mod theme;
+mod unimod;
 
 use eframe::egui::{self, Color32, ComboBox, DragValue, Response, RichText, TextEdit, Ui};
 use runner::{Job, Status, Step};
@@ -12,10 +17,18 @@ use settings::{Backend, ModKind, Modification, Reagent, Settings, TolUnit, Toler
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
+/// Start-up frames used to measure the tabs: two per tab
+const FIT_STEPS: usize = 2 * Tab::ALL.len();
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Sage search")
+            // the smiling garlic, drawn by examples/make_icon.rs
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/garlic.png"))
+                    .expect("the bundled icon is a valid PNG"),
+            )
             .with_inner_size([1040.0, 780.0])
             .with_min_inner_size([720.0, 480.0]),
         ..Default::default()
@@ -23,7 +36,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Sage search",
         options,
-        Box::new(|_cc| Ok(Box::new(SageGui::new()))),
+        Box::new(|cc| Ok(Box::new(SageGui::new(&cc.egui_ctx)))),
     )
 }
 
@@ -35,16 +48,19 @@ enum Tab {
     Spectra,
     Scoring,
     Crosslink,
+    /// Shown once a search has been started
+    Progress,
 }
 
 impl Tab {
-    const ALL: [(Tab, &'static str); 6] = [
+    const ALL: [(Tab, &'static str); 7] = [
         (Tab::Files, "Files"),
         (Tab::Database, "Database & enzyme"),
         (Tab::Modifications, "Modifications"),
         (Tab::Spectra, "Tolerances & spectra"),
         (Tab::Scoring, "Scoring & output"),
         (Tab::Crosslink, "Crosslinking"),
+        (Tab::Progress, "Progress"),
     ];
 }
 
@@ -60,6 +76,25 @@ struct SageGui {
     problems: Vec<(bool, String)>,
     show_json: bool,
     last_saved: Option<PathBuf>,
+    unimod: unimod::Lookup,
+    /// Steps, metrics and errors of the current or last search
+    tracker: Option<progress::Tracker>,
+    /// CPU / RAM / GPU / vRAM utilisation, shown on the Progress tab
+    usage: usage::Monitor,
+    dark: bool,
+    /// Start-up frames spent measuring the tabs, see `measure_step`
+    fit_step: usize,
+    /// Largest height (points) by which a tab overflowed the scroll area
+    overflow: f32,
+    /// CPU threads sage.exe may use (`--threads`)
+    threads: usize,
+    /// RAM cap for sage.exe in GB, 0 = no cap
+    max_ram_gb: f64,
+    gpus: Vec<system::Gpu>,
+    gpu_support: Option<system::GpuSupport>,
+    gpu_probe: Option<std::sync::mpsc::Receiver<system::GpuSupport>>,
+    /// sage.exe path the GPU support was checked for
+    probed_sage: String,
 }
 
 /// Where the GUI remembers its last settings and tool paths between runs
@@ -69,7 +104,7 @@ fn state_path() -> Option<PathBuf> {
 }
 
 impl SageGui {
-    fn new() -> Self {
+    fn new(ctx: &egui::Context) -> Self {
         let mut app = SageGui {
             s: Settings::default(),
             tab: Tab::Files,
@@ -81,6 +116,18 @@ impl SageGui {
             problems: Vec::new(),
             show_json: false,
             last_saved: None,
+            unimod: Default::default(),
+            tracker: None,
+            usage: usage::Monitor::start(system::gpus()),
+            dark: false,
+            fit_step: 0,
+            overflow: 0.0,
+            threads: system::cpu_threads(),
+            max_ram_gb: 0.0,
+            gpus: system::gpus(),
+            gpu_support: None,
+            gpu_probe: None,
+            probed_sage: String::new(),
         };
         if let Some(state) = state_path()
             .and_then(|p| std::fs::read_to_string(p).ok())
@@ -91,6 +138,11 @@ impl SageGui {
             app.converter_exe = text("converter_exe");
             app.parquet = state.get("parquet").and_then(|v| v.as_bool()).unwrap_or(false);
             app.telemetry = state.get("telemetry").and_then(|v| v.as_bool()).unwrap_or(true);
+            app.dark = state.get("dark").and_then(|v| v.as_bool()).unwrap_or(false);
+            if let Some(n) = state.get("threads").and_then(|v| v.as_u64()) {
+                app.threads = (n as usize).clamp(1, system::cpu_threads());
+            }
+            app.max_ram_gb = state.get("max_ram_gb").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
             if let Some(Ok(s)) = state.get("config").map(Settings::from_json) {
                 app.s = s;
             }
@@ -103,6 +155,7 @@ impl SageGui {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
         }
+        theme::install(ctx, app.dark);
         app
     }
 
@@ -113,6 +166,9 @@ impl SageGui {
             "converter_exe": self.converter_exe,
             "parquet": self.parquet,
             "telemetry": self.telemetry,
+            "dark": self.dark,
+            "threads": self.threads,
+            "max_ram_gb": self.max_ram_gb,
             "config": self.s.to_json(&self.s.spectra),
         });
         if let Some(dir) = path.parent() {
@@ -168,9 +224,26 @@ impl SageGui {
     /// Check the settings, write the configuration into the output folder
     /// and start converting / searching
     fn start_run(&mut self, ctx: &egui::Context) {
-        let (mut errors, warnings) = self.s.check();
+        let (mut errors, mut warnings) = self.s.check();
         if !Path::new(&self.sage_exe).is_file() {
             errors.push("sage.exe not found: set its location under Files > Programs.".into());
+        }
+        // Only non-cleavable searches use the backend (see Crosslinking tab)
+        let xl = &self.s.crosslink;
+        if xl.enabled && !xl.is_cleavable() && xl.backend == Backend::Gpu {
+            match &self.gpu_support {
+                Some(system::GpuSupport::Yes(_)) => {}
+                Some(system::GpuSupport::No) => errors.push(
+                    "Crosslink backend gpu: this sage.exe was built without GPU support (Files > Resources). \
+                     Choose cpu or auto, or use a sage.exe built with --features gpu."
+                        .into(),
+                ),
+                _ => warnings.push(
+                    "Crosslink backend gpu: GPU support of sage.exe is unknown (Files > Resources); \
+                     the search fails if it has none."
+                        .into(),
+                ),
+            }
         }
         let has_raw = self.s.spectra.iter().any(|f| Settings::is_thermo_raw(f));
         if has_raw && !Path::new(&self.converter_exe).is_file() {
@@ -219,7 +292,7 @@ impl SageGui {
             return;
         }
 
-        let mut args = vec![config_path.into_os_string()];
+        let mut args = vec![config_path.into_os_string(), "--threads".into(), self.threads.to_string().into()];
         if self.parquet && !self.s.crosslink.enabled {
             args.push("--parquet".into());
         }
@@ -231,9 +304,63 @@ impl SageGui {
             program: PathBuf::from(&self.sage_exe),
             args,
             skip_if_exists: None,
+            memory_limit: (self.max_ram_gb > 0.0).then(|| (self.max_ram_gb * system::GB) as u64),
         });
         self.save_state();
+        let xl = &self.s.crosslink;
+        self.tracker = Some(progress::Tracker::new(progress::Plan {
+            files: spectra.len(),
+            raw_files: self.s.spectra.iter().filter(|f| Settings::is_thermo_raw(f)).count(),
+            crosslink: xl.enabled,
+            linear: xl.enabled && xl.linear_search,
+            quant: self.s.lfq || self.s.tmt != Tmt::None,
+            gpu_backend: xl.enabled && matches!(xl.backend, Backend::Gpu | Backend::Auto),
+            output_dir: out.clone(),
+        }));
         self.job = Some(Job::start(steps, ctx.clone()));
+        self.tab = Tab::Progress;
+    }
+
+    /// Feed new log lines to the tracker, and close it when the job ends
+    fn follow_job(&mut self) {
+        let (Some(job), Some(tracker)) = (&self.job, &mut self.tracker) else { return };
+        let log = job.log.lock().unwrap().clone();
+        tracker.update(&log, job.total.load(std::sync::atomic::Ordering::Relaxed));
+        match job.status() {
+            Status::Running(_) => {}
+            Status::Finished => tracker.finish(progress::State::Finished, None, &log),
+            Status::Cancelled => tracker.finish(progress::State::Cancelled, None, &log),
+            Status::Failed(e) => tracker.finish(progress::State::Failed, Some(&e), &log),
+        }
+    }
+
+    /// Start-up only: record how far `tab` overflows the scroll area, and
+    /// once every tab has been measured, grow the window so the tallest tab
+    /// needs no scrolling (limited by the screen height). Each tab is drawn
+    /// invisibly for two frames, since grids size their rows from the previous frame.
+    fn measure_step(&mut self, ctx: &egui::Context, overflow: f32) {
+        if self.fit_step % 2 == 1 {
+            self.overflow = self.overflow.max(overflow);
+        }
+        self.fit_step += 1;
+        ctx.request_repaint();
+        if self.fit_step < FIT_STEPS || self.overflow <= 0.0 {
+            return;
+        }
+        let window = ctx.screen_rect().size();
+        let mut height = window.y + self.overflow + 8.0;
+        let monitor = ctx.input(|i| i.viewport().monitor_size);
+        if let Some(monitor) = monitor {
+            // egui-winit reports the monitor in physical pixels
+            let monitor = monitor / ctx.pixels_per_point();
+            // leave room for the title bar and the taskbar
+            height = height.min(monitor.y - 90.0);
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                ((monitor.x - window.x) / 2.0).max(0.0),
+                ((monitor.y - height) / 2.0 - 30.0).max(0.0),
+            )));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(window.x, height)));
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
@@ -257,6 +384,7 @@ impl SageGui {
 impl eframe::App for SageGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_dropped_files(ctx);
+        self.follow_job();
         if ctx.input(|i| i.viewport().close_requested()) {
             if let Some(job) = &self.job {
                 job.cancel();
@@ -299,16 +427,34 @@ impl eframe::App for SageGui {
                 }
                 ui.toggle_value(&mut self.show_json, "Show JSON")
                     .on_hover_text("Show the configuration file that will be passed to sage.exe.");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::theme_switch(ui, &mut self.dark) {
+                        theme::set_dark(ctx, self.dark);
+                    }
+                });
             });
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 for (tab, name) in Tab::ALL {
-                    let label = if tab == Tab::Crosslink && self.s.crosslink.enabled {
-                        format!("{name} ●")
+                    if tab == Tab::Progress {
+                        let Some(state) = self.tracker.as_ref().map(|t| t.state) else { continue };
+                        let selected = self.tab == tab;
+                        let (fill, border) = progress_tab_colors(ui, state, selected);
+                        let r = ui.add(
+                            egui::Button::new(name).selected(selected).fill(fill).stroke(egui::Stroke::NONE),
+                        );
+                        if r.clicked() {
+                            self.tab = tab;
+                        }
+                        ui.painter().rect_stroke(
+                            r.rect.expand(2.0),
+                            4.0,
+                            egui::Stroke::new(2.0_f32, border),
+                            egui::StrokeKind::Outside,
+                        );
                     } else {
-                        name.to_string()
-                    };
-                    ui.selectable_value(&mut self.tab, tab, label);
+                        ui.selectable_value(&mut self.tab, tab, name);
+                    }
                 }
             });
             ui.add_space(2.0);
@@ -319,7 +465,7 @@ impl eframe::App for SageGui {
             ui.horizontal(|ui| {
                 let running = self.running();
                 let run = ui
-                    .add_enabled(!running, egui::Button::new(RichText::new("▶ Run search").strong()))
+                    .add_enabled(!running, theme::tone_button(ui, "▶ Run search", theme::Tone::Blue))
                     .on_hover_text(
                         "Check the settings, convert any Thermo .raw files to mzML, write \
                          sage_search.json into the output folder and run sage.exe.",
@@ -327,7 +473,7 @@ impl eframe::App for SageGui {
                 if run.clicked() {
                     self.start_run(ctx);
                 }
-                if ui.add_enabled(running, egui::Button::new("■ Cancel")).clicked() {
+                if ui.add_enabled(running, theme::tone_button(ui, "■ Cancel", theme::Tone::Tan)).clicked() {
                     if let Some(job) = &self.job {
                         job.cancel();
                     }
@@ -344,7 +490,10 @@ impl eframe::App for SageGui {
                     let (text, color) = match job.status() {
                         Status::Running(step) => (format!("Running: {step}"), Color32::from_rgb(70, 130, 220)),
                         Status::Finished => ("Finished".to_string(), Color32::from_rgb(40, 160, 70)),
-                        Status::Failed(e) => (format!("Failed: {e}"), Color32::from_rgb(210, 60, 60)),
+                        Status::Failed(_) => (
+                            "Failed: see the Progress tab for what went wrong".to_string(),
+                            Color32::from_rgb(210, 60, 60),
+                        ),
                         Status::Cancelled => ("Cancelled".to_string(), Color32::GRAY),
                     };
                     if job.is_running() {
@@ -352,17 +501,21 @@ impl eframe::App for SageGui {
                     }
                     ui.label(RichText::new(text).color(color));
                 }
+                if self.tab == Tab::Progress {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(12.0);
+                        self.usage_meters(ui);
+                    });
+                }
             });
             ui.add_space(4.0);
         });
 
-        if self.job.is_some() || !self.problems.is_empty() {
-            egui::TopBottomPanel::bottom("log")
-                .resizable(true)
-                .default_height(220.0)
-                .min_height(80.0)
-                .show(ctx, |ui| {
-                    ui.add_space(4.0);
+        // Settings problems and load/save messages; the search log is on the Progress tab
+        if !self.problems.is_empty() {
+            egui::TopBottomPanel::bottom("problems").show(ctx, |ui| {
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
                     for (is_error, msg) in &self.problems {
                         let (icon, color) = if *is_error {
                             ("✖", Color32::from_rgb(210, 60, 60))
@@ -371,25 +524,13 @@ impl eframe::App for SageGui {
                         };
                         ui.label(RichText::new(format!("{icon} {msg}")).color(color));
                     }
-                    if let Some(job) = &self.job {
-                        ui.separator();
-                        let lines = job.log.lock().unwrap().clone();
-                        ui.horizontal(|ui| {
-                            ui.strong("Log");
-                            if ui.small_button("Copy").clicked() {
-                                ui.ctx().copy_text(lines.join("\n"));
-                            }
-                        });
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .stick_to_bottom(true)
-                            .show(ui, |ui| {
-                                for line in &lines {
-                                    ui.label(RichText::new(line).monospace().size(12.0));
-                                }
-                            });
-                    }
                 });
+                ui.add_space(2.0);
+            });
+        }
+
+        if self.tab == Tab::Progress {
+            self.progress_log(ctx);
         }
 
         if self.show_json {
@@ -408,18 +549,27 @@ impl eframe::App for SageGui {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let measuring = self.fit_step < FIT_STEPS;
+            let tab = if measuring { Tab::ALL[self.fit_step / 2].0 } else { self.tab };
+            let out = egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                if measuring {
+                    ui.set_invisible();
+                }
                 ui.add_space(6.0);
                 let running = self.running();
-                ui.add_enabled_ui(!running, |ui| match self.tab {
+                ui.add_enabled_ui(!running, |ui| match tab {
                     Tab::Files => self.files_tab(ui),
                     Tab::Database => database_tab(ui, &mut self.s),
-                    Tab::Modifications => modifications_tab(ui, &mut self.s),
+                    Tab::Modifications => modifications_tab(ui, &mut self.s, &mut self.unimod),
                     Tab::Spectra => spectra_tab(ui, &mut self.s),
                     Tab::Scoring => scoring_tab(ui, &mut self.s),
                     Tab::Crosslink => crosslink_tab(ui, &mut self.s),
+                    Tab::Progress => self.progress_tab(ui),
                 });
             });
+            if measuring {
+                self.measure_step(ctx, out.content_size.y - out.inner_rect.height());
+            }
         });
     }
 }
@@ -429,7 +579,8 @@ impl eframe::App for SageGui {
 
 /// One labelled row in a two-column grid; `tip` shows on hover over both
 fn row(ui: &mut Ui, label: &str, tip: &str, add: impl FnOnce(&mut Ui) -> Response) {
-    ui.label(label).on_hover_text(tip);
+    let muted = theme::muted(ui);
+    ui.label(RichText::new(label).color(muted)).on_hover_text(tip);
     ui.horizontal(|ui| add(ui).on_hover_text(tip));
     ui.end_row();
 }
@@ -443,9 +594,7 @@ fn grid(ui: &mut Ui, id: &str, add: impl FnOnce(&mut Ui)) {
 }
 
 fn heading(ui: &mut Ui, text: &str) {
-    ui.add_space(8.0);
-    ui.heading(text);
-    ui.add_space(2.0);
+    theme::section(ui, text);
 }
 
 fn note(ui: &mut Ui, text: &str) {
@@ -479,6 +628,15 @@ fn optional<T: egui::emath::Numeric>(
         None => r |= ui.label(RichText::new(auto).weak()),
     }
     r
+}
+
+const CHARGE_TIP: &str = "Precursor charge states to try when the file does not report one (or always, \
+    with 'Override charge'). Default 2 to 4; crosslinked peptides are usually 3+ to 6+ (sometimes up to 8+).";
+
+/// Precursor charge range; each bound is limited by the other so min <= max
+fn charge_range(ui: &mut Ui, z: &mut (u8, u8)) -> Response {
+    let r = ui.add(DragValue::new(&mut z.0).range(1..=z.1).speed(0.05).prefix("from ").suffix("+"));
+    r | ui.add(DragValue::new(&mut z.1).range(z.0..=10).speed(0.05).prefix("to ").suffix("+"))
 }
 
 fn tolerance(ui: &mut Ui, id: &str, t: &mut Tolerance) -> Response {
@@ -600,14 +758,62 @@ impl SageGui {
                 ui,
                 "Output folder",
                 "Folder where Sage writes results.sage.tsv (PSMs), results.json (the full settings \
-                 used), quantification tables and, for crosslink searches, crosslinks.sage.tsv.\n\
+                 used), quantification tables and, for crosslink searches, crosslinks.sage.tsv \
+                 plus crosslinks_xiView.csv and crosslinks.mzid (for xiVIEW, PRIDE) and \
+                 crosslinks_proXL.xml (for ProXL).\n\
                  Created if it does not exist. Example: C:\\results\\2026-11-01_hela",
                 |ui| {
-                    path_field(ui, &mut self.s.output_directory, "C:\\results\\my_search", || {
-                        rfd::FileDialog::new().pick_folder()
-                    })
+                    // dialogs open where the current output folder is, or its closest existing parent
+                    let current = self.s.output_directory.clone();
+                    let start = Path::new(&current)
+                        .ancestors()
+                        .find(|d| d.is_dir() && !d.as_os_str().is_empty())
+                        .map(Path::to_path_buf);
+                    let start2 = start.clone();
+                    let mut r = path_field(ui, &mut self.s.output_directory, "C:\\results\\my_search", || {
+                        let mut dialog = rfd::FileDialog::new().set_title("Choose the output folder");
+                        if let Some(dir) = start {
+                            dialog = dialog.set_directory(dir);
+                        }
+                        dialog.pick_folder()
+                    });
+                    // A Save dialog: go to the location, type the new folder's name, press Save
+                    let new = ui.button("New folder…").on_hover_text(
+                        "Create a new folder for the results: go to where it should be, type its name \
+                         in 'File name' and press Save. The folder is created and selected.",
+                    );
+                    if new.clicked() {
+                        let mut dialog = rfd::FileDialog::new()
+                            .set_title("New output folder: go to its location, type the folder name, press Save")
+                            .set_file_name("sage_results");
+                        if let Some(dir) = start2 {
+                            dialog = dialog.set_directory(dir);
+                        }
+                        if let Some(path) = dialog.save_file() {
+                            match std::fs::create_dir_all(&path) {
+                                Ok(()) => {
+                                    self.s.output_directory = path.display().to_string();
+                                    self.problems = vec![(false, format!("Created {}", path.display()))];
+                                }
+                                Err(e) => {
+                                    self.problems = vec![(true, format!("Could not create {}: {e}", path.display()))]
+                                }
+                            }
+                        }
+                    }
+                    r |= new;
+                    r
                 },
             );
+            let out = self.s.output_directory.trim();
+            if !out.is_empty() && !Path::new(out).is_dir() {
+                ui.label("");
+                ui.label(
+                    RichText::new("This folder does not exist yet: it will be created when the search starts.")
+                        .color(theme::muted(ui)),
+                );
+                ui.end_row();
+            }
             let xl = self.s.crosslink.enabled;
             row(
                 ui,
@@ -659,6 +865,423 @@ impl SageGui {
                  developers by default. Untick to run with --disable-telemetry-i-dont-want-to-improve-sage.",
                 |ui| ui.checkbox(&mut self.telemetry, "send anonymous usage statistics to the Sage developers"),
             );
+        });
+
+        self.resources(ui);
+    }
+
+    /// The Progress tab: steps, progress bar, log, and the report or error
+    fn progress_tab(&mut self, ui: &mut Ui) {
+        let Some(t) = &self.tracker else {
+            heading(ui, "Search progress");
+            note(ui, "No search has been run yet. Press ▶ Run search to start one; its progress appears here.");
+            return;
+        };
+        let (ok, bad, warn) = (Color32::from_rgb(40, 160, 70), Color32::from_rgb(210, 60, 60), Color32::from_rgb(220, 135, 30));
+        let muted = theme::muted(ui);
+        let running = t.state == progress::State::Running;
+        // keep clear of the scroll bar on the right
+        ui.set_max_width(ui.available_width() - 20.0);
+
+        heading(ui, "Search progress");
+        ui.horizontal(|ui| {
+            let (text, color) = match t.state {
+                progress::State::Running => (format!("Running: {}", t.activity()), theme::accent(ui)),
+                progress::State::Finished => ("✔ Search finished successfully".to_string(), ok),
+                progress::State::Failed => (
+                    format!("✖ Search failed: {}", t.diagnosis.as_ref().map_or("see below", |d| d.title.as_str())),
+                    bad,
+                ),
+                progress::State::Cancelled => ("■ Search cancelled".to_string(), muted),
+            };
+            if running {
+                ui.spinner();
+            }
+            ui.label(RichText::new(text).color(color).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(format!("elapsed {}", progress::format_duration(t.elapsed()))).color(muted));
+            });
+        });
+        let fill = match t.state {
+            progress::State::Running => theme::accent(ui),
+            progress::State::Finished => ok,
+            progress::State::Failed => bad,
+            progress::State::Cancelled => muted,
+        };
+        let bar = ui.add(
+            egui::ProgressBar::new(t.fraction())
+                .fill(fill)
+                .animate(running),
+        );
+        // Percentage centred on the bar, dark blue on a pale backdrop so it reads
+        // over every fill colour and over the empty track
+        let navy = Color32::from_rgb(15, 40, 100);
+        let galley = ui.painter().layout_no_wrap(
+            format!("{:.0}%", 100.0 * t.fraction()),
+            egui::FontId::proportional(14.0),
+            navy,
+        );
+        let pos = bar.rect.center() - galley.size() / 2.0;
+        let backdrop = egui::Rect::from_min_size(pos, galley.size()).expand2(egui::vec2(6.0, 0.0));
+        ui.painter().rect_filled(backdrop, 4.0, Color32::from_white_alpha(190));
+        ui.painter().galley(pos, galley, navy);
+        if running {
+            // keep the elapsed time and animation moving
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        }
+
+        heading(ui, "Steps");
+        egui::Grid::new("progress_steps").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+            for (i, stage) in t.stages.iter().enumerate() {
+                let done = t.took[i].is_some() && (i < t.current || t.state == progress::State::Finished);
+                let current = i == t.current && !done;
+                if done {
+                    ui.label(RichText::new("✔").color(ok));
+                } else if current && running {
+                    ui.spinner();
+                } else if current && t.state == progress::State::Failed {
+                    ui.label(RichText::new("✖").color(bad));
+                } else if current && t.state == progress::State::Cancelled {
+                    ui.label(RichText::new("■").color(muted));
+                } else {
+                    ui.label(RichText::new("○").color(muted));
+                }
+                let label = RichText::new(stage.label());
+                ui.label(if done || current { label } else { label.color(muted) });
+                let detail = match (stage, done) {
+                    (progress::Stage::Search, _) if t.plan.files > 0 && t.stage() != progress::Stage::Linear => {
+                        format!("{} of {} files", t.files_done, t.plan.files)
+                    }
+                    (progress::Stage::Linear, true) => format!("{0} of {0} files", t.plan.files),
+                    (progress::Stage::Linear, false) if t.plan.files > 0 => {
+                        format!("{} of {} files", t.files_done, t.plan.files)
+                    }
+                    (progress::Stage::Convert, _) => format!("{} of {} files", t.converted, t.plan.raw_files),
+                    _ => String::new(),
+                };
+                let time = t.took[i].filter(|_| done).map(progress::format_duration).unwrap_or_default();
+                let sep = if !detail.is_empty() && !time.is_empty() { "  ·  " } else { "" };
+                ui.label(RichText::new(format!("{detail}{sep}{time}")).color(muted));
+                ui.end_row();
+            }
+        });
+
+        if t.state == progress::State::Failed {
+            if let Some(d) = &t.diagnosis {
+                heading(ui, "What went wrong");
+                egui::Frame::group(ui.style())
+                    .stroke(egui::Stroke::new(1.5_f32, bad))
+                    .inner_margin(10.0)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(&d.title).color(bad).strong().size(16.0));
+                        ui.label(&d.cause);
+                        ui.add_space(6.0);
+                        ui.strong("How to fix it");
+                        for fix in &d.fixes {
+                            ui.label(format!("•  {fix}"));
+                        }
+                        if !d.evidence.is_empty() {
+                            ui.add_space(6.0);
+                            ui.strong("Error message");
+                            for line in &d.evidence {
+                                ui.label(RichText::new(line).monospace().size(12.0).color(muted));
+                            }
+                        }
+                    });
+            }
+        }
+
+        if t.state == progress::State::Finished {
+            heading(ui, "Report");
+            if t.identifications() == Some(0) {
+                let hint = if t.plan.crosslink {
+                    "No crosslinks were identified at 1% FDR. Check the reagent and its reactive residues, the \
+                     precursor charge range (crosslinks are usually 3+ to 6+), the tolerances, and that the \
+                     FASTA contains the crosslinked proteins."
+                } else {
+                    "No peptides were identified at 1% FDR. Check that the FASTA matches the sample's species, \
+                     the enzyme, the precursor and fragment tolerances, the fixed modifications (e.g. \
+                     carbamidomethyl C), and that the files contain MS2 spectra."
+                };
+                ui.label(RichText::new(format!("⚠ {hint}")).color(warn));
+                ui.add_space(4.0);
+            }
+            for note in t.missing_exports() {
+                ui.label(RichText::new(format!("ℹ {note}")).color(warn));
+            }
+            // Two columns of label / value pairs: the first half of the list on
+            // the left, the second half on the right
+            let half = t.metrics.len().div_ceil(2);
+            egui::Grid::new("progress_metrics").num_columns(4).spacing([18.0, 6.0]).show(ui, |ui| {
+                for i in 0..half {
+                    for (label, value) in [t.metrics.get(i), t.metrics.get(i + half)].into_iter().flatten() {
+                        ui.label(RichText::new(label).color(muted));
+                        ui.label(RichText::new(value).strong());
+                    }
+                    ui.end_row();
+                }
+            });
+            if !t.outputs.is_empty() {
+                ui.add_space(6.0);
+                ui.strong("Output files");
+                let half = t.outputs.len().div_ceil(2);
+                egui::Grid::new("progress_outputs").num_columns(4).spacing([18.0, 4.0]).show(ui, |ui| {
+                    for i in 0..half {
+                        for (path, size) in [t.outputs.get(i), t.outputs.get(i + half)].into_iter().flatten() {
+                            ui.label(path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+                                .on_hover_text(path.display().to_string());
+                            ui.label(RichText::new(human_size(*size)).color(muted));
+                        }
+                        ui.end_row();
+                    }
+                });
+            }
+            let out = t.plan.output_dir.clone();
+            if ui.button("Open results folder").clicked() {
+                let _ = std::process::Command::new("explorer").arg(&out).spawn();
+            }
+        }
+
+        if !t.warnings.is_empty() && t.state != progress::State::Running {
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(RichText::new(format!("Warnings from Sage ({})", t.warnings.len())).color(warn))
+                .id_salt("progress_warnings")
+                .show(ui, |ui| {
+                    for w in &t.warnings {
+                        ui.label(format!("•  {w}"));
+                    }
+                });
+        }
+
+    }
+
+    /// CPU, RAM, GPU and vRAM utilisation of the whole computer, right to left
+    fn usage_meters(&self, ui: &mut Ui) {
+        let Some(u) = self.usage.latest(ui.ctx()) else {
+            ui.label(RichText::new("measuring usage…").color(theme::muted(ui)));
+            return;
+        };
+        let gb = |b: u64| b as f64 / system::GB;
+        let meter = |ui: &mut Ui, name: &str, pct: Option<f32>, tip: String| {
+            let value = match pct {
+                Some(p) => RichText::new(format!("{p:.0}%")).strong().color(if p >= 90.0 {
+                    Color32::from_rgb(210, 60, 60)
+                } else {
+                    ui.visuals().text_color()
+                }),
+                None => RichText::new("–").color(theme::muted(ui)),
+            };
+            // right to left: value first, then its name
+            let r = ui.label(value).on_hover_text(&tip);
+            ui.label(RichText::new(name).color(theme::muted(ui))).on_hover_text(&tip);
+            ui.add_space(10.0);
+            r
+        };
+        let all_gpus = u
+            .gpus
+            .iter()
+            .map(|g| match g.vram_pct() {
+                Some(v) if g.vram_total >= 512 << 20 => format!(
+                    "{}: {:.0}% busy, {:.1} of {:.1} GB vRAM ({v:.0}%)",
+                    g.name, g.util, gb(g.vram_used), gb(g.vram_total)
+                ),
+                _ => format!("{}: {:.0}% busy (integrated, uses system RAM)", g.name, g.util),
+            })
+            .collect::<Vec<_>>()
+            .join("
+");
+        let main = u.main_gpu().filter(|g| g.vram_total >= 512 << 20).or(u.main_gpu());
+        let gpu_tip = format!("Whole computer, as in Task Manager (busiest engine type).
+{all_gpus}");
+        let vram_pct = main.filter(|g| g.vram_total >= 512 << 20).and_then(|g| g.vram_pct());
+        meter(ui, "vRAM", vram_pct, match main {
+            Some(g) if vram_pct.is_some() => format!(
+                "{}: {:.1} of {:.1} GB dedicated video memory in use (whole computer).",
+                g.name, gb(g.vram_used), gb(g.vram_total)
+            ),
+            _ => "No graphics card with its own video memory.".into(),
+        });
+        meter(ui, "GPU", main.map(|g| g.util), gpu_tip);
+        meter(ui, "RAM", Some(u.ram_pct()), format!(
+            "{:.1} of {:.1} GB of memory in use (whole computer).",
+            gb(u.ram_used), gb(u.ram_total)
+        ));
+        meter(ui, "CPU", Some(u.cpu), format!(
+            "Processor use of the whole computer across {} logical CPUs.",
+            system::cpu_threads()
+        ));
+    }
+
+    /// The search log, in a panel along the bottom of the Progress tab whose
+    /// top edge can be dragged to show more or fewer lines
+    fn progress_log(&self, ctx: &egui::Context) {
+        let Some(job) = &self.job else { return };
+        let lines = job.log.lock().unwrap().clone();
+        let (bad, warn) = (Color32::from_rgb(210, 60, 60), Color32::from_rgb(220, 135, 30));
+        let max = ctx.screen_rect().height() * 0.8;
+        egui::TopBottomPanel::bottom("progress_log")
+            .resizable(true)
+            .default_height(260.0)
+            .height_range(90.0..=max)
+            .show(ctx, |ui| {
+                // grip on the draggable top edge
+                let top = ui.max_rect().top() - 3.0;
+                let x = ui.max_rect().center().x;
+                ui.painter().line_segment(
+                    [egui::pos2(x - 22.0, top), egui::pos2(x + 22.0, top)],
+                    egui::Stroke::new(3.0_f32, theme::muted(ui)),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Log").size(17.0).color(theme::accent(ui)));
+                    ui.label(RichText::new(format!("{} lines", lines.len())).color(theme::muted(ui)));
+                    if ui.small_button("Copy log").on_hover_text("Copy the whole log, e.g. to report a problem.").clicked() {
+                        ui.ctx().copy_text(lines.join("\n"));
+                    }
+                    ui.label(RichText::new("drag the top edge to resize").color(theme::muted(ui)).size(12.0));
+                });
+                let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    egui::ScrollArea::both()
+                        .id_salt("progress_log")
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show_rows(ui, row_height, lines.len(), |ui, rows| {
+                            for line in &lines[rows] {
+                                let color = if line.contains(" ERROR ") || line.starts_with("Error") || line.starts_with("=== Failed") {
+                                    bad
+                                } else if line.contains(" WARN ") {
+                                    warn
+                                } else if line.starts_with("---") || line.starts_with("===") {
+                                    theme::accent(ui)
+                                } else {
+                                    ui.visuals().text_color()
+                                };
+                                // one row per line (show_rows needs equal heights): scroll, don't wrap
+                                ui.add(egui::Label::new(RichText::new(line).monospace().size(12.0).color(color)).extend());
+                            }
+                        });
+                });
+            });
+    }
+
+    /// CPU threads, RAM cap and GPUs available to sage.exe
+    fn resources(&mut self, ui: &mut Ui) {
+        // Re-check GPU support whenever sage.exe changes
+        if self.probed_sage != self.sage_exe {
+            self.probed_sage = self.sage_exe.clone();
+            self.gpu_support = None;
+            self.gpu_probe = Some(system::probe_in_background(Path::new(&self.sage_exe), ui.ctx()));
+        }
+        if let Some(Ok(support)) = self.gpu_probe.as_ref().map(|rx| rx.try_recv()) {
+            self.gpu_support = Some(support);
+            self.gpu_probe = None;
+        }
+
+        heading(ui, "Resources");
+        let cpus = system::cpu_threads();
+        let total_gb = system::total_ram().map(|b| b as f64 / system::GB);
+        grid(ui, "resources", |ui| {
+            let tip = format!(
+                "Maximum CPU threads sage.exe may use (passed as --threads). This computer has {cpus}. \
+                 Fewer threads leave the computer responsive for other work; searches take longer."
+            );
+            row(ui, "CPU threads", &tip, |ui| {
+                let r = ui.add(DragValue::new(&mut self.threads).range(1..=cpus).speed(0.1));
+                ui.label(RichText::new(format!("of {cpus}")).color(theme::muted(ui)));
+                let all = ui.add_enabled(self.threads != cpus, egui::Button::new("Use all").small());
+                if all.clicked() {
+                    self.threads = cpus;
+                }
+                r | all
+            });
+            let installed = total_gb.map(|g| format!("{g:.1} GB")).unwrap_or("unknown".into());
+            let tip = format!(
+                "Most memory sage.exe may use, in GB. 0 = no limit (all available). Installed: {installed}.\n\
+                 Enforced by Windows: if the search needs more, sage.exe is stopped with a \"ran out of memory\" \
+                 message instead of slowing the whole computer down. Large databases, many variable \
+                 modifications, crosslink searches and many files at once need the most memory."
+            );
+            row(ui, "Max RAM", &tip, |ui| {
+                let max = total_gb.unwrap_or(1024.0).ceil();
+                let r = ui.add(
+                    DragValue::new(&mut self.max_ram_gb).range(0.0..=max).speed(0.25).max_decimals(1).suffix(" GB"),
+                );
+                let text = match (self.max_ram_gb > 0.0, total_gb) {
+                    (false, Some(t)) => format!("0 = all available ({t:.1} GB installed)"),
+                    (false, None) => "0 = all available".into(),
+                    (true, Some(t)) => format!("of {t:.1} GB installed"),
+                    (true, None) => String::new(),
+                };
+                ui.label(RichText::new(text).color(theme::muted(ui)));
+                r
+            });
+            row(ui, "GPU", "Graphics adapters Windows reports, with their dedicated video memory (vRAM). \
+                Integrated graphics have no vRAM of their own and borrow system RAM.", |ui| {
+                ui.vertical(|ui| {
+                    if self.gpus.is_empty() {
+                        ui.label(RichText::new("none found").color(theme::muted(ui)));
+                    }
+                    for gpu in &self.gpus {
+                        let memory = if gpu.vram >= 512 << 20 {
+                            format!("{:.1} GB vRAM", gpu.vram as f64 / system::GB)
+                        } else {
+                            format!("integrated, shares up to {:.1} GB of system RAM", gpu.shared as f64 / system::GB)
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(&gpu.name);
+                            ui.label(RichText::new(memory).color(theme::muted(ui)));
+                        });
+                    }
+                })
+                .response
+            });
+            row(ui, "GPU support", "Whether this sage.exe can use a GPU. Only the gpu / auto backend of \
+                non-cleavable crosslink searches uses one (Crosslinking tab); everything else runs on the CPU.\n\
+                It needs a sage.exe built with: cargo build --release --features gpu, and a Vulkan or \
+                DirectX 12 graphics driver.", |ui| {
+                let (ok, warn) = (Color32::from_rgb(40, 160, 70), Color32::from_rgb(200, 130, 30));
+                let r = match &self.gpu_support {
+                    None => {
+                        ui.spinner();
+                        ui.label(RichText::new("checking sage.exe…").color(theme::muted(ui)))
+                    }
+                    Some(system::GpuSupport::Yes(adapters)) => {
+                        // hardware adapters only, each name once (it may appear per backend)
+                        let mut names: Vec<&str> = Vec::new();
+                        for name in adapters
+                            .iter()
+                            .filter(|a| !a.ends_with("| Cpu"))
+                            .map(|a| a.split(" | ").next().unwrap_or(a))
+                        {
+                            if !names.contains(&name) {
+                                names.push(name);
+                            }
+                        }
+                        if names.is_empty() {
+                            ui.label(
+                                RichText::new("✖ sage.exe has GPU support, but no Vulkan / DirectX 12 GPU is usable \
+                                    (update the graphics driver)")
+                                    .color(warn),
+                            )
+                        } else {
+                            ui.label(RichText::new(format!("✔ ready: sage.exe can use {}", names.join(", "))).color(ok))
+                        }
+                    }
+                    Some(system::GpuSupport::No) => ui.label(
+                        RichText::new("✖ this sage.exe was built without GPU support (cargo build --release --features gpu)")
+                            .color(warn),
+                    ),
+                    Some(system::GpuSupport::Unknown(why)) => ui.label(RichText::new(format!("? {why}")).color(warn)),
+                };
+                let again = ui.add_enabled(self.gpu_probe.is_none(), egui::Button::new("Check again").small());
+                if again.clicked() {
+                    self.probed_sage.clear();
+                    self.gpus = system::gpus();
+                }
+                r | again
+            });
         });
     }
 }
@@ -774,6 +1397,26 @@ fn database_tab(ui: &mut Ui, s: &mut Settings) {
             |ui| ui.checkbox(&mut s.semi_enzymatic, "semi-specific digestion"));
     });
 
+    heading(ui, "Precursor charge states");
+    note(ui, "Used by linear and crosslink searches alike.");
+    grid(ui, "charges", |ui| {
+        row(ui, "Precursor charge", CHARGE_TIP, |ui| {
+            let r = charge_range(ui, &mut s.precursor_charge);
+            let presets = [((2, 4), "Linear: 2+ to 4+"), ((3, 6), "Crosslinks: 3+ to 6+")];
+            presets.into_iter().fold(r, |r, (z, label)| {
+                let b = ui
+                    .add_enabled(s.precursor_charge != z, egui::Button::new(label).small())
+                    .on_hover_text("Typical range for this kind of search.");
+                if b.clicked() {
+                    s.precursor_charge = z;
+                }
+                r | b
+            })
+        });
+        row(ui, "Override charge", "Ignore the charge state in the file and always try the range above.",
+            |ui| ui.checkbox(&mut s.override_precursor_charge, "always use the charge range"));
+    });
+
     heading(ui, "Peptides & fragments");
     grid(ui, "peptides", |ui| {
         row(ui, "Minimum peptide mass", "Lightest peptide (monoisotopic, Da) to search.\n\
@@ -823,7 +1466,97 @@ const TARGET_TIP: &str = "Where the modification can occur:\n\
     • [ protein N-terminus, [M\n\
     • ] protein C-terminus";
 
-fn modifications_tab(ui: &mut Ui, s: &mut Settings) {
+/// Enter a UniMod accession, fetch the record and add it at one of its sites
+fn unimod_panel(ui: &mut Ui, s: &mut Settings, lk: &mut unimod::Lookup) {
+    let tip = "Type a UniMod accession number (the Accession # column of unimod.org's modification list), \
+        e.g. 35 for oxidation or UNIMOD:21 for phospho, and press Enter. The name, monoisotopic mass and \
+        allowed sites are fetched from unimod.org (downloaded once, then cached).";
+    let busy = lk.busy();
+    ui.horizontal(|ui| {
+        ui.label("UniMod accession #").on_hover_text(tip);
+        let edit = ui
+            .add(TextEdit::singleline(&mut lk.input).hint_text("e.g. 35").desired_width(100.0))
+            .on_hover_text(tip);
+        let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let look = ui.add_enabled(!busy, egui::Button::new("Look up")).on_hover_text(tip);
+        if !busy && (look.clicked() || enter) {
+            lk.start(ui.ctx());
+        }
+        if busy {
+            ui.spinner();
+            ui.label(RichText::new("Fetching from unimod.org…").weak());
+        }
+    });
+
+    let entry = match &lk.result {
+        None => return,
+        Some(Err(e)) => {
+            ui.label(RichText::new(format!("✖ {e}")).color(Color32::from_rgb(210, 60, 60)));
+            return;
+        }
+        Some(Ok(entry)) => entry.clone(),
+    };
+    ui.group(|ui| {
+        ui.horizontal(|ui| {
+            ui.strong(format!("{}  {}", entry.proforma(), entry.title));
+            ui.label(format!("({})", entry.full_name));
+            ui.hyperlink_to(
+                "view on unimod.org",
+                format!("https://www.unimod.org/modifications_view.php?editid1={}", entry.accession),
+            );
+        });
+        ui.label(format!("Monoisotopic mass {:+.6} Da   ·   composition {}", entry.mono_mass, entry.composition));
+        ui.add_space(4.0);
+        egui::Grid::new("unimod_sites").num_columns(5).spacing([14.0, 4.0]).striped(true).show(ui, |ui| {
+            ui.strong("Site");
+            ui.strong("Position");
+            ui.strong("Classification");
+            ui.strong("Sage target").on_hover_text(TARGET_TIP);
+            ui.label("");
+            ui.end_row();
+            for spec in &entry.specificities {
+                ui.label(&spec.site);
+                ui.label(&spec.position);
+                ui.label(&spec.classification);
+                let Some(target) = &spec.target else {
+                    ui.label(RichText::new("not supported").weak())
+                        .on_hover_text("Sage can't express this site (e.g. a residue that is not a standard amino acid).");
+                    ui.label("");
+                    ui.end_row();
+                    continue;
+                };
+                ui.monospace(target);
+                ui.horizontal(|ui| {
+                    for (kind, label) in [(ModKind::Fixed, "Add fixed"), (ModKind::Variable, "Add variable")] {
+                        let added = s.mods.iter().any(|m| {
+                            m.kind == kind && m.target == *target && (m.mass - entry.mono_mass).abs() < 1e-6
+                        });
+                        let b = ui
+                            .add_enabled(!added, egui::Button::new(if added { "✔ added" } else { label }).small())
+                            .on_hover_text(format!(
+                                "Add {} ({:+.6} Da) on {target} as a {} modification.",
+                                entry.title,
+                                entry.mono_mass,
+                                if kind == ModKind::Fixed { "fixed" } else { "variable" }
+                            ));
+                        if b.clicked() {
+                            s.mods.push(Modification {
+                                target: target.clone(),
+                                mass: entry.mono_mass,
+                                name: entry.proforma(),
+                                kind,
+                                max_count: 0,
+                            });
+                        }
+                    }
+                });
+                ui.end_row();
+            }
+        });
+    });
+}
+
+fn modifications_tab(ui: &mut Ui, s: &mut Settings, lk: &mut unimod::Lookup) {
     heading(ui, "Modifications");
     note(ui, "Fixed modifications are always present (e.g. carbamidomethyl C after iodoacetamide). \
         Variable modifications may or may not be present; each one increases search time.");
@@ -860,6 +1593,8 @@ fn modifications_tab(ui: &mut Ui, s: &mut Settings) {
             });
         }
     });
+    ui.add_space(4.0);
+    unimod_panel(ui, s, lk);
     ui.add_space(6.0);
 
     let mut remove = None;
@@ -930,15 +1665,9 @@ fn spectra_tab(ui: &mut Ui, s: &mut Settings) {
             });
     });
 
-    heading(ui, "Charge states");
-    grid(ui, "charges", |ui| {
-        row(ui, "Precursor charge", "Charge states to try when the file does not report one. Default 2 to 4; \
-            crosslinked peptides are often 3+ to 6+.", |ui| {
-            let r = ui.add(DragValue::new(&mut s.precursor_charge.0).range(1..=10).prefix("from "));
-            r | ui.add(DragValue::new(&mut s.precursor_charge.1).range(1..=10).prefix("to "))
-        });
-        row(ui, "Override charge", "Ignore the charge state in the file and always try the range above.",
-            |ui| ui.checkbox(&mut s.override_precursor_charge, "always use the charge range"));
+    heading(ui, "Fragment charge");
+    note(ui, "The precursor charge range is on the Database & enzyme tab.");
+    grid(ui, "fragment_charge", |ui| {
         row(ui, "Max fragment charge", "Highest fragment ion charge to consider. Unset = precursor charge - 1. \
             Example: 1 for low charge peptides, 2 for most HCD data.",
             |ui| optional(ui, &mut s.max_fragment_charge, 2, "precursor charge - 1", 1..=6));
@@ -1043,11 +1772,13 @@ fn scoring_tab(ui: &mut Ui, s: &mut Settings) {
 fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
     heading(ui, "Crosslinking (XL-MS)");
     ui.checkbox(&mut s.crosslink.enabled, RichText::new("Search for crosslinked peptides").strong())
-        .on_hover_text("Turns this into a crosslink search: results go to crosslinks.sage.tsv. \
+        .on_hover_text("Turns this into a crosslink search: results go to crosslinks.sage.tsv \
+            (and, with 'Linear search' below, linear peptides to results.sage.tsv). \
             Label-free and TMT quantification work (Scoring & output tab); chimera, DIA and parquet \
             output are not used in this mode. \
             Details: CROSSLINKING.md");
-    note(ui, "Recommended database settings: 2 missed cleavages, deisotoping on, precursor charge 3 to 6.");
+    note(ui, "Recommended settings: 2 missed cleavages, deisotoping on, precursor charge 3 to 6 \
+        (Database & enzyme tab).");
 
     let xl = &mut s.crosslink;
     ui.add_enabled_ui(xl.enabled, |ui| {
@@ -1056,6 +1787,8 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
                 • DSS / BS3: 138.06808 Da, non-cleavable\n• DSG / BS2G: 96.02113 Da, non-cleavable\n\
                 • DSSO: 158.00376 Da, MS-cleavable (stubs 54.011 / 103.993 / 85.983)\n\
                 • DSBU: 196.08479 Da, MS-cleavable (stubs 85.053 / 111.032)\n\
+                • cliXlink: 267.05653 Da, MS-cleavable and asymmetric: the plain arm leaves DSSO-like stubs \
+                (54.011 / 103.993 / 85.983), the alkyne-tagged arm 163.063 / 213.046 / 195.035\n\
                 • EDC / DMTMM: zero-length (-18.01056 Da, the water released when the amide forms); \
                 link an amine (K, protein N-term) to a carboxyl (D, E, protein C-term)\n\
                 MS-cleavable reagents use a fast doublet search that scales to whole proteomes.",
@@ -1079,6 +1812,7 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
                         } else if before.sites().is_some() && xl.reagent != Reagent::Custom {
                             xl.two_sites = false;
                         }
+                        xl.reset_stubs();
                     }
                     r
                 });
@@ -1086,17 +1820,9 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
                 row(ui, "Linker mass", "Mass the linker adds to the pair of peptides (Da). Example: 138.06808 for DSS; \
                     -18.010565 for a zero-length coupling (one water is lost).",
                     |ui| mass(ui, &mut xl.custom_mass));
-                row(ui, "MS-cleavable", "The custom linker breaks in the collision cell and leaves stubs on each peptide.",
+                row(ui, "MS-cleavable", "The custom linker breaks in the collision cell and leaves stubs on each peptide. \
+                    Enter the stub masses under 'Cleavable linker fragments' below.",
                     |ui| ui.checkbox(&mut xl.custom_cleavable, "cleavable linker with stub masses"));
-                if xl.custom_cleavable {
-                    row(ui, "Stub masses", "Short and long stub remnants. short + long must equal the linker mass \
-                        (DSSO: 54.01056 + 103.99320 = 158.00376).", |ui| {
-                        let r = mass(ui, &mut xl.stub_short);
-                        r | mass(ui, &mut xl.stub_long)
-                    });
-                    row(ui, "Additional stubs", "Other observed stub masses, comma separated. Example (DSSO sulfenic acid): 85.98264",
-                        |ui| ui.add(TextEdit::singleline(&mut xl.stub_alt).hint_text("85.98264").desired_width(200.0)));
-                }
             }
             row(ui, "Reactive groups", "Same: both ends of the linker react with the same residues \
                 (homobifunctional NHS esters such as DSS, BS3, DSSO, DSBU).\n\
@@ -1119,7 +1845,7 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
             row(ui, "Peptide C-terminal residue", "Allow a link on a peptide's last residue when it is not the \
                 protein C-terminus. Normally off: a crosslinked lysine blocks trypsin cleavage.",
                 |ui| ui.checkbox(&mut xl.allow_cterm_residue, "allow"));
-            let cleavable = cleavable_selected(xl);
+            let cleavable = xl.is_cleavable();
             row(ui, "Loop-links", "Also search links with both ends on the same peptide. Not searched for \
                 MS-cleavable reagents.", |ui| ui.add_enabled(!cleavable, egui::Checkbox::new(&mut xl.loop_links, "search loop-links")));
             if cleavable {
@@ -1129,10 +1855,23 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
             }
             row(ui, "Min peaks per chain", "Each of the two peptides needs at least this many matched fragments. Default 3.",
                 |ui| num(ui, &mut xl.min_chain_peaks, 1..=20, 0.1));
+            row(ui, "Min linked ions per chain", "Non-cleavable linkers: each peptide needs at least this many matched                 fragments that carry the linker (ions containing the link site; for loop-links, both sites). They are                 the direct evidence of the link: without them, a correct peptide carrying any modification of about                 the linker's mass, or a strong peptide paired with a barely matched partner, is reported as a                 crosslink. Default 2; 0 turns the check off. MS-cleavable linkers rely on their stub doublets instead.",
+                |ui| ui.add_enabled(!cleavable, egui::DragValue::new(&mut xl.min_linked_peaks).range(0..=20).speed(0.1)));
+            row(ui, "Linear search", "Before the crosslink search, also run an ordinary linear peptide search on \
+                the same spectra and database, written to results.sage.tsv next to crosslinks.sage.tsv (with \
+                peptide, protein and protein-group FDR; LFQ / TMT tables, pin file and HTML report follow the \
+                Scoring & output tab). It uses the crosslink search's database settings (e.g. minimum peptide mass \
+                350 Da). Unlinked peptides, mono-links and the seeds of crosslinks all show up here. Roughly \
+                doubles the file reading time.",
+                |ui| ui.checkbox(&mut xl.linear_search, "also run a linear peptide search (results.sage.tsv)"));
         });
 
+        if xl.is_cleavable() {
+            stub_masses(ui, xl);
+        }
+
         heading(ui, "Non-cleavable search engine");
-        if cleavable_selected(xl) {
+        if xl.is_cleavable() {
             note(ui, "MS-cleavable reagents always use the CPU doublet search; these settings are ignored.");
         }
         grid(ui, "xl_backend", |ui| {
@@ -1175,6 +1914,113 @@ fn site_row(ui: &mut Ui, label: &str, end: &str, site: &mut settings::Site) {
     });
 }
 
-fn cleavable_selected(xl: &settings::Crosslink) -> bool {
-    xl.reagent.is_cleavable() || (xl.reagent == Reagent::Custom && xl.custom_cleavable)
+/// Fragment (stub) masses an MS-cleavable linker leaves on each peptide, with
+/// the doublet spacing and mass balance they imply
+fn stub_masses(ui: &mut Ui, xl: &mut settings::Crosslink) {
+    heading(ui, "Cleavable linker fragments");
+    note(ui, "When the linker breaks in the collision cell, each peptide keeps a short or a long stub, so it \
+        appears as a doublet. Preset values are filled in; edit them for a modified reagent or another stub form.");
+    grid(ui, "xl_stubs", |ui| {
+        if xl.reagent == Reagent::Custom {
+            row(ui, "Asymmetric", "The two ends of the linker differ (e.g. cliXlink, where one arm carries an \
+                alkyne tag), so each arm leaves its own short / long stubs. A cleavage leaves one arm's short stub \
+                on one peptide and the other arm's long stub on its partner.",
+                |ui| ui.checkbox(&mut xl.asymmetric, "the two arms leave different stubs"));
+        }
+        let two = xl.has_second_arm();
+        let arm1 = if two { "Arm 1: " } else { "" };
+        row(ui, &format!("{arm1}Short stub"), "Lighter remnant left on a peptide (Da). DSSO: alkene 54.01056; \
+            DSBU: butyl amine 85.05276; cliXlink arm 1: alkene 54.01056.",
+            |ui| mass(ui, &mut xl.stub_short));
+        row(ui, &format!("{arm1}Long stub"), "Heavier remnant left on the other side of the cleaved bond (Da). \
+            DSSO: sulfenic acid 103.99320; DSBU: butyl isocyanate 111.03203; cliXlink arm 1: sulfenic acid 103.99320.",
+            |ui| mass(ui, &mut xl.stub_long));
+        row(ui, &format!("{arm1}Additional stubs"), "Other observed stub forms, comma separated, used when scoring \
+            each peptide. DSSO / cliXlink arm 1: thiol 85.98264 (the sulfenic acid minus water). Leave empty for none.",
+            |ui| ui.add(TextEdit::singleline(&mut xl.stub_alt).hint_text("e.g. 85.98264").desired_width(200.0)));
+        row(ui, &format!("{arm1}Doublet spacing"), "long - short: the mass gap between the two peaks of every \
+            stub-peptide doublet on this arm.",
+            |ui| ui.label(format!("{:.5} Da", xl.stub_long - xl.stub_short)));
+        if two {
+            row(ui, "Arm 2: Short stub", "Lighter remnant of the second arm (Da). cliXlink: alkyne-tagged alkene 163.06333.",
+                |ui| mass(ui, &mut xl.stub2_short));
+            row(ui, "Arm 2: Long stub", "Heavier remnant of the second arm (Da). cliXlink: alkyne-tagged sulfenic acid 213.04596.",
+                |ui| mass(ui, &mut xl.stub2_long));
+            row(ui, "Arm 2: Additional stubs", "Other stub forms of the second arm, comma separated. \
+                cliXlink: alkyne-tagged thiol 195.03540. Leave empty for none.",
+                |ui| ui.add(TextEdit::singleline(&mut xl.stub2_alt).hint_text("e.g. 195.0354").desired_width(200.0)));
+            row(ui, "Arm 2: Doublet spacing", "long - short of the second arm.",
+                |ui| ui.label(format!("{:.5} Da", xl.stub2_long - xl.stub2_short)));
+        }
+        let linker = xl.linker_mass();
+        let ok = Color32::from_rgb(40, 160, 70);
+        let bad = Color32::from_rgb(210, 60, 60);
+        let sums = if two {
+            vec![
+                ("arm 1 short + arm 2 long", xl.stub_short + xl.stub2_long),
+                ("arm 2 short + arm 1 long", xl.stub2_short + xl.stub_long),
+            ]
+        } else {
+            vec![("short + long", xl.stub_short + xl.stub_long)]
+        };
+        row(ui, "Mass balance", "A cleavage splits the linker into a short and a long stub, so short + long \
+            (for an asymmetric linker: each arm's short stub + the other arm's long stub) must equal the linker \
+            mass, or the search will not start.", |ui| {
+            ui.vertical(|ui| {
+                for (what, sum) in sums {
+                    let (text, color) = if (sum - linker).abs() <= 1e-3 {
+                        (format!("{what} = {sum:.5} Da = linker mass ✔"), ok)
+                    } else {
+                        (format!("{what} = {sum:.5} Da ≠ linker mass {linker:.5} Da"), bad)
+                    };
+                    ui.label(RichText::new(text).color(color));
+                }
+            })
+            .response
+        });
+        if xl.reagent.is_cleavable() {
+            let name = match xl.reagent {
+                Reagent::Clixlink => "cliXlink".to_string(),
+                r => r.key().to_ascii_uppercase(),
+            };
+            row(ui, "Defaults", "Restore the preset stub masses of the selected reagent.", |ui| {
+                let r = ui.add_enabled(xl.stubs_edited(), egui::Button::new(format!("Reset to {name} values")));
+                if r.clicked() {
+                    xl.reset_stubs();
+                }
+                r
+            });
+        }
+    });
+}
+
+/// `(fill, border)` of the Progress tab: pulsing orange while the search runs,
+/// green when it finished, red when it failed, grey when cancelled. The fill
+/// is a translucent tint of the border colour (stronger when the tab is open),
+/// so the label stays readable in both themes.
+fn progress_tab_colors(ui: &Ui, state: progress::State, selected: bool) -> (Color32, Color32) {
+    let (color, pulse) = match state {
+        progress::State::Running => {
+            let t = ui.ctx().input(|i| i.time) as f32;
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+            (Color32::from_rgb(235, 140, 30), 0.5 + 0.5 * (t * std::f32::consts::TAU / 1.4).sin())
+        }
+        progress::State::Finished => (Color32::from_rgb(40, 160, 70), 1.0),
+        progress::State::Failed => (Color32::from_rgb(210, 60, 60), 1.0),
+        progress::State::Cancelled => (Color32::GRAY, 1.0),
+    };
+    let tint = if selected { 0.38 } else { 0.24 };
+    (
+        color.gamma_multiply(tint * (0.45 + 0.55 * pulse)),
+        color.gamma_multiply(0.3 + 0.7 * pulse),
+    )
+}
+
+fn human_size(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
+        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
+        b if b >= 1 << 10 => format!("{:.0} KB", b as f64 / 1024.0),
+        b => format!("{b} B"),
+    }
 }

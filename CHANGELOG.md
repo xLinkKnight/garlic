@@ -4,16 +4,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [v0.16.0] - 2026-11-02
 
 ### Added
+- Crosslinking: asymmetric MS-cleavable linkers. A cleavable linker can give its second arm its own stubs with `"cleavable": {..., "other": {"short": .., "long": .., "alt": [..]}}`; the doublet search then tries each peptide pair both ways round. New `clixlink` preset (cliXlink, 267.05653 Da; arm 1 54.01056 / 103.99320 / 85.98264, alkyne-tagged arm 163.06333 / 213.04596 / 195.03540).
+- Crosslinking: `crosslinks_FDRfiltered.sage.tsv`, the accepted results only (target-target matches with `spectrum_q` <= 0.01, the CSM count in the log), next to the full `crosslinks.sage.tsv`.
+- Crosslinking: `"linear_search": true` also runs a linear peptide search on the same spectra first and writes `results.sage.tsv`.
+- Crosslinking: `min_linked_peaks` (default 2), the matched fragment ions that carry the linker required on each chain of a non-cleavable match, reported in the new `linked_a` / `linked_b` columns.
+- Crosslinking: exports for viewers: `crosslinks_xiView.csv` (xiVIEW), `crosslinks_proXL.xml` (ProXL) and `crosslinks.mzid` (mzIdentML 1.3 with the crosslinking extension, for xiVIEW and PRIDE), with references to the spectrum files.
+- Crosslinking: the `gpu` backend can be built on Windows (`--features gpu`, DirectX 12).
+- `sage-gui`: precursor charge range (Database & enzyme tab); editable stub masses of cleavable linkers with their doublet spacing and mass balance, including a second arm for asymmetric linkers and the cliXlink preset; "also run a linear peptide search" and "min linked ions per chain" options.
+- `sage-gui`: UniMod accession lookup on the Modifications tab (fills in name, mass and sites from unimod.org).
+- `sage-gui`: Resources section (CPU threads, RAM limit, GPU name, VRAM and backend support).
+- `sage-gui`: Progress tab while a search runs: status colour that pulses while running, step list, log with a draggable border, two-column report and an explanation of common failures; CPU, RAM, GPU and VRAM usage next to Run search.
+- `sage-gui`: New folder button when choosing the results folder; new theme, window sized to fit the tabs, and an app icon.
 - Crosslinking (XL-MS) search: enable with a `crosslink` config block; writes `crosslinks.sage.tsv`. Supports non-cleavable (DSS/BS3/DSG/BS2G, incl. loop-links) and MS-cleavable (DSSO/DSBU, doublet-based) linkers. See `CROSSLINKING.md`.
 - Crosslinking: heterobifunctional chemistry with `site1` / `site2` (a link always joins a site1 group to a site2 group), and the zero-length reagents `edc` and `dmtmm` (amine to carboxyl, -18.010565 Da).
 - Multiple enzymes (co-digestion): `"enzyme": {"enzymes": ["trypsin", "asp-n"]}` cleaves wherever any listed enzyme does. Named proteases: trypsin, trypsin/p, lys-c, lys-n, arg-c, asp-n, glu-c, chymotrypsin, chymotrypsin-high, proalanase; custom rules `{"cleave_at": "DE", "restrict": "P", "c_terminal": true}` can be mixed in.
 - Crosslinking: quantification. `quant.tmt` adds reporter-ion columns to `crosslinks.sage.tsv` (MS2 or SPS-MS3); `quant.lfq` writes `crosslinks.lfq.tsv` with MS1 intensities per crosslinked peptide pair across runs (alignment on shared crosslinks, decoy-based peak q-values). Sage warns when a static modification (e.g. TMT on K) blocks crosslink-reactive residues.
 - `sage-gui`: a desktop window for editing search settings (with hover help on every field), choosing FASTA/mzML/MGF/Bruker `.d`/Thermo `.raw` files (RAW converted with msconvert or ThermoRawFileParser) and running searches.
 
+### Changed
+- `sage-gui`: modification sites are always shown (the "show hidden sites" switch is gone).
+
 ### Fixed
+- Crosslinking: non-cleavable searches reported false crosslinks when the wrong linker was searched. A loop-link was accepted on the unmodified ions outside its ring alone, so a correct peptide carrying any modification of about the linker's mass passed; a strong peptide paired with a barely matched partner passed as a crosslink. Each chain now needs matched linker-carrying ions (`min_linked_peaks`). On a DSSO-crosslinked Pol II run searched as DSS, CSMs at 1% FDR fell from 55 to 13 (4 with isotope error 0, against 155 for the correct DSSO search).
+- Crosslinking: DSSO stub names were swapped in the documentation and the GUI: 103.99320 Da is the sulfenic acid, 85.98264 Da the thiol.
 - Crosslinking: the BS2G preset used 114.03170 Da (the hydrolysed mono-link); the crosslink adds 96.02113 Da, like DSG.
 
 ## [v0.15.0]
