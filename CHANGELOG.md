@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.17.0] - 2026-11-03
+
+### Added
+- `sage-gui`: built-in annotated spectrum viewer, the "Annotated spectra" tab, using [Annotator](https://github.com/snijderlab/annotator)'s engine (`mzcore` / `mzannotate`) with no separate program. Lists the linear and crosslink matches of a results folder (filters for kind, targets, spectrum q-value, text search); for the one picked, draws its spectrum with ion-coloured, labelled peaks (zoom, hover for m/z, error and every interpretation), the backbone coverage of each peptide, and a table of matched fragments. Crosslinks and loop-links are ProForma 2.0 crosslinked peptidoforms; MS-cleavable linkers show their stub ions. Spectra are read with Sage's own reader by Sage's spectrum ids (mzML, MGF, Bruker `.d`: the precursor's merged spectrum, as searched). "View spectra" buttons (bottom bar, Progress tab) and `sage-gui --view <results folder>` open it. Crosslinked pairs are drawn joined by a bridge between their linked residues (loop-links by a bracket); for MS-cleavable linkers, ions carrying a stub are found per peptide and shown in the stub's colour: peptide + stub doublets as triangles on the bridge pointing at their peptide, stub-carrying fragment ions as hooks with the N-/C-terminal directionality of the plain series, and `+A` / `+S` / `+T` in the peak labels. The header shows retention time, mass error and, for timsTOF data, the precursor ion mobility (1/K0). Publication figures: "Export figure" saves the annotated spectrum (current zoom), peptide map with bridge and stubs, legend and an optional title (with RT and ion mobility) as SVG (vector) or PNG / TIFF at 300, 600 or 1200 dpi, 7 in wide, on a white or transparent background.
+- Files for the separate Annotator app: `"write_annotator": true` (or `--write-annotator`) writes `results.annotator.csv` (linear PSMs) and `crosslinks.annotator.csv` (crosslink-spectrum matches) at 1% FDR in Annotator's basic CSV format, with ProForma 2.0 crosslinks (`A[XLMOD:02126#XL1]..//B[#XL1]..`) and spectrum positions for mzML, MGF and Bruker `.d` (DDA-PASEF, from `analysis.tdf`). Off by default. See `CROSSLINKING.md`.
+- `sage-core`: `CrosslinkSettings::proforma_linker` and `Modification::proforma_label`, the ProForma of a crosslinker and a modification (shared by the export and the viewer).
+- Citation and acknowledgments for Annotator (Schulte et al., *Anal. Chem.* 2025, doi:10.1021/acs.analchem.5c02832) and its `mzcore` / `mzannotate` libraries in `README.md` and `CITATION.cff`.
+
+### Changed
+- The Windows release `sage.exe` is built with `--features gpu`, so the crosslink `gpu` backend works out of the box (DirectX 12).
+
+### Fixed
+- `write_pin`, `write_report` and `annotate_matches` in the configuration file were ignored: the command-line flags, absent, overrode them with `false`. A flag now only turns its output on. This also made the corresponding `sage-gui` checkboxes ineffective.
+
 ## [v0.16.0] - 2026-11-02
 
 ### Added

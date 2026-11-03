@@ -10,6 +10,7 @@ mod system;
 mod usage;
 mod theme;
 mod unimod;
+mod viewer;
 
 use eframe::egui::{self, Color32, ComboBox, DragValue, Response, RichText, TextEdit, Ui};
 use runner::{Job, Status, Step};
@@ -33,10 +34,22 @@ fn main() -> eframe::Result {
             .with_min_inner_size([720.0, 480.0]),
         ..Default::default()
     };
+    // `sage-gui --view <results folder>` opens the annotated spectra of a search
+    let mut args = std::env::args().skip(1);
+    let view = match args.next().as_deref() {
+        Some("--view") => args.next(),
+        _ => None,
+    };
     eframe::run_native(
         "Sage search",
         options,
-        Box::new(|cc| Ok(Box::new(SageGui::new(&cc.egui_ctx)))),
+        Box::new(move |cc| {
+            let mut app = SageGui::new(&cc.egui_ctx);
+            if let Some(folder) = view {
+                app.view_spectra(Path::new(&folder));
+            }
+            Ok(Box::new(app))
+        }),
     )
 }
 
@@ -50,10 +63,12 @@ enum Tab {
     Crosslink,
     /// Shown once a search has been started
     Progress,
+    /// Annotated spectra of the results
+    Viewer,
 }
 
 impl Tab {
-    const ALL: [(Tab, &'static str); 7] = [
+    const ALL: [(Tab, &'static str); 8] = [
         (Tab::Files, "Files"),
         (Tab::Database, "Database & enzyme"),
         (Tab::Modifications, "Modifications"),
@@ -61,6 +76,7 @@ impl Tab {
         (Tab::Scoring, "Scoring & output"),
         (Tab::Crosslink, "Crosslinking"),
         (Tab::Progress, "Progress"),
+        (Tab::Viewer, "Annotated spectra"),
     ];
 }
 
@@ -95,6 +111,8 @@ struct SageGui {
     gpu_probe: Option<std::sync::mpsc::Receiver<system::GpuSupport>>,
     /// sage.exe path the GPU support was checked for
     probed_sage: String,
+    /// The "Annotated spectra" tab
+    viewer: viewer::Viewer,
 }
 
 /// Where the GUI remembers its last settings and tool paths between runs
@@ -128,6 +146,7 @@ impl SageGui {
             gpu_support: None,
             gpu_probe: None,
             probed_sage: String::new(),
+            viewer: Default::default(),
         };
         if let Some(state) = state_path()
             .and_then(|p| std::fs::read_to_string(p).ok())
@@ -219,6 +238,12 @@ impl SageGui {
             }
             Err(e) => self.problems = vec![(true, format!("Could not save {}: {e}", path.display()))],
         }
+    }
+
+    /// Show a results folder on the "Annotated spectra" tab
+    fn view_spectra(&mut self, out: &Path) {
+        self.viewer.open(&out.display().to_string());
+        self.tab = Tab::Viewer;
     }
 
     /// Check the settings, write the configuration into the output folder
@@ -486,6 +511,16 @@ impl eframe::App for SageGui {
                 {
                     let _ = std::process::Command::new("explorer").arg(&out).spawn();
                 }
+                if ui
+                    .add_enabled(
+                        !running && Path::new(&out).join("results.json").is_file(),
+                        egui::Button::new("View spectra"),
+                    )
+                    .on_hover_text(VIEW_TIP)
+                    .clicked()
+                {
+                    self.view_spectra(Path::new(&out));
+                }
                 if let Some(job) = &self.job {
                     let (text, color) = match job.status() {
                         Status::Running(step) => (format!("Running: {step}"), Color32::from_rgb(70, 130, 220)),
@@ -565,6 +600,7 @@ impl eframe::App for SageGui {
                     Tab::Scoring => scoring_tab(ui, &mut self.s),
                     Tab::Crosslink => crosslink_tab(ui, &mut self.s),
                     Tab::Progress => self.progress_tab(ui),
+                    Tab::Viewer => self.viewer.ui(ui, &self.s.output_directory),
                 });
             });
             if measuring {
@@ -879,6 +915,8 @@ impl SageGui {
         };
         let (ok, bad, warn) = (Color32::from_rgb(40, 160, 70), Color32::from_rgb(210, 60, 60), Color32::from_rgb(220, 135, 30));
         let muted = theme::muted(ui);
+        // Results folder to open in Annotator, once the tracker is no longer borrowed
+        let mut annotate: Option<PathBuf> = None;
         let running = t.state == progress::State::Running;
         // keep clear of the scroll bar on the right
         ui.set_max_width(ui.available_width() - 20.0);
@@ -1038,9 +1076,14 @@ impl SageGui {
                 });
             }
             let out = t.plan.output_dir.clone();
-            if ui.button("Open results folder").clicked() {
-                let _ = std::process::Command::new("explorer").arg(&out).spawn();
-            }
+            ui.horizontal(|ui| {
+                if ui.button("Open results folder").clicked() {
+                    let _ = std::process::Command::new("explorer").arg(&out).spawn();
+                }
+                if ui.button("View spectra").on_hover_text(VIEW_TIP).clicked() {
+                    annotate = Some(PathBuf::from(&out));
+                }
+            });
         }
 
         if !t.warnings.is_empty() && t.state != progress::State::Running {
@@ -1054,6 +1097,9 @@ impl SageGui {
                 });
         }
 
+        if let Some(out) = annotate {
+            self.view_spectra(&out);
+        }
     }
 
     /// CPU, RAM, GPU and vRAM utilisation of the whole computer, right to left
@@ -1766,8 +1812,18 @@ fn scoring_tab(ui: &mut Ui, s: &mut Settings) {
         row(ui, "Annotate matches", "Write matched_fragments.sage.tsv listing every matched fragment ion \
             (useful for plotting annotated spectra; large file).",
             |ui| ui.checkbox(&mut s.annotate_matches, "write matched fragment ions"));
+        row(ui, "Annotator app files", "Only for the separate Annotator app (github.com/snijderlab/annotator); \
+            garlic's \"Annotated spectra\" tab needs nothing extra.\n\
+            Writes results.annotator.csv (linear matches) and crosslinks.annotator.csv: target \
+            matches at 1% FDR as ProForma (a crosslink is PEPK[XLMOD:02126#XL1]R//AK[#XL1]R) with \
+            each spectrum's position in its file. Open them in Annotator together with the \
+            spectrum files.",
+            |ui| ui.checkbox(&mut s.write_annotator, "write .annotator.csv files"));
     });
 }
+
+const VIEW_TIP: &str = "Show the matches of this results folder on the \"Annotated spectra\" tab: \
+    each spectrum annotated with Annotator's engine (built in), linear and crosslinked.";
 
 fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
     heading(ui, "Crosslinking (XL-MS)");

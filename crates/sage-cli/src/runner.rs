@@ -26,6 +26,7 @@ use report_builder::{
     Report, ReportSection,
 };
 
+mod annotator_export;
 mod crosslink_export;
 mod crosslink_mzid;
 mod crosslink_runner;
@@ -700,6 +701,12 @@ impl Runner {
             self.parameters
                 .output_paths
                 .push(self.write_pin(&outputs.features, &filenames)?);
+        }
+
+        // Identifications for Annotator's annotated spectra, if requested
+        if self.parameters.write_annotator {
+            let path = self.write_annotator_linear(&outputs.features)?;
+            self.parameters.output_paths.push(path);
         }
 
         // Write an html report if requested

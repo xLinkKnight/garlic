@@ -84,6 +84,15 @@ fn main() -> anyhow::Result<()> {
                 .help("Write `.html` report file"),
         )
         .arg(
+            Arg::new("write-annotator")
+                .long("write-annotator")
+                .action(clap::ArgAction::SetTrue)
+                .help(
+                    "Write `results.annotator.csv` / `crosslinks.annotator.csv` to view annotated \
+                     spectra in Annotator (github.com/snijderlab/annotator)",
+                ),
+        )
+        .arg(
             Arg::new("disable-telemetry")
                 .long("disable-telemetry-i-dont-want-to-improve-sage")
                 .action(clap::ArgAction::SetFalse)

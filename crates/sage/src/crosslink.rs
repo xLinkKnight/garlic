@@ -477,6 +477,28 @@ impl CrosslinkSettings {
         }
     }
 
+    /// The crosslinker as a ProForma 2.0 modification (without its `#XL`
+    /// label): its XLMOD term where ProForma readers such as Annotator know the
+    /// term's mass (cleavable ones then also bring their stub forms), otherwise
+    /// its formula or mass delta
+    pub fn proforma_linker(&self) -> String {
+        match (self.reagent, self.mass) {
+            (Some(Reagent::Dss), _) | (None, None) => "XLMOD:02001".into(),
+            (Some(Reagent::Bs3), _) => "XLMOD:02000".into(),
+            (Some(Reagent::Dsg), _) => "XLMOD:02006".into(),
+            (Some(Reagent::Bs2g), _) => "XLMOD:02005".into(),
+            (Some(Reagent::Dsso), _) => "XLMOD:02126".into(),
+            (Some(Reagent::Dsbu), _) => "XLMOD:02120".into(),
+            (Some(Reagent::Dmtmm), _) => "XLMOD:02208".into(),
+            // zero-length amide bond: one water lost
+            (Some(Reagent::Edc), _) => "Formula:H-2O-1".into(),
+            // XLMOD:02253 carries no mass in Annotator's copy of XLMOD; the
+            // exact mass, as f32 would print +267.05652
+            (Some(Reagent::Clixlink), _) => "+267.05653".into(),
+            (None, Some(mass)) => format!("{mass:+}"),
+        }
+    }
+
     /// The two site specifications of a heterobifunctional reagent, if any
     pub fn hetero_sites(&self) -> Option<(String, String)> {
         match (&self.site1, &self.site2) {

@@ -50,6 +50,10 @@ pub struct Search {
     #[serde(skip_serializing)]
     pub write_report: bool,
 
+    /// Write `results.annotator.csv` / `crosslinks.annotator.csv` for Annotator
+    #[serde(skip_serializing)]
+    pub write_annotator: bool,
+
     #[serde(skip_serializing)]
     pub annotate_matches: bool,
 
@@ -86,6 +90,7 @@ pub struct Input {
     pub annotate_matches: Option<bool>,
     pub write_pin: Option<bool>,
     pub write_report: Option<bool>,
+    pub write_annotator: Option<bool>,
     pub score_type: Option<ScoreType>,
 }
 
@@ -220,16 +225,20 @@ impl Input {
             input.mzml_paths = Some(mzml_paths.into_iter().map(|p| p.into()).collect());
         }
 
-        if let Some(write_pin) = matches.get_one::<bool>("write-pin").copied() {
-            input.write_pin = Some(write_pin);
+        // Output switches: a flag turns an output on; without the flag the
+        // configuration file decides. (`SetTrue` flags read as `false` when
+        // absent, which used to override `"write_pin": true` in the file.)
+        if matches.get_flag("write-pin") {
+            input.write_pin = Some(true);
         }
-
-        if let Some(write_report) = matches.get_one::<bool>("write-report").copied() {
-            input.write_report = Some(write_report);
+        if matches.get_flag("write-report") {
+            input.write_report = Some(true);
         }
-
-        if let Some(annotate_matches) = matches.get_one::<bool>("annotate-matches").copied() {
-            input.annotate_matches = Some(annotate_matches);
+        if matches.get_flag("write-annotator") {
+            input.write_annotator = Some(true);
+        }
+        if matches.get_flag("annotate-matches") {
+            input.annotate_matches = Some(true);
         }
 
         // avoid to later panic if these parameters are not set (but doesn't check if files exist)
@@ -495,6 +504,7 @@ impl Input {
             write_pin: self.write_pin.unwrap_or(false),
             bruker_config: self.bruker_config.unwrap_or_default(),
             write_report: self.write_report.unwrap_or(false),
+            write_annotator: self.write_annotator.unwrap_or(false),
             protein_grouping: self.protein_grouping.unwrap_or(true),
             protein_grouping_peptide_fdr: self.protein_grouping_peptide_fdr.unwrap_or(0.01),
             crosslink: self.crosslink,

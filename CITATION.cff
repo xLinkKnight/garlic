@@ -27,3 +27,29 @@ preferred-citation:
   type: article
   url: "https://doi.org/10.1021/acs.jproteome.3c00486"
   volume: 22
+references:
+  - type: article
+    title: "A Universal Spectrum Annotator for Complex Peptidoforms in Mass Spectrometry-Based Proteomics"
+    authors:
+      - family-names: Schulte
+        given-names: Douwe
+        orcid: https://orcid.org/0000-0003-0594-0993
+      - family-names: Leuvenink
+        given-names: Rien W.
+        orcid: https://orcid.org/0009-0002-6757-4116
+      - family-names: Jager
+        given-names: Shelley
+      - family-names: Heck
+        given-names: Albert J. R.
+        orcid: https://orcid.org/0000-0002-2405-4404
+      - family-names: Snijder
+        given-names: Joost
+        orcid: https://orcid.org/0000-0002-9310-8226
+    journal: Analytical Chemistry
+    volume: 97
+    issue: 42
+    start: 23120
+    end: 23130
+    year: 2025
+    doi: 10.1021/acs.analchem.5c02832
+    notes: "Annotator (https://github.com/snijderlab/annotator); its engine (mzcore / mzannotate) draws the annotated spectra in sage-gui."

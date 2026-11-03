@@ -147,6 +147,10 @@ impl Runner {
         info!("wrote {} ({} target crosslink-spectrum matches at 1% FDR)", FDR_FILTERED, accepted.len());
         self.parameters.output_paths.push(path);
         self.write_viewer_exports(&matches, &settings, &filenames)?;
+        if self.parameters.write_annotator {
+            let path = self.write_annotator_crosslinks(&matches, &settings)?;
+            self.parameters.output_paths.push(path);
+        }
         if tmt.is_some() {
             let quantified = matches
                 .iter()

@@ -324,6 +324,114 @@ These references were checked against the viewers' own readers: pyteomics
 `get_by_id` / MGF index lookup as xiVIEW's importer uses them, and JRAP's scan
 numbering from ProXL's importer.
 
+## Annotated spectra
+
+`sage-gui` shows the annotated spectrum of any match on its **Annotated
+spectra** tab, with the engine of [Annotator](https://github.com/snijderlab/annotator)
+(Snijder lab) built in: `mzcore` parses the ProForma peptidoform, `mzannotate`
+generates and matches its fragments. Nothing else needs to be installed.
+
+* Open it with **View spectra** after a search (bottom bar or Progress tab), by
+  loading any results folder on the tab, or with `sage-gui --view <folder>`.
+* The list holds the matches of `results.sage.tsv` and `crosslinks.sage.tsv`,
+  filtered by kind, targets, spectrum q-value and a text search (peptide,
+  protein, scan), best score first.
+* For the match picked: its spectrum with each peak coloured by ion series and
+  labelled (`y7`, `b5²+`, `y4-H2O`; in a crosslink `1:` / `2:` name the
+  peptide), zoom and pan, hover for m/z, mass error and every interpretation; the
+  backbone ions seen on each peptide; and a table of matched fragments. The
+  fragmentation model (CID / HCD by default, with DSSO / DSBU stub ions; ETD,
+  EThcD, EAD, All) and the search's fragment tolerance are Annotator's.
+* Under the spectrum, each peptide's residues with the backbone ions seen: a hook
+  over the right of a residue for an N-terminal (a/b/c) ion ending there, one
+  under its left for a C-terminal (x/y/z) ion starting there (b blue, y red).
+  A crosslinked pair is drawn as two rows with the linked residues aligned and
+  joined by a **bridge** labelled with the linker; a loop-link as a bracket
+  under its peptide.
+* MS-cleavable linkers: ions carrying a **stub** are found for each peptide
+  (the peptide alone with the stub on its linked residue, fragmented by
+  Annotator's engine) and shown in the stub's colour (DSSO: A alkene teal, T
+  thiol amber, S sulfenic acid magenta; DSBU: Bu, BuUr; cliXlink's alkyne arm
+  A', T', S'):
+  * the whole peptide + stub (the doublet peaks, at every charge below the
+    precursor's) as a triangle on the bridge pointing at that peptide;
+  * fragment ions holding the linked residue + stub as hooks with the same
+    directionality as the plain series, nested outside them, one per stub;
+  * on the peaks as `y6+S`, `P+A²+`; hover the map for every stub ion with its
+    observed m/z and error.
+
+  On the DSSO Pol II run, both peptides showed peptide + stub ions in 39 of 40
+  crosslink spectra (9 of 40 with the same peptidoforms on other spectra).
+* The header gives charge, scan, score, q-value, retention time, mass and mass
+  error, the precursor m/z and, for timsTOF (Bruker `.d`) data, the precursor's
+  ion mobility 1/K0 (V·s/cm²).
+* **Export figure** saves the shown match as a publication figure: the spectrum
+  (the current zoom, or the whole spectrum), labelled as in the viewer
+  (internal fragments only with "label all matched peaks"), the peptide map with
+  the bridge and stub glyphs, a legend, and optionally a title with the
+  peptides, charge, scan, retention time and ion mobility. Formats: SVG (vector,
+  editable in Illustrator / Inkscape), PNG and TIFF at 300, 600 or 1200 dpi;
+  7 inches wide (two-column width); white or transparent background (PNG and
+  TIFF then carry an alpha channel; opaque figures have none).
+* Spectra are read with Sage's own reader by Sage's spectrum ids, exactly as
+  searched: mzML, MGF and, for Bruker `.d`, the precursor's spectrum merged over
+  all its frames. The matches' peptidoforms are written as for the Annotator
+  files below.
+
+On the DSSO Pol II timsTOF run, the annotated ions carry 31% of the intensity of
+the matched spectra of linear PSMs and 18 to 22% for crosslinks, against 6 to 9%
+when the same peptidoforms are put on other spectra.
+
+### Files for the Annotator app
+
+For the separate Annotator program, `"write_annotator": true` (or
+`--write-annotator`; "write .annotator.csv files" in `sage-gui`) writes the
+matches at 1% spectrum FDR (targets, rank 1):
+
+* `results.annotator.csv`: linear PSMs (also from `"linear_search": true`)
+* `crosslinks.annotator.csv`: target-target crosslink-spectrum matches
+
+Both are Annotator's "basic CSV" PSM format, `scan_index,sequence,raw_file,z,mode`:
+
+```
+scan_index,sequence,raw_file,z,mode
+134649,FISTLQVK[XLMOD:02126#XL1]LYGR//K[#XL1]AAPSPISHVAEIR,C:\data\PolII.d,4,
+```
+
+* `sequence` is ProForma 2.0: a crosslink is `A[linker#XL1]...//B[#XL1]...`, a
+  loop-link puts both ends on one peptide. The linker is its XLMOD term (DSS
+  `XLMOD:02001`, BS3 `02000`, DSG `02006`, BS2G `02005`, DSSO `02126`, DSBU
+  `02120`, DMTMM `02208`); EDC is `Formula:H-2O-1`, cliXlink and custom linkers
+  their mass (Annotator's copy of XLMOD has no mass for cliXlink). A protein
+  N-terminal link is written on the first residue: Annotator rejects crosslinks
+  on a terminus, and every b ion contains both. Modifications keep their name
+  when it is an ontology accession (`UNIMOD:35`), otherwise their mass.
+* `scan_index` is the spectrum's 0-based position in its file as Annotator's
+  reader (mzdata) numbers it: the mzML `index`, the MGF order, or for Bruker
+  `.d` (DDA-PASEF) the position of the precursor's first PASEF window, computed
+  from `analysis.tdf` (MS1 frames and every PASEF window count). Sage merges all
+  frames of a precursor, so for a precursor fragmented in several frames
+  Annotator shows the first frame's spectrum only.
+* `mode` is empty: choose the fragmentation model in Annotator (its CID model
+  includes DSSO / DSBU stub ions).
+
+Open the spectrum files together with the CSV; Annotator matches each row's
+`raw_file` against the open files by name:
+
+```
+annotator.exe run1.mzML run2.mzML results.annotator.csv crosslinks.annotator.csv
+```
+
+Annotator does not open Bruker `.d` folders from its command line: load the `.d`
+with its raw file button, then the matches find their spectra.
+
+Checked with Annotator's own libraries (mzident 0.2.1, mzcore, mzannotate,
+mzdata 0.65): every row of a DSSO search of a timsTOF Pol II run (104 crosslinks,
+9,618 PSMs) parses, its position holds the spectrum with Sage's precursor m/z,
+and the expected fragments annotate (about twice the peaks of the neighbouring
+spectrum); synthetic DSS, loop-link and EDC spectra from Sage's fragment model
+annotate 98 to 100%.
+
 ## Quantification
 
 The usual `quant` block works for crosslink searches:

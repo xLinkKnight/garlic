@@ -217,6 +217,31 @@ impl Display for Modification {
     }
 }
 
+/// Ontology prefixes a ProForma reader resolves (`UNIMOD:35`, `U:Oxidation`, ...)
+const PROFORMA_PREFIXES: [&str; 12] = [
+    "UNIMOD:", "U:", "MOD:", "M:", "RESID:", "R:", "XLMOD:", "X:", "GNO:", "G:", "FORMULA:", "GLYCAN:",
+];
+
+/// Is this modification name an ontology accession, as ProForma readers such as
+/// Annotator understand it? Free text names are not.
+pub fn is_proforma_accession(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    PROFORMA_PREFIXES
+        .iter()
+        .any(|p| upper.starts_with(p) && upper.len() > p.len())
+}
+
+impl Modification {
+    /// Strict ProForma label: the name when it is an ontology accession,
+    /// otherwise the mass delta (a free text name would not parse)
+    pub fn proforma_label(&self) -> String {
+        match &self.name {
+            Some(name) if is_proforma_accession(&name.to_string()) => name.to_string(),
+            _ => format!("{:+}", self.mass),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModificationError {
     TooMany,

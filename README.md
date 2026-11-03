@@ -31,6 +31,14 @@ If you use Sage in a scientific publication, please cite the following paper:
 
 [Sage: An Open-Source Tool for Fast Proteomics Searching and Quantification at Scale](https://doi.org/10.1021/acs.jproteome.3c00486)
 
+If you use the annotated spectrum viewer or its exported figures (`sage-gui`, "Annotated spectra" tab), please also cite Annotator, whose engine draws them:
+
+Schulte, D.; Leuvenink, R. W.; Jager, S.; Heck, A. J. R.; Snijder, J. [A Universal Spectrum Annotator for Complex Peptidoforms in Mass Spectrometry-Based Proteomics](https://doi.org/10.1021/acs.analchem.5c02832). *Anal. Chem.* **2025**, 97 (42), 23120–23130. doi:10.1021/acs.analchem.5c02832
+
+## Acknowledgments
+
+The spectrum annotation in `sage-gui` (ProForma 2.0 peptidoforms including crosslinks, theoretical fragmentation and peak matching) uses the [`mzcore`](https://crates.io/crates/mzcore), [`mzannotate`](https://crates.io/crates/mzannotate) and [`mzident`](https://crates.io/crates/mzident) libraries by Douwe Schulte, Ralf Gabriels, Auke Heerdink and contributors ([rusteomics/mzcore](https://github.com/rusteomics/mzcore)), the engine of [Annotator](https://github.com/snijderlab/annotator) from the Snijder lab at Utrecht University. They are used under the MIT license (they are dual-licensed MIT OR Apache-2.0). Spectra in the viewer are read with [`mzdata`](https://github.com/mobiusklein/mzdata) by Joshua Klein, and figures are rendered with [`resvg`](https://github.com/linebender/resvg).
+
 
 ## Features
 

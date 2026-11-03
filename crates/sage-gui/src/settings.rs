@@ -743,6 +743,8 @@ pub struct Settings {
     pub protein_grouping_peptide_fdr: f64,
     pub write_pin: bool,
     pub write_report: bool,
+    /// `results.annotator.csv` / `crosslinks.annotator.csv` for Annotator
+    pub write_annotator: bool,
     pub annotate_matches: bool,
     pub lfq: bool,
     /// MS1 mass tolerance (ppm) for LFQ
@@ -811,6 +813,7 @@ impl Default for Settings {
             protein_grouping_peptide_fdr: 0.01,
             write_pin: false,
             write_report: false,
+            write_annotator: false,
             annotate_matches: false,
             lfq: false,
             lfq_ppm: 5.0,
@@ -835,7 +838,7 @@ const TOP_KEYS: &[&str] = &[
     "isotope_errors", "deisotope", "chimera", "wide_window", "min_peaks", "max_peaks",
     "max_fragment_charge", "min_matched_peaks", "report_psms", "score_type", "predict_rt",
     "protein_grouping", "protein_grouping_peptide_fdr", "write_pin", "write_report",
-    "annotate_matches", "quant", "crosslink", "mzml_paths", "output_directory",
+    "write_annotator", "annotate_matches", "quant", "crosslink", "mzml_paths", "output_directory",
 ];
 const DATABASE_KEYS: &[&str] = &[
     "fasta", "enzyme", "peptide_min_mass", "peptide_max_mass", "ion_kinds", "min_ion_index",
@@ -1075,6 +1078,7 @@ impl Settings {
         );
         top.insert("write_pin".into(), json!(self.write_pin));
         top.insert("write_report".into(), json!(self.write_report));
+        top.insert("write_annotator".into(), json!(self.write_annotator));
         top.insert("annotate_matches".into(), json!(self.annotate_matches));
         top.insert("quant".into(), Value::Object(quant));
         if self.crosslink.enabled {
@@ -1199,6 +1203,8 @@ impl Settings {
             ),
             write_pin: bool_or(top.get("write_pin"), d.write_pin),
             write_report: bool_or(top.get("write_report"), d.write_report),
+            // absent from a file means off, as in Sage
+            write_annotator: bool_or(top.get("write_annotator"), false),
             annotate_matches: bool_or(top.get("annotate_matches"), d.annotate_matches),
             lfq: bool_or(quant.and_then(|q| q.get("lfq")), false),
             lfq_ppm: f64_or(lv("ppm_tolerance"), d.lfq_ppm),
