@@ -364,7 +364,7 @@ impl Default for Crosslink {
             require_complete_doublets: false,
             backend: Backend::Cpu,
             chain_survivors: 20000,
-            linear_search: false,
+            linear_search: true,
             min_linked_peaks: 2,
         }
     }
@@ -470,10 +470,8 @@ impl Crosslink {
         );
         m.insert("backend".into(), json!(self.backend.key()));
         m.insert("chain_survivors".into(), json!(self.chain_survivors));
-        // only when on, so configs still run in a sage.exe without this option
-        if self.linear_search {
-            m.insert("linear_search".into(), json!(true));
-        }
+        // always written: Sage turns the linear search on when it is absent
+        m.insert("linear_search".into(), json!(self.linear_search));
         // Sage's default (2) is left out, so configs still run in an older sage.exe
         if self.min_linked_peaks != 2 {
             m.insert("min_linked_peaks".into(), json!(self.min_linked_peaks));
@@ -812,7 +810,7 @@ impl Default for Settings {
             protein_grouping: true,
             protein_grouping_peptide_fdr: 0.01,
             write_pin: false,
-            write_report: false,
+            write_report: true,
             write_annotator: false,
             annotate_matches: false,
             lfq: false,

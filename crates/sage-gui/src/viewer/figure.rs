@@ -21,16 +21,18 @@ const MONO: &str = "Consolas, 'Courier New', monospace";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     Svg,
+    Pdf,
     Png,
     Tiff,
 }
 
 impl Format {
-    pub const ALL: [Format; 3] = [Format::Svg, Format::Png, Format::Tiff];
+    pub const ALL: [Format; 4] = [Format::Svg, Format::Pdf, Format::Png, Format::Tiff];
 
     pub fn label(self) -> &'static str {
         match self {
             Format::Svg => "SVG (vector)",
+            Format::Pdf => "PDF (vector)",
             Format::Png => "PNG",
             Format::Tiff => "TIFF",
         }
@@ -39,9 +41,15 @@ impl Format {
     pub fn extension(self) -> &'static str {
         match self {
             Format::Svg => "svg",
+            Format::Pdf => "pdf",
             Format::Png => "png",
             Format::Tiff => "tif",
         }
+    }
+
+    /// Vector formats keep any size; raster ones are rendered at a resolution
+    pub fn is_vector(self) -> bool {
+        matches!(self, Format::Svg | Format::Pdf)
     }
 }
 
@@ -98,7 +106,7 @@ fn label_svg(text: &str) -> String {
 }
 
 /// A round step giving about `n` ticks over `span`
-fn tick_step(span: f64, n: f64) -> f64 {
+pub(super) fn tick_step(span: f64, n: f64) -> f64 {
     let raw = (span / n).max(f64::MIN_POSITIVE);
     let magnitude = 10f64.powf(raw.log10().floor());
     [1.0, 2.0, 2.5, 5.0, 10.0]
@@ -421,10 +429,13 @@ fn legend_svg(out: &mut String, a: &Annotation, y: f64) -> f64 {
     y
 }
 
-/// Write the figure: the SVG itself, or rendered at `dpi` to PNG / TIFF
+/// Write the figure: the SVG itself, converted to PDF, or rendered at `dpi`
+/// to PNG / TIFF
 pub fn export(svg: &str, format: Format, dpi: u32, background: bool, path: &Path) -> Result<(), String> {
-    if format == Format::Svg {
-        return std::fs::write(path, svg).map_err(|e| e.to_string());
+    match format {
+        Format::Svg => return std::fs::write(path, svg).map_err(|e| e.to_string()),
+        Format::Pdf => return std::fs::write(path, pdf(svg)?).map_err(|e| e.to_string()),
+        Format::Png | Format::Tiff => {}
     }
     let image = rasterize(svg, dpi)?;
     match (format, background) {
@@ -435,14 +446,29 @@ pub fn export(svg: &str, format: Format, dpi: u32, background: bool, path: &Path
     .map_err(|e| e.to_string())
 }
 
+/// The SVG parsed for rendering, with the system fonts
+fn parse(svg: &str) -> Result<(resvg::usvg::Tree, f32), String> {
+    let mut options = resvg::usvg::Options::default();
+    options.fontdb_mut().load_system_fonts();
+    let tree = resvg::usvg::Tree::from_str(svg, &options).map_err(|e| e.to_string())?;
+    Ok((tree, options.dpi))
+}
+
+/// The SVG as a vector PDF of the same size, text kept as text (fonts embedded)
+pub fn pdf(svg: &str) -> Result<Vec<u8>, String> {
+    let (tree, css_dpi) = parse(svg)?;
+    // usvg sizes the figure in CSS pixels, `css_dpi` per inch: one page of the figure's size
+    let page = svg2pdf::PageOptions { dpi: css_dpi };
+    svg2pdf::to_pdf(&tree, svg2pdf::ConversionOptions::default(), page).map_err(|e| e.to_string())
+}
+
 /// Render the SVG at `dpi` (straight, not premultiplied, RGBA)
 pub fn rasterize(svg: &str, dpi: u32) -> Result<image::RgbaImage, String> {
-    use resvg::{tiny_skia, usvg};
-    let mut options = usvg::Options::default();
-    options.fontdb_mut().load_system_fonts();
-    let tree = usvg::Tree::from_str(svg, &options).map_err(|e| e.to_string())?;
+    use resvg::tiny_skia;
+    let (tree, css_dpi) = parse(svg)?;
+    let options_dpi = css_dpi;
     // usvg sizes the figure (given in inches) in CSS pixels, `options.dpi` per inch
-    let scale = dpi as f32 / options.dpi;
+    let scale = dpi as f32 / options_dpi;
     let size = tree.size();
     let (w, h) = ((size.width() * scale).ceil() as u32, (size.height() * scale).ceil() as u32);
     let mut pixmap = tiny_skia::Pixmap::new(w, h).ok_or("figure too large")?;
@@ -518,7 +544,13 @@ mod test {
                 let path = dir.join(format!("figure_{background}.{}", format.extension()));
                 export(&svg(&a, &options(background)), format, 300, background, &path).unwrap();
                 assert!(std::fs::metadata(&path).unwrap().len() > 1000, "{}", path.display());
-                if format != Format::Svg {
+                if format == Format::Pdf {
+                    let bytes = std::fs::read(&path).unwrap();
+                    assert!(bytes.starts_with(b"%PDF"));
+                    // one page, 7 in (504 pt) wide
+                    let text = String::from_utf8_lossy(&bytes);
+                    assert!(text.contains("/MediaBox [0 0 504"), "{}", &text[..text.len().min(2000)]);
+                } else if format != Format::Svg {
                     let img = image::open(&path).unwrap();
                     assert_eq!(img.width(), 2100, "7 in at 300 dpi");
                     assert_eq!(img.color().has_alpha(), !background);

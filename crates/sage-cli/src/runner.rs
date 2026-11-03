@@ -30,6 +30,7 @@ mod annotator_export;
 mod crosslink_export;
 mod crosslink_mzid;
 mod crosslink_runner;
+mod summary_tables;
 
 pub struct Runner {
     pub database: IndexedDatabase,
@@ -695,6 +696,10 @@ impl Runner {
                     .push(self.write_lfq(areas, &filenames)?);
             }
         }
+
+        // Peptide- and protein-level tables (1% FDR)
+        let tables = self.write_summary_tables(&outputs.features, &filenames, areas.as_ref())?;
+        self.parameters.output_paths.extend(tables);
 
         // Write percolator input file if requested
         if self.parameters.write_pin {

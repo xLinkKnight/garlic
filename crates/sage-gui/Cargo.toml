@@ -1,6 +1,6 @@
 [package]
 name = "sage-gui"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 description = "Desktop front-end for editing Sage search settings and running searches"
 license = "MIT"
@@ -25,7 +25,9 @@ mzcore = "0.2"
 mzannotate = "0.2"
 mzdata = { version = "0.65", default-features = false, features = ["miniz_oxide"] }
 # Figure export: SVG rendered to PNG / TIFF
-resvg = { version = "0.49", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+# PDF export of figures (shares usvg 0.45 with resvg)
+svg2pdf = { version = "0.13", default-features = false, features = ["text"] }
 image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
 
 [target.'cfg(windows)'.dependencies]

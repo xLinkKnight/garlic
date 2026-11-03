@@ -52,6 +52,10 @@ pub struct Match {
     pub expmass: f32,
     pub calcmass: f32,
     pub rt: f32,
+    /// Precursor inverse ion mobility 1/K0 (V·s/cm²), timsTOF data
+    pub ion_mobility: Option<f32>,
+    /// Crosslinks: both peptides from the same protein
+    pub intra_protein: bool,
 }
 
 impl Match {
@@ -176,9 +180,11 @@ impl Results {
             Kind::Crosslink => vec![(0, site(m.sites.0)), (1, site(m.sites.1))],
             Kind::Loop => vec![(0, site(m.sites.0)), (0, site(m.sites.1))],
         };
-        // Stub ions only for two peptides: a cleaved loop-link stays one peptide
-        let stubs = if m.kind == Kind::Crosslink { stubs_of(&settings) } else { Vec::new() };
-        let stub_peptides = [(&m.peptide, sites[0].1), (&m.partner, sites[1].1)]
+        // A cleaved loop-link stays one peptide: its ring ions carry the stub of
+        // one linked residue, so each residue's stubs are looked for in turn
+        let stubs = stubs_of(&settings);
+        let second = if m.kind == Kind::Loop { &m.peptide } else { &m.partner };
+        let stub_peptides = [(&m.peptide, sites[0].1), (second, sites[1].1)]
             .iter()
             .filter(|_| !stubs.is_empty())
             .map(|(peptide, s)| {
@@ -439,6 +445,8 @@ fn parse_linear(text: &str) -> Vec<Match> {
             expmass: field(&f, &col, "expmass").parse().unwrap_or(0.0),
             calcmass: field(&f, &col, "calcmass").parse().unwrap_or(0.0),
             rt: field(&f, &col, "rt").parse().unwrap_or(0.0),
+            ion_mobility: field(&f, &col, "ion_mobility").parse().ok().filter(|&x: &f32| x > 0.0),
+            intra_protein: false,
         })
         .collect()
 }
@@ -475,6 +483,8 @@ fn parse_crosslinks(text: &str) -> Vec<Match> {
                 expmass: field(&f, &col, "expmass").parse().unwrap_or(0.0),
                 calcmass: field(&f, &col, "calcmass").parse().unwrap_or(0.0),
                 rt: field(&f, &col, "rt").parse().unwrap_or(0.0),
+                ion_mobility: field(&f, &col, "ion_mobility").parse().ok().filter(|&x: &f32| x > 0.0),
+                intra_protein: field(&f, &col, "intra_protein") == "true",
             }
         })
         .collect()
@@ -687,8 +697,11 @@ fn find_peak(peaks: &[PeakView], mz: f64, tolerance: Tolerance) -> Option<usize>
 /// own interpretation of the same mass).
 fn find_stub_ions(views: &mut [PeakView], link: &Link, charge: u8, model: Model, tolerance: Tolerance) -> Vec<StubIon> {
     let mut found: Vec<StubIon> = Vec::new();
-    for (k, per_stub) in link.stub_peptides.iter().enumerate() {
-        let site = link.sites.get(k).map_or(0, |s| s.1);
+    let is_loop = link.kind == Kind::Loop;
+    for (side, per_stub) in link.stub_peptides.iter().enumerate() {
+        let (k, site) = link.sites.get(side).copied().unwrap_or((side, 0));
+        // loop-links: ring ions contain this residue but not the other one
+        let other = link.sites.get(1 - side.min(1)).map(|s| s.1).filter(|_| is_loop);
         for (j, proforma) in per_stub.iter().enumerate() {
             let Ok((ions, _)) = PeptidoformIonSet::pro_forma(proforma, &mzcore::ontology::STATIC_ONTOLOGIES) else {
                 continue;
@@ -707,7 +720,8 @@ fn find_stub_ions(views: &mut [PeakView], link: &Link, charge: u8, model: Model,
             // The whole peptide + stub (the doublet peaks), at every charge up to
             // `max_charge`: the model only gives the precursor at its own charge
             let peptide_mass = ions.formulas().first().map(|f| f.monoisotopic_mass().value);
-            for z in 1..=max_charge {
+            // (not for loop-links: their peptide carries both stubs)
+            for z in (1..=max_charge).filter(|_| !is_loop) {
                 let Some(mass) = peptide_mass else { break };
                 let mz = (mass + z as f64 * 1.007_276_466_6) / z as f64;
                 let Some(peak) = find_peak(views, mz, tolerance) else { continue };
@@ -721,15 +735,19 @@ fn find_stub_ions(views: &mut [PeakView], link: &Link, charge: u8, model: Model,
                 found.push(StubIon { peptide: k, stub: j, kind: StubIonKind::Peptide, charge: z, theoretical_mz: mz, peak, text });
             }
             for f in fragments.iter().filter(|f| f.neutral_loss.is_empty()) {
+                // N-terminal ion `bN` holds residues 0..N, C-terminal `yN` n-N..n.
+                // Loop-links: the ion must hold this residue and not the other,
+                // so N-terminal ring ions belong to the first residue and
+                // C-terminal ones to the second
+                let n_ok = |series: usize| series > site && other.is_none_or(|o| o > site && series <= o);
+                let c_ok = |series: usize| {
+                    series >= n.saturating_sub(site) && series <= n && other.is_none_or(|o| o < site && n - series > o)
+                };
                 let kind = match &f.ion {
-                    FragmentType::a(p, _) | FragmentType::b(p, _) | FragmentType::c(p, _)
-                        if p.series_number > site =>
-                    {
+                    FragmentType::a(p, _) | FragmentType::b(p, _) | FragmentType::c(p, _) if n_ok(p.series_number) => {
                         StubIonKind::NTerm(p.series_number - 1)
                     }
-                    FragmentType::x(p, _) | FragmentType::y(p, _) | FragmentType::z(p, _)
-                        if p.series_number >= n.saturating_sub(site) && p.series_number <= n =>
-                    {
+                    FragmentType::x(p, _) | FragmentType::y(p, _) | FragmentType::z(p, _) if c_ok(p.series_number) => {
                         StubIonKind::CTerm(n - p.series_number)
                     }
                     _ => continue,
@@ -1001,6 +1019,59 @@ pub(crate) mod test {
         Link { kind: Kind::Crosslink, sites, linker: "DSSO".into(), stubs, stub_peptides }
     }
 
+    /// An opened DSSO loop-link (NEKIQQKLQNER, K3–K7): ring ions carry the stub
+    /// of one residue: b3–b6 the first, y6–y9 the second
+    #[test]
+    fn loop_link_ring_ions_carry_one_stub() {
+        let settings = CrosslinkSettings { reagent: Some(sage_core::crosslink::Reagent::Dsso), ..Default::default() };
+        let stubs = stubs_of(&settings);
+        let none = HashMap::new();
+        let (peptide, first, second) = ("NEKIQQKLQNER", 2usize, 6usize);
+        let stub_peptides = [first, second]
+            .iter()
+            .map(|&s| stubs.iter().map(|st| rewrite(peptide, &[(s, format!("{:+}", st.mass))], &none)).collect())
+            .collect();
+        let link = Link { kind: Kind::Loop, sites: vec![(0, first), (0, second)], linker: "DSSO".into(), stubs, stub_peptides };
+
+        // b4 with the alkene on K3 and y7 with the sulfenic acid on K7 (ring ions),
+        // and y9 with the alkene on K7 (it holds K3 too: not a ring ion of K7 alone)
+        let fragments = |proforma: &str| {
+            PeptidoformIonSet::pro_forma(proforma, &mzcore::ontology::STATIC_ONTOLOGIES)
+                .unwrap()
+                .0
+                .generate_theoretical_fragments::<OutputMolecularFormula>(Charge::new::<mzcore::system::e>(1), FragmentationModel::cid())
+        };
+        let pick = |proforma: &str, n_term: bool, number: usize| {
+            fragments(proforma)
+                .into_iter()
+                .find(|f| {
+                    f.neutral_loss.is_empty()
+                        && f.charge.value == 1
+                        && match &f.ion {
+                            FragmentType::b(p, _) => n_term && p.series_number == number,
+                            FragmentType::y(p, _) => !n_term && p.series_number == number,
+                            _ => false,
+                        }
+                })
+                .and_then(|f| f.mz(MassMode::Monoisotopic))
+                .unwrap()
+                .value
+        };
+        let mut mz = vec![
+            pick(&link.stub_peptides[0][0], true, 4),
+            pick(&link.stub_peptides[1][2], false, 7),
+            pick(&link.stub_peptides[1][0], false, 11),
+        ];
+        mz.sort_by(f64::total_cmp);
+        let peaks = Peaks { intensity: vec![50.0; mz.len()], mz, precursor_mz: None, ion_mobility: None };
+        let a = annotate(&peaks, "NEK[XLMOD:02126#XL1]IQQK[#XL1]LQNER", 3, Model::CidHcd, Tolerance::Ppm(-10.0, 10.0), Some(&link))
+            .unwrap();
+        let mut found: Vec<(StubIonKind, usize)> = a.stub_ions.iter().map(|s| (s.kind, s.stub)).collect();
+        found.sort_by_key(|(k, s)| (format!("{k:?}"), *s));
+        assert_eq!(found, vec![(StubIonKind::CTerm(5), 2), (StubIonKind::NTerm(3), 0)], "{:?}", a.stub_ions);
+        assert!(a.stub_ions.iter().all(|s| s.peptide == 0));
+    }
+
     #[test]
     fn dsso_stubs_are_named() {
         let names: Vec<_> = dsso_link().stubs.iter().map(|s| (s.name.clone(), (s.mass * 1000.0).round() as i64)).collect();
@@ -1099,12 +1170,12 @@ mod real_data {
                 .take(40)
                 .collect::<Vec<_>>()
         };
-        let chosen = [pick(Kind::Linear), pick(Kind::Crosslink)];
+        let chosen = [pick(Kind::Linear), pick(Kind::Crosslink), pick(Kind::Loop)];
         let wanted = chosen.iter().flatten().map(|m| m.key()).collect::<HashSet<_>>();
         let start = std::time::Instant::now();
         let spectra = results.read_spectra(&wanted, &|msg| println!("{msg}")).unwrap();
         println!("read {} spectra in {:.1} s", spectra.len(), start.elapsed().as_secs_f32());
-        for (name, list) in ["linear", "crosslink"].iter().zip(&chosen) {
+        for (name, list) in ["linear", "crosslink", "loop-link"].iter().zip(&chosen) {
             for model in [Model::CidHcd, Model::All] {
                 let (mut right, mut wrong, mut n) = (0.0, 0.0, 0);
                 let keys: Vec<_> = list.iter().map(|m| m.key()).collect();
@@ -1157,6 +1228,37 @@ mod real_data {
              other spectrum: {}/{}, {} stub fragment ions",
             own.0, own.2, own.1, other.0, other.2, other.1
         );
+
+        // Ring ions of the loop-links (stub on one residue), against other spectra
+        let list = &chosen[2];
+        if !list.is_empty() {
+            let keys: Vec<_> = list.iter().map(|m| m.key()).collect();
+            let ring = |offset: usize| {
+                let (mut with, mut ions) = (0, 0);
+                for (i, m) in list.iter().enumerate() {
+                    let Some(link) = results.link(m) else { continue };
+                    let key = &keys[(i + offset) % keys.len()];
+                    let a = annotate(&spectra[key], &results.proforma(m), m.charge, Model::CidHcd, results.fragment_tol, Some(&link))
+                        .unwrap();
+                    with += (!a.stub_ions.is_empty()) as usize;
+                    ions += a.stub_ions.len();
+                    if offset == 0 && i < 2 {
+                        println!("  {}: {:?}", results.proforma(m), a.stub_ions.iter().map(|s| s.text.clone()).collect::<Vec<_>>());
+                    }
+                }
+                (with, ions)
+            };
+            let (own, other) = (ring(0), ring(1));
+            println!(
+                "loop-link ring ions: own spectrum: in {}/{} spectra, {} ions; other spectrum: in {}/{}, {} ions",
+                own.0,
+                list.len(),
+                own.1,
+                other.0,
+                list.len(),
+                other.1
+            );
+        }
 
         // Ion mobility of the timsTOF precursors, and example figures when
         // SAGE_GUI_FIGURES names a folder

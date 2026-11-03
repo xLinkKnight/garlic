@@ -243,6 +243,7 @@ impl Runner {
             "pairs_scored",
             "stub_peaks",
             "rt",
+            "ion_mobility",
             "spectrum_q",
             "crosslink_q",
         ]
@@ -304,6 +305,7 @@ impl Runner {
                 m.pairs_scored.to_string(),
                 m.stub_peaks.to_string(),
                 m.rt.to_string(),
+                m.ims.to_string(),
                 m.spectrum_q.to_string(),
                 m.crosslink_q.to_string(),
             ];

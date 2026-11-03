@@ -68,6 +68,10 @@ fn default_linked_peaks() -> u16 {
     2
 }
 
+fn default_linear_search() -> bool {
+    true
+}
+
 fn default_chain_survivors() -> usize {
     20_000
 }
@@ -319,8 +323,9 @@ pub struct CrosslinkSettings {
     #[serde(default = "default_chain_survivors")]
     pub chain_survivors: usize,
     /// Also run an ordinary linear peptide search on the same spectra
-    /// (`results.sage.tsv` next to `crosslinks.sage.tsv`)
-    #[serde(default)]
+    /// (`results.sage.tsv`, `peptides.sage.tsv` and `proteins.sage.tsv` next
+    /// to `crosslinks.sage.tsv`). On unless set to `false`.
+    #[serde(default = "default_linear_search")]
     pub linear_search: bool,
     /// Non-cleavable linkers: matched fragment ions that carry the linker
     /// (contain the link site; loop-links: both sites) required on *each*
@@ -348,7 +353,7 @@ impl Default for CrosslinkSettings {
             require_complete_doublets: false,
             backend: Backend::Cpu,
             chain_survivors: default_chain_survivors(),
-            linear_search: false,
+            linear_search: default_linear_search(),
             min_linked_peaks: default_linked_peaks(),
         }
     }
@@ -650,7 +655,8 @@ pub struct CrosslinkMatch {
     pub alpha_matched: u16,
     pub beta_matched: u16,
     /// Non-cleavable linkers: matched ions carrying the linker, per chain
-    /// (loop-links: `alpha_linked` only)
+    /// (loop-links: `alpha_linked` only). Cleavable loop-links: matched
+    /// stub-carrying ions inside the opened ring.
     pub alpha_linked: u16,
     pub beta_linked: u16,
     pub delta_next: f64,
@@ -763,6 +769,56 @@ pub fn linked_ions(peptide: &Peptide, mods: &Modifications, kinds: &[Kind], link
         .filter(|(shifted, plain)| shifted.1 != plain.1)
         .map(|(ion, _)| ion)
         .collect()
+}
+
+/// Theoretical (neutral) fragment ions of a loop-link of an MS-cleavable
+/// linker whose ring opened in the collision cell: `(all ions, ring ions)`.
+///
+/// Residue `first < second` carry the arms `at_first` / `at_second`. Once the
+/// linker is cleaved, a backbone cleavage *inside* the ring separates
+/// fragments too: those contain one linked residue and carry one of its arm's
+/// stubs (any of short, long, alt). These ring ions are the evidence of the
+/// loop-link and are returned separately as well. Ions containing both
+/// residues carry both stubs, one arm's short stub and the other arm's long
+/// (= the linker mass) or alt stub, or the intact linker; ions containing
+/// neither are ordinary linear ions.
+#[allow(clippy::too_many_arguments)]
+pub fn cleaved_loop_ions(
+    peptide: &Peptide,
+    mods: &Modifications,
+    kinds: &[Kind],
+    first: usize,
+    second: usize,
+    at_first: &ArmStubs,
+    at_second: &ArmStubs,
+    linker: f32,
+) -> (Vec<(Kind, f32)>, Vec<(Kind, f32)>) {
+    // stubs summed over both sites: exactly one of them the short stub
+    let mut both = vec![linker];
+    for (x, y) in [(at_first, at_second), (at_second, at_first)] {
+        for long in std::iter::once(y.long).chain(y.alt.iter().copied()) {
+            let sum = x.short + long;
+            if both.iter().all(|b| (b - sum).abs() > 1e-3) {
+                both.push(sum);
+            }
+        }
+    }
+    let (mut all, mut ring) = (Vec::new(), Vec::new());
+    for &kind in kinds {
+        let n_terminal = matches!(kind, Kind::A | Kind::B | Kind::C);
+        let contains = |site: usize, idx: usize| if n_terminal { idx >= site } else { idx < site };
+        for (idx, ion) in IonSeries::new(peptide, kind, mods).enumerate() {
+            let mass = ion.monoisotopic_mass;
+            match (contains(first, idx), contains(second, idx)) {
+                (false, false) => all.push((kind, mass)),
+                (true, true) => all.extend(both.iter().map(|s| (kind, mass + s))),
+                (true, false) => ring.extend(at_first.all().into_iter().map(|s| (kind, mass + s))),
+                (false, true) => ring.extend(at_second.all().into_iter().map(|s| (kind, mass + s))),
+            }
+        }
+    }
+    all.extend(ring.iter().copied());
+    (all, ring)
 }
 
 fn frag_charge_bound(max_fragment_charge: Option<u8>, precursor_charge: u8) -> u8 {
@@ -1483,6 +1539,56 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
         best.map(|b| b.map(|(site, tally, _)| (site, tally)))
     }
 
+    /// Best pair of link sites for a loop-link of an MS-cleavable linker on one
+    /// peptide (see [`cleaved_loop_ions`]): `(score, first, second, tally,
+    /// matched ring ions)`. A site pair needs `min_linked_peaks` matched ring
+    /// ions, the ions only an opened loop-link gives.
+    fn score_cleavable_loop(
+        &self,
+        query: &ProcessedSpectrum,
+        peptide: &Peptide,
+        stubs: &CleavableStubs,
+        max_fragment_charge: u8,
+    ) -> Option<(f64, usize, usize, Tally, u16)> {
+        let db = self.scorer.db;
+        let tol = self.scorer.fragment_tol;
+        let sites = self.settings.link_site_roles(peptide);
+        let arms = stubs.arms();
+        let mut best: Option<(f64, usize, usize, Tally, u16)> = None;
+        for (x, &(first, roles_first)) in sites.iter().enumerate() {
+            for &(second, roles_second) in &sites[x + 1..] {
+                if !pairable(roles_first, roles_second) {
+                    continue;
+                }
+                for (arm_first, arm_second) in stubs.arm_pairs() {
+                    let (all, ring) = cleaved_loop_ions(
+                        peptide,
+                        &db.modifications,
+                        &db.ion_kinds,
+                        first,
+                        second,
+                        &arms[arm_first],
+                        &arms[arm_second],
+                        self.settings.linker_mass(),
+                    );
+                    let tally = match_ions(query, &all, max_fragment_charge, tol);
+                    if tally.matched() < self.settings.min_chain_peaks {
+                        continue;
+                    }
+                    let ring_matched = match_ions(query, &ring, max_fragment_charge, tol).matched();
+                    if ring_matched < self.settings.min_linked_peaks {
+                        continue;
+                    }
+                    let score = tally.score(self.scorer.score_type);
+                    if best.as_ref().is_none_or(|b| score > b.0) {
+                        best = Some((score, first, second, tally, ring_matched));
+                    }
+                }
+            }
+        }
+        best
+    }
+
     /// Search for an MS-cleavable crosslink (DSSO, DSBU, ...).
     ///
     /// 1. A stub-bearing peptide appears in the spectrum as a *doublet* (short
@@ -1537,8 +1643,58 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
 
             // each peptide pair once per precursor charge: the best-scoring way round
             let mut seen: HashMap<(u32, u32), usize> = HashMap::new();
+            let mut loops_seen: HashSet<usize> = HashSet::new();
             for iso in sc.min_isotope_err..=sc.max_isotope_err {
                 let m = mass - iso as f32 * NEUTRON;
+
+                // Loop-links: one peptide plus the linker explains the precursor;
+                // the opened ring shows as stub-carrying fragment ions
+                if cfg.loop_links {
+                    let (lo, hi) = sc.precursor_tol.bounds(m);
+                    let start = db.peptides.partition_point(|p| p.monoisotopic < lo - linker);
+                    let end = db.peptides[start..]
+                        .iter()
+                        .take_while(|p| p.monoisotopic <= hi - linker)
+                        .take(MAX_PARTNERS_PER_SEED)
+                        .count();
+                    for ix in start..start + end {
+                        let p = &db.peptides[ix];
+                        if !loops_seen.insert(ix) {
+                            continue;
+                        }
+                        pairs_scored += 1;
+                        let Some((score, first, second, tally, ring)) =
+                            self.score_cleavable_loop(query, p, &stubs, max_fc)
+                        else {
+                            continue;
+                        };
+                        let calc = p.monoisotopic + linker;
+                        found.push(CrosslinkMatch {
+                            psm_id: CSM_COUNTER.fetch_add(1, Ordering::Relaxed),
+                            spec_id: query.id.clone(),
+                            file_id: query.file_id,
+                            kind: LinkKind::Loop,
+                            class: PairClass::of(p.decoy, p.decoy),
+                            alpha: PeptideIx(ix as u32),
+                            beta: None,
+                            alpha_site: first as u16,
+                            beta_site: second as u16,
+                            intra_protein: true,
+                            charge,
+                            rt: query.scan_start_time,
+                            expmass: mass,
+                            calcmass: calc,
+                            precursor_ppm: ppm_delta(mass, iso, calc),
+                            isotope_error: iso as f32 * NEUTRON,
+                            hyperscore: score,
+                            alpha_score: score,
+                            alpha_matched: tally.matched(),
+                            alpha_linked: ring,
+                            ..Default::default()
+                        });
+                    }
+                }
+
                 for &(arm_a, arm_b) in &stubs.arm_pairs() {
                 let (x, y) = (&arms[arm_a], &arms[arm_b]);
                 for &a in &peaks {
@@ -2694,6 +2850,92 @@ mod test {
             ions.push((Kind::B, p.monoisotopic + arms[0].long));
         }
         assert!(xl.score(&spectrum(precursor, 4, &ions)).is_empty());
+    }
+
+    /// Ions of a DSSO loop-link opened in the collision cell: the first site
+    /// keeps the short stub, the second the long one
+    fn opened_loop(p: &Peptide, mods: &Modifications, first: usize, second: usize, cfg: &CrosslinkSettings) -> Vec<(Kind, f32)> {
+        let s = cfg.stubs().unwrap();
+        let short = ArmStubs { short: s.short, long: s.short, alt: vec![] };
+        let long = ArmStubs { short: s.long, long: s.long, alt: vec![] };
+        let (mut all, _) = cleaved_loop_ions(p, mods, &[Kind::B, Kind::Y], first, second, &short, &long, cfg.linker_mass());
+        all.dedup();
+        all
+    }
+
+    #[test]
+    fn cleaved_loop_ions_follow_the_ring() {
+        let l = peptide("AEFGHDSTWKLMNPQSTVKGYEDFAR", "PROT_L", Position::Internal);
+        let db = database(vec![l.clone()]);
+        let cfg = dsso();
+        let arm = &cfg.stubs().unwrap().arms()[0];
+        let (all, ring) = cleaved_loop_ions(&l, &db.modifications, &[Kind::B, Kind::Y], 9, 18, arm, arm, cfg.linker_mass());
+        // b10..b18 and y9..y17 lie inside the ring (9 + 9 positions), three stubs each
+        assert_eq!(ring.len(), 18 * 3);
+        // spanning ions: the linker (alkene + sulfenic acid) or alkene + thiol
+        let b19 = IonSeries::new(&l, Kind::B, &db.modifications).nth(18).unwrap().monoisotopic_mass;
+        // b19 with each stub combination (b20 = b19 + G is 57 Da further out)
+        let spanning: Vec<f32> = all
+            .iter()
+            .filter(|(k, m)| *k == Kind::B && *m - b19 > 100.0 && *m - b19 < 160.0)
+            .map(|(_, m)| m - b19)
+            .collect();
+        assert_eq!(spanning.len(), 2, "{spanning:?}");
+        assert!(spanning.iter().any(|d| (d - cfg.linker_mass()).abs() < 1e-3));
+        assert!(spanning.iter().any(|d| (d - (54.01056 + 85.98264)).abs() < 1e-3));
+    }
+
+    #[test]
+    fn finds_cleavable_loop_link() {
+        let l = peptide("AEFGHDSTWKLMNPQSTVKGYEDFAR", "PROT_L", Position::Internal);
+        let mut targets = distractors(400);
+        targets.push(l.clone());
+        let db = database(targets);
+        let sc = scorer(&db);
+        let cfg = dsso();
+        let xl = CrosslinkScorer::new(&sc, &cfg);
+
+        let ions = opened_loop(&l, &db.modifications, 9, 18, &cfg);
+        let hits = xl.score(&spectrum(l.monoisotopic + cfg.linker_mass(), 3, &ions));
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        let hit = &hits[0];
+        assert_eq!(hit.kind, LinkKind::Loop);
+        assert_eq!(hit.class, PairClass::TT);
+        assert_eq!((hit.alpha_site, hit.beta_site), (9, 18));
+        assert_eq!(String::from_utf8(db[hit.alpha].sequence.to_vec()).unwrap(), "AEFGHDSTWKLMNPQSTVKGYEDFAR");
+        assert!(hit.alpha_linked >= 9, "ring ions {}", hit.alpha_linked);
+        assert!(hit.precursor_ppm.abs() < 1.0);
+
+        // switched off: no loop-links
+        let off = CrosslinkSettings { loop_links: false, ..dsso() };
+        assert!(CrosslinkScorer::new(&sc, &off)
+            .score(&spectrum(l.monoisotopic + cfg.linker_mass(), 3, &ions))
+            .is_empty());
+    }
+
+    #[test]
+    fn cleavable_loop_link_needs_ring_ions() {
+        // the ring never opened (or another +158 Da modification): only ions
+        // outside the ring and spanning it, none that only an opened loop gives
+        let l = peptide("AEFGHDSTWKLMNPQSTVKGYEDFAR", "PROT_L", Position::Internal);
+        let mut targets = distractors(400);
+        targets.push(l.clone());
+        let db = database(targets);
+        let sc = scorer(&db);
+        let cfg = dsso();
+        let closed = chain_ions(
+            &l,
+            &db.modifications,
+            &[Kind::B, Kind::Y],
+            Link::Loop { first: 9, second: 18, shift: cfg.linker_mass() },
+        );
+        let query = spectrum(l.monoisotopic + cfg.linker_mass(), 3, &closed);
+        assert!(CrosslinkScorer::new(&sc, &cfg).score(&query).is_empty());
+
+        // nor is a linear peptide spectrum at the loop-link's precursor mass
+        let linear = chain_ions(&l, &db.modifications, &[Kind::B, Kind::Y], Link::Single { site: 0, shift: 0.0 });
+        let query = spectrum(l.monoisotopic + cfg.linker_mass(), 3, &linear);
+        assert!(CrosslinkScorer::new(&sc, &cfg).score(&query).is_empty());
     }
 
     #[test]

@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.18.0] - 2026-11-03
+
+### Added
+- Peptide- and protein-level reports from every linear search: `peptides.sage.tsv` (one row per target peptide at 1% peptide FDR: proteins and groups, charges, PSM count per file, best spectrum/peptide/protein/group q-values and scores, summed MS2 intensity and, with LFQ, MS1 intensity per file) and `proteins.sage.tsv` (one row per target protein group with a unique peptide in `peptides.sage.tsv`: its group q-value, unique and shared peptides, PSM count per file and, with LFQ, the summed intensity of its unique peptides per file), next to `results.sage.tsv`. Protein groups are listed with their q-value rather than cut at 1%: Sage's picked group FDR cannot go below 1 / (number of protein groups), about 0.08 for a 13-protein complex, so filter on `protein_group_q` for proteome-wide databases.
+- `sage-gui`: mobiligram of timsTOF (Bruker `.d`) runs ("Mobiligram…" in the Annotated spectra tab): every searched precursor by m/z and ion mobility (1/K0), marker shape by charge state (1+ to 6+ and up), colour by identification at 1% FDR (crosslinks between proteins red #FF523B, within a protein orange #FF9D35, loop-links pink; linear peptides blue at 50% transparency; unidentified grey), with a legend of colours (with counts) and charge shapes. Interactive in the viewer; exported as SVG or PDF, white or transparent background.
+- `sage-gui`: PDF (vector, fonts embedded) as an export format for annotated spectra too.
+- `crosslinks.sage.tsv`: `ion_mobility` column (precursor 1/K0, timsTOF data; 0 otherwise), after `rt`.
+- Crosslinking: loop-links of MS-cleavable linkers (DSSO, DSBU, cliXlink). The opened ring shows as fragment ions that carry the stub of one linked residue (ring ions); peptides whose mass plus the linker matches the precursor are scored with these ions, the ions spanning both residues (both stubs) and the plain ones outside, and need `min_linked_peaks` matched ring ions. On the DSSO Pol II run: 154 loop-link CSMs at 1% FDR (1 decoy), with 12.4 ring ions on average against 4.2 for decoys; spectra of a PRP40 loop-link that had been the best-scoring decoy crosslinks are now explained, and intra-protein crosslinks at 1% FDR rose from 74 to 148. `sage-gui` marks the ring ions as stub hooks in the peptide map and labels them (`b4+A`).
+- `sage-gui`: the mobiligram legend always lists every class, with n = 0 when none was found.
+
+### Changed
+- Crosslinking: the linear peptide search (`linear_search`) is on by default, so crosslink searches also give the usual bottom-up results (`results.sage.tsv`, `peptides.sage.tsv`, `proteins.sage.tsv`). Set `"linear_search": false` (or untick it in `sage-gui`) to skip it.
+- `sage-gui`: the HTML report (`results.sage.report.html`) is on by default for new settings.
+
 ## [v0.17.0] - 2026-11-03
 
 ### Added

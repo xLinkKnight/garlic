@@ -2,6 +2,7 @@
 //! picked, its spectrum annotated by Annotator's engine (see [`model`]).
 
 pub mod figure;
+pub mod mobiligram;
 pub mod model;
 
 use eframe::egui::{self, Color32, RichText, Ui};
@@ -39,6 +40,7 @@ pub struct Viewer {
     export: ExportSettings,
     annotation: Option<Result<Annotation, String>>,
     annotated: Option<(usize, Model)>,
+    mobiligram: MobiligramView,
 }
 
 impl Default for Viewer {
@@ -63,6 +65,7 @@ impl Default for Viewer {
             export: ExportSettings::default(),
             annotation: None,
             annotated: None,
+            mobiligram: MobiligramView::default(),
         }
     }
 }
@@ -113,6 +116,8 @@ impl Viewer {
         self.annotation = None;
         self.annotated = None;
         self.filter_key.clear();
+        self.mobiligram.points = None;
+        self.mobiligram.file = None;
         match Results::load(Path::new(folder)) {
             Ok(results) => {
                 let (linear, crosslinks) = results.matches.iter().fold((0, 0), |(l, x), m| match m.kind {
@@ -289,6 +294,22 @@ impl Viewer {
             } else if missing > 0 && ui.button(format!("Read {missing} more spectra")).clicked() {
                 self.read_shown_spectra();
             }
+            ui.separator();
+            let has_mobility = results.matches.iter().any(|m| m.ion_mobility.is_some());
+            if ui
+                .add_enabled(has_mobility, egui::Button::new("Mobiligram…"))
+                .on_hover_text(
+                    "Every precursor of the run by m/z and ion mobility (1/K0): marker shape by charge, \
+                     colour by identification (crosslinks, linear peptides, unidentified). Export as SVG or PDF.",
+                )
+                .on_disabled_hover_text(
+                    "Needs ion mobility: timsTOF (Bruker .d) data, searched with garlic 0.18 or later \
+                     (crosslinks.sage.tsv with an ion_mobility column).",
+                )
+                .clicked()
+            {
+                self.mobiligram.open = true;
+            }
         });
         ui.add_space(4.0);
 
@@ -297,6 +318,18 @@ impl Viewer {
             ui.separator();
             ui.vertical(|ui| self.spectrum_view(ui, &results));
         });
+
+        if self.mobiligram.open {
+            let view = &mut self.mobiligram;
+            let points = view.points.get_or_insert_with(|| Arc::new(mobiligram::points(&results))).clone();
+            let mut open = true;
+            egui::Window::new("Mobiligram")
+                .open(&mut open)
+                .default_size([920.0, 680.0])
+                .resizable(true)
+                .show(ui.ctx(), |ui| view.ui(ui, &points));
+            view.open = open;
+        }
     }
 
     fn match_list(&mut self, ui: &mut Ui, results: &Results) {
@@ -442,10 +475,10 @@ impl Viewer {
                 })
                 .response
                 .on_hover_text(
-                    "SVG: vector graphics, editable in Illustrator / Inkscape, any size. \
+                    "SVG / PDF: vector graphics, editable in Illustrator / Inkscape, any size. \
                      PNG / TIFF: rendered at the chosen resolution, 7 inches wide.",
                 );
-            ui.add_enabled_ui(self.export.format != figure::Format::Svg, |ui| {
+            ui.add_enabled_ui(!self.export.format.is_vector(), |ui| {
                 egui::ComboBox::from_id_salt("viewer_export_dpi")
                     .selected_text(format!("{} dpi", self.export.dpi))
                     .show_ui(ui, |ui| {
@@ -519,6 +552,212 @@ impl Default for ExportSettings {
             map: true,
             zoom: true,
             message: None,
+        }
+    }
+}
+
+/// The mobiligram window: its precursors and export settings
+struct MobiligramView {
+    open: bool,
+    /// Computed when the window first opens
+    points: Option<Arc<Vec<mobiligram::Point>>>,
+    /// Only this spectrum file (`None`: all)
+    file: Option<String>,
+    unidentified: bool,
+    format: figure::Format,
+    background: bool,
+    title: bool,
+    message: Option<(bool, String)>,
+}
+
+impl Default for MobiligramView {
+    fn default() -> Self {
+        MobiligramView {
+            open: false,
+            points: None,
+            file: None,
+            unidentified: true,
+            format: figure::Format::Svg,
+            background: true,
+            title: true,
+            message: None,
+        }
+    }
+}
+
+/// egui_plot's marker for a charge state's shape
+fn plot_marker(shape: mobiligram::Shape) -> egui_plot::MarkerShape {
+    use egui_plot::MarkerShape as M;
+    use mobiligram::Shape;
+    match shape {
+        Shape::Cross => M::Plus,
+        Shape::Circle => M::Circle,
+        Shape::Triangle => M::Up,
+        Shape::Square => M::Square,
+        Shape::Diamond => M::Diamond,
+        Shape::TriangleDown => M::Down,
+    }
+}
+
+/// A charge-state marker drawn with the painter (for the key under the plot)
+fn paint_marker(painter: &egui::Painter, c: egui::Pos2, shape: mobiligram::Shape, r: f32, stroke: egui::Stroke) {
+    use mobiligram::Shape;
+    let p = |x: f32, y: f32| egui::pos2(c.x + x * r, c.y + y * r);
+    match shape {
+        Shape::Circle => {
+            painter.circle_stroke(c, r, stroke);
+        }
+        Shape::Square => {
+            painter.rect_stroke(egui::Rect::from_center_size(c, egui::vec2(1.7 * r, 1.7 * r)), 0.0, stroke, egui::StrokeKind::Middle);
+        }
+        Shape::Diamond => {
+            painter.add(egui::Shape::closed_line(vec![p(0.0, -1.15), p(1.15, 0.0), p(0.0, 1.15), p(-1.15, 0.0)], stroke));
+        }
+        Shape::Triangle => {
+            painter.add(egui::Shape::closed_line(vec![p(0.0, -1.2), p(1.04, 0.6), p(-1.04, 0.6)], stroke));
+        }
+        Shape::TriangleDown => {
+            painter.add(egui::Shape::closed_line(vec![p(0.0, 1.2), p(1.04, -0.6), p(-1.04, -0.6)], stroke));
+        }
+        Shape::Cross => {
+            painter.line_segment([p(-1.0, 0.0), p(1.0, 0.0)], stroke);
+            painter.line_segment([p(0.0, -1.0), p(0.0, 1.0)], stroke);
+        }
+    }
+}
+
+impl MobiligramView {
+    fn ui(&mut self, ui: &mut Ui, points: &[mobiligram::Point]) {
+        use mobiligram::{Class, Shape};
+        let mut files: Vec<&str> = points.iter().map(|p| p.file.as_str()).collect();
+        files.sort_unstable();
+        files.dedup();
+        let options = mobiligram::MobiligramOptions {
+            background: self.background,
+            title: None,
+            unidentified: self.unidentified,
+            file: self.file.clone(),
+        };
+        let shown = mobiligram::selected(points, &options);
+
+        ui.horizontal_wrapped(|ui| {
+            if files.len() > 1 {
+                ui.label("file");
+                egui::ComboBox::from_id_salt("mobiligram_file")
+                    .selected_text(self.file.as_deref().unwrap_or("all files"))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.file, None, "all files");
+                        for f in &files {
+                            ui.selectable_value(&mut self.file, Some(f.to_string()), *f);
+                        }
+                    });
+            }
+            ui.checkbox(&mut self.unidentified, "unidentified precursors")
+                .on_hover_text("Also show the precursors with no match at 1% FDR (grey).");
+            let crosslinks = shown.iter().filter(|p| p.class.is_crosslink()).count();
+            let linear = shown.iter().filter(|p| p.class == Class::Linear).count();
+            ui.label(
+                RichText::new(format!("{} precursors · {crosslinks} crosslinks · {linear} linear peptides", shown.len())).weak(),
+            );
+        });
+
+        let plot_height = (ui.available_height() - 70.0).max(320.0);
+        Plot::new("mobiligram_plot")
+            .height(plot_height)
+            .legend(egui_plot::Legend::default().position(egui_plot::Corner::RightTop))
+            .x_axis_label("m/z")
+            .y_axis_label("1/K0 (V·s/cm²)")
+            .label_formatter(|name, p| {
+                let name = if name.is_empty() { String::new() } else { format!("{name}\n") };
+                format!("{name}m/z {:.3}\n1/K0 {:.3}", p.x, p.y)
+            })
+            .show(ui, |plot_ui| {
+                for class in Class::ALL {
+                    let color = match class {
+                        Class::Unidentified => class.color().gamma_multiply(0.6),
+                        Class::Linear => class.color().gamma_multiply(0.5),
+                        _ => class.color(),
+                    };
+                    for charge in 1..=6u8 {
+                        let xy: Vec<[f64; 2]> = shown
+                            .iter()
+                            .filter(|p| p.class == class && p.charge.clamp(1, 6) == charge)
+                            .map(|p| [p.mz, p.mobility as f64])
+                            .collect();
+                        if xy.is_empty() {
+                            continue;
+                        }
+                        plot_ui.points(
+                            egui_plot::Points::new(xy)
+                                .name(class.label())
+                                .color(color)
+                                .shape(plot_marker(Shape::of(charge)))
+                                .radius(if class.is_crosslink() { 4.0f32 } else { 2.5 }),
+                        );
+                    }
+                }
+            });
+
+        // charge key: the shapes in use
+        let mut charges: Vec<u8> = shown.iter().map(|p| p.charge.clamp(1, 6)).collect();
+        charges.sort_unstable();
+        charges.dedup();
+        ui.horizontal(|ui| {
+            ui.label("charge:");
+            let stroke = egui::Stroke::new(1.3f32, ui.visuals().text_color());
+            for charge in charges {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                paint_marker(ui.painter(), rect.center(), Shape::of(charge), 5.0, stroke);
+                ui.label(if charge == 6 { "6+ and up".to_string() } else { format!("{charge}+") });
+                ui.add_space(6.0);
+            }
+        });
+
+        // export
+        let mut save = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Export");
+            egui::ComboBox::from_id_salt("mobiligram_format")
+                .selected_text(self.format.label())
+                .show_ui(ui, |ui| {
+                    for f in [figure::Format::Svg, figure::Format::Pdf] {
+                        ui.selectable_value(&mut self.format, f, f.label());
+                    }
+                });
+            ui.checkbox(&mut self.background, "white background").on_hover_text("Off: transparent background.");
+            ui.checkbox(&mut self.title, "title");
+            save = ui.button("Save…").clicked();
+        });
+        if let Some((error, text)) = &self.message {
+            let color = if *error { Color32::from_rgb(210, 60, 60) } else { ui.visuals().weak_text_color() };
+            ui.label(RichText::new(text).color(color));
+        }
+        if save {
+            let source = self.file.clone().unwrap_or_else(|| match files.as_slice() {
+                [one] => one.to_string(),
+                _ => format!("{} files", files.len()),
+            });
+            let options = mobiligram::MobiligramOptions {
+                title: self.title.then(|| format!("Mobiligram · {source} · {} precursors", shown.len())),
+                ..options
+            };
+            let svg = mobiligram::svg(points, &options);
+            let stem: String = source
+                .trim_end_matches(".d")
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .collect();
+            let format = self.format;
+            if let Some(path) = rfd::FileDialog::new()
+                .set_file_name(format!("mobiligram_{stem}.{}", format.extension()))
+                .add_filter(format.label(), &[format.extension()])
+                .save_file()
+            {
+                self.message = Some(match figure::export(&svg, format, 300, self.background, &path) {
+                    Ok(()) => (false, format!("Saved {}", path.display())),
+                    Err(e) => (true, format!("Could not save {}: {e}", path.display())),
+                });
+            }
         }
     }
 }

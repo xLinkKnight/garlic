@@ -793,7 +793,8 @@ impl SageGui {
             row(
                 ui,
                 "Output folder",
-                "Folder where Sage writes results.sage.tsv (PSMs), results.json (the full settings \
+                "Folder where Sage writes results.sage.tsv (PSMs), peptides.sage.tsv and \
+                 proteins.sage.tsv (peptides at 1% FDR and their protein groups), results.json (the full settings \
                  used), quantification tables and, for crosslink searches, crosslinks.sage.tsv \
                  plus crosslinks_xiView.csv and crosslinks.mzid (for xiVIEW, PRIDE) and \
                  crosslinks_proXL.xml (for ProXL).\n\
@@ -1829,7 +1830,8 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
     heading(ui, "Crosslinking (XL-MS)");
     ui.checkbox(&mut s.crosslink.enabled, RichText::new("Search for crosslinked peptides").strong())
         .on_hover_text("Turns this into a crosslink search: results go to crosslinks.sage.tsv \
-            (and, with 'Linear search' below, linear peptides to results.sage.tsv). \
+            (and, with 'Linear search' below, on by default, the usual bottom-up results: \
+            results.sage.tsv, peptides.sage.tsv and proteins.sage.tsv). \
             Label-free and TMT quantification work (Scoring & output tab); chimera, DIA and parquet \
             output are not used in this mode. \
             Details: CROSSLINKING.md");
@@ -1914,12 +1916,13 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
             row(ui, "Min linked ions per chain", "Non-cleavable linkers: each peptide needs at least this many matched                 fragments that carry the linker (ions containing the link site; for loop-links, both sites). They are                 the direct evidence of the link: without them, a correct peptide carrying any modification of about                 the linker's mass, or a strong peptide paired with a barely matched partner, is reported as a                 crosslink. Default 2; 0 turns the check off. MS-cleavable linkers rely on their stub doublets instead.",
                 |ui| ui.add_enabled(!cleavable, egui::DragValue::new(&mut xl.min_linked_peaks).range(0..=20).speed(0.1)));
             row(ui, "Linear search", "Before the crosslink search, also run an ordinary linear peptide search on \
-                the same spectra and database, written to results.sage.tsv next to crosslinks.sage.tsv (with \
-                peptide, protein and protein-group FDR; LFQ / TMT tables, pin file and HTML report follow the \
-                Scoring & output tab). It uses the crosslink search's database settings (e.g. minimum peptide mass \
-                350 Da). Unlinked peptides, mono-links and the seeds of crosslinks all show up here. Roughly \
-                doubles the file reading time.",
-                |ui| ui.checkbox(&mut xl.linear_search, "also run a linear peptide search (results.sage.tsv)"));
+                the same spectra and database, giving the usual bottom-up results next to crosslinks.sage.tsv: \
+                results.sage.tsv (PSMs, with peptide, protein and protein-group FDR), peptides.sage.tsv and \
+                proteins.sage.tsv (peptides at 1% FDR and their protein groups); LFQ / TMT tables, pin file and HTML \
+                report follow the Scoring & output tab. It uses the crosslink search's database settings (e.g. \
+                minimum peptide mass 350 Da). Unlinked peptides, mono-links and the seeds of crosslinks all show \
+                up here. On by default; roughly doubles the file reading time.",
+                |ui| ui.checkbox(&mut xl.linear_search, "also run a linear peptide search (peptide and protein reports)"));
         });
 
         if xl.is_cleavable() {

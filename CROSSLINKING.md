@@ -35,8 +35,8 @@ before. Two strategies are used, chosen by the reagent:
 | `cleavable` | none | MS-cleavable stub masses: `{"short": .., "long": .., "alt": [..]}`; `short + long` must equal the linker mass. An asymmetric linker adds its second arm as `"other": {"short": .., "long": .., "alt": [..]}`; then each arm's short stub + the other arm's long stub must equal the linker mass. Required for custom cleavable reagents; with a cleavable preset it replaces the preset stubs |
 | `backend` | `"cpu"` | non-cleavable search algorithm / hardware: `cpu`, `reflect`, `gpu`, `auto` - see [Choosing a backend](#choosing-a-backend) |
 | `chain_survivors` | `20000` | `reflect`/`gpu` only: peptides kept per spectrum after the per-chain filter (best by chain score) |
-| `min_linked_peaks` | `2` | non-cleavable only: matched fragment ions that carry the linker (contain the link site; loop-links: both sites) required on *each* chain, reported as `linked_a` / `linked_b`. They are the only direct evidence of the link; without them a correct peptide with any modification of about the linker's mass passes as a loop-link, and a strong peptide with a barely matched partner as a crosslink. `0` turns the check off |
-| `linear_search` | `false` | also run an ordinary linear peptide search first, written to `results.sage.tsv` (plus the usual LFQ/TMT tables, `.pin` and HTML report when enabled). It uses the crosslink search's database settings, e.g. `peptide_min_mass` 350 Da |
+| `min_linked_peaks` | `2` | matched fragment ions that carry the linker required on *each* chain, reported as `linked_a` / `linked_b`. Non-cleavable: ions that contain the link site (loop-links: both sites). Cleavable loop-links: stub-carrying ions inside the opened ring. They are the only direct evidence of the link; without them a correct peptide with any modification of about the linker's mass passes as a loop-link, and a strong peptide with a barely matched partner as a crosslink. `0` turns the check off |
+| `linear_search` | `true` | also run an ordinary linear peptide search first, written to `results.sage.tsv`, `peptides.sage.tsv` and `proteins.sage.tsv` (plus the usual LFQ/TMT tables, `.pin` and HTML report when enabled). It uses the crosslink search's database settings, e.g. `peptide_min_mass` 350 Da. `false` skips it |
 | `require_complete_doublets` | `false` | cleavable only: require both stub peaks of *both* peptides (default: both of one, at least one of the other) |
 | `residues` | `"K"` | residues the linker reacts with (e.g. `"KST"`) |
 | `protein_nterm` | `true` | allow linking the protein N-terminal amine |
@@ -50,8 +50,12 @@ Output: `crosslinks.sage.tsv` (+ `results.json`): every candidate match, one per
 spectrum, targets and decoys, with their q-values (decoys are needed to estimate
 the FDR, and for viewers that filter themselves). `crosslinks_FDRfiltered.sage.tsv`
 has the same columns but only the accepted results: target-target matches with
-`spectrum_q` <= 0.01 (the CSM count reported in the log). With `"linear_search": true` there is also
-`results.sage.tsv` from a linear peptide search of the same spectra. Run as normal: `sage config.json`.
+`spectrum_q` <= 0.01 (the CSM count reported in the log). A linear peptide search of the same
+spectra also runs first (`"linear_search"`, on unless set to `false`) and writes the usual bottom-up
+results: `results.sage.tsv` (PSMs), `peptides.sage.tsv` (peptides at 1% FDR) and `proteins.sage.tsv`
+(their protein groups, each with its `protein_group_q`), plus the LFQ/TMT tables and HTML report when
+enabled. Protein groups are not cut at 1%: Sage's picked protein FDR cannot go below 1 / (number of
+protein groups), about 0.08 for a 13-protein complex. Run as normal: `sage config.json`.
 
 ## Required database settings
 
@@ -149,7 +153,28 @@ size rather than quadratically, which is what makes proteome-scale searching pra
 Recommended: `deisotope: true` (assigns charges to the stub-peptide ions; without
 it the search tries every charge up to precursor-1 for each peak) and a
 generous `max_peaks` (defaults to 300 in cleavable mode, since doublets are
-often weak). Loop-links are not searched in cleavable mode.
+often weak). Loop-links are searched too (`loop_links`), see below.
+
+### Loop-links of MS-cleavable linkers
+
+A loop-link joins two residues of one peptide, so cleaving the linker does not
+split the peptide and gives no stub-peptide doublets. It opens the ring
+instead, and that shows in the fragment ions:
+
+* ions that contain **one** linked residue (cleaved inside the former ring) carry
+  one stub of that residue's arm (DSSO: alkene +54.011, sulfenic acid +103.993 or
+  thiol +85.983). A closed ring never gives these ions, which makes them the
+  evidence of an opened loop-link;
+* ions that contain **both** linked residues carry both stubs: one arm's alkene
+  and the other's sulfenic acid (= the linker mass, as when intact) or thiol;
+* ions that contain neither are ordinary linear ions.
+
+Peptides whose mass plus the linker matches the precursor are scored with
+these ions for every pair of reactive residues (both arm orientations for
+cliXlink), and at least `min_linked_peaks` ring ions must match: without them a
+linear peptide with any modification of about the linker's mass would pass.
+Loop-links get their own FDR group (`decoys / targets`), as in non-cleavable
+mode; `linked_a` reports the matched ring ions.
 
 ## Choosing a backend
 
@@ -369,10 +394,24 @@ generates and matches its fragments. Nothing else needs to be installed.
   (the current zoom, or the whole spectrum), labelled as in the viewer
   (internal fragments only with "label all matched peaks"), the peptide map with
   the bridge and stub glyphs, a legend, and optionally a title with the
-  peptides, charge, scan, retention time and ion mobility. Formats: SVG (vector,
-  editable in Illustrator / Inkscape), PNG and TIFF at 300, 600 or 1200 dpi;
-  7 inches wide (two-column width); white or transparent background (PNG and
-  TIFF then carry an alpha channel; opaque figures have none).
+  peptides, charge, scan, retention time and ion mobility. Formats: SVG and PDF
+  (vector, editable in Illustrator / Inkscape), PNG and TIFF at 300, 600 or
+  1200 dpi; 7 inches wide (two-column width); white or transparent background
+  (PNG and TIFF then carry an alpha channel; opaque figures have none).
+* **Mobiligram…** (timsTOF data) opens the whole run as a mobiligram: every
+  precursor Sage searched, by m/z and ion mobility 1/K0. The marker shape gives
+  the charge (1+ plus, 2+ circle, 3+ triangle, 4+ square, 5+ diamond, 6+ and up
+  downward triangle) and the colour the identification at 1% spectrum FDR:
+  crosslinks between proteins (red, #FF523B), within a protein (orange, #FF9D35) and loop-links
+  (pink) drawn on top with a dark outline, linear peptides (blue, 50%
+  transparent) and precursors not identified (grey, can be hidden). One spectrum is one
+  point: a crosslink beats a linear match of the same spectrum. Hover for m/z
+  and 1/K0; click a legend entry to hide that class; with several runs, pick
+  one or show all. **Save…** writes it as SVG or PDF (7 inches wide, white or
+  transparent, optional title) with a legend of the colours (with counts) and
+  the charge shapes. Needs `crosslinks.sage.tsv` from garlic 0.18 or later,
+  which has an `ion_mobility` column. Precursors where Sage found no candidate
+  peptide at all are not in Sage's result tables and so not shown.
 * Spectra are read with Sage's own reader by Sage's spectrum ids, exactly as
   searched: mzML, MGF and, for Bruker `.d`, the precursor's spectrum merged over
   all its frames. The matches' peptidoforms are written as for the Annotator
@@ -485,7 +524,9 @@ every run:
   backend (different candidate generation). Report which backend you used.
 * Cleavable mode needs the stub doublets to be present in the MS2 spectrum
   (i.e. HCD/stepped-HCD data). It is not an MS2-MS3 workflow.
-* Cleavable mode: peptides carrying a *mono-link* or *loop-link* are not searched.
+* Cleavable mode: peptides carrying a *mono-link* are not searched. Loop-links are
+  found through the ring ions of the opened linker (see "Loop-links of
+  MS-cleavable linkers"), so the two linked residues need sequence between them.
 * **Mono-links** (hydrolyzed/amidated dead-ends) are not part of this search;
   search for them as an ordinary variable modification (`K: 156.0786`).
 * Loop-links are found through unshifted ions *outside* the ring, so the linked
