@@ -24,11 +24,15 @@ pub struct Viewer {
     opening: Option<Receiver<Result<Results, String>>>,
     /// Reads spectra in the background: the match picked, then the rows in view
     loader: Option<loader::Loader>,
-    /// Spectra asked for (each once), and those not in their file
+    /// Spectra asked for as rows in view, and as the match picked (each
+    /// once); and those not in their file
     requested: HashSet<SpectrumKey>,
+    picked: HashSet<SpectrumKey>,
     not_found: HashSet<SpectrumKey>,
     /// The spectrum file being read
     reading: Option<String>,
+    /// timsTOF runs of the shown matches opened (in the background), of all
+    runs: (usize, usize),
     show_linear: bool,
     show_crosslinks: bool,
     targets_only: bool,
@@ -66,8 +70,10 @@ impl Default for Viewer {
             opening: None,
             loader: None,
             requested: HashSet::new(),
+            picked: HashSet::new(),
             not_found: HashSet::new(),
             reading: None,
+            runs: (0, 0),
             show_linear: true,
             show_crosslinks: true,
             targets_only: true,
@@ -130,8 +136,10 @@ impl Viewer {
         self.spectra.clear();
         self.loader = None;
         self.requested.clear();
+        self.picked.clear();
         self.not_found.clear();
         self.reading = None;
+        self.runs = (0, 0);
         self.selected = None;
         self.annotation = None;
         self.annotated = None;
@@ -143,6 +151,9 @@ impl Viewer {
         let path = PathBuf::from(folder);
         let _ = std::thread::Builder::new().name("results".into()).spawn(move || {
             let _ = tx.send(Results::load(&path));
+            // Annotator's ontologies load on first use (about a third of a
+            // second): here, rather than when the first match is shown
+            std::sync::LazyLock::force(&mzcore::ontology::STATIC_ONTOLOGIES);
         });
         self.opening = Some(rx);
     }
@@ -164,14 +175,16 @@ impl Viewer {
         self.selected = self.shown.first().copied();
     }
 
-    /// Ask for a spectrum, unless it was asked for already: `now` for the
-    /// match picked, otherwise after it (rows in view)
+    /// Ask for spectra, unless they were asked for already: `now` for the
+    /// match picked, otherwise after it (rows in view). A row in view of a
+    /// run not open yet waits until the run is opened, which picking one of
+    /// its matches does: so a match picked is asked for now even when its
+    /// row was asked for before.
     fn request(&mut self, keys: Vec<SpectrumKey>, now: bool) {
         let Some(loader) = &self.loader else { return };
-        let keys: Vec<SpectrumKey> = keys
-            .into_iter()
-            .filter(|k| !self.spectra.contains_key(k) && self.requested.insert(k.clone()))
-            .collect();
+        let asked = if now { &mut self.picked } else { &mut self.requested };
+        let keys: Vec<SpectrumKey> =
+            keys.into_iter().filter(|k| !self.spectra.contains_key(k) && asked.insert(k.clone())).collect();
         if keys.is_empty() {
             return;
         }
@@ -206,6 +219,7 @@ impl Viewer {
                 loader::Event::NotFound(keys) => self.not_found.extend(keys),
                 loader::Event::Failed(e) => self.message = Some((true, e)),
                 loader::Event::Busy(file) => self.reading = file,
+                loader::Event::Runs { open, total } => self.runs = (open, total),
             }
         }
     }
@@ -334,6 +348,12 @@ impl Viewer {
                 ui.label(RichText::new(format!("{} spectra read", self.spectra.len())).weak()).on_hover_text(
                     "Spectra are read as you pick matches or scroll to them: timsTOF spectra one by one \
                      (as the search read them), mzML / MGF files whole, once.",
+                );
+            }
+            let (open, total) = self.runs;
+            if open < total {
+                ui.label(RichText::new(format!("· opening runs {open} of {total}")).weak()).on_hover_text(
+                    "timsTOF runs are opened in the background (about a second each), so that their spectra                      show at once; a run picked before its turn is opened right away.",
                 );
             }
             ui.separator();
@@ -1565,6 +1585,197 @@ mod test {
         if let Ok(out) = std::env::var("SAGE_GUI_FIGURES") {
             std::fs::create_dir_all(&out).unwrap();
             harness.render().unwrap().save(Path::new(&out).join("viewer_multivalent.png")).unwrap();
+        }
+    }
+
+    /// A row in view of a run not open yet waits for the run to be opened;
+    /// picking that match later must still ask for it now (it was never read
+    /// before: the match stayed on "Reading the spectrum…")
+    #[test]
+    fn a_match_picked_is_asked_for_now_even_when_its_row_was_asked_for() {
+        let (loader, requests) = loader::Loader::fake();
+        let mut viewer = Viewer::default();
+        viewer.loader = Some(loader);
+        let key = ("run_2.d".to_string(), "133000".to_string());
+        viewer.request(vec![key.clone()], false);
+        viewer.request(vec![key.clone()], true);
+        // asked for once each way, however often the frames ask
+        viewer.request(vec![key.clone()], false);
+        viewer.request(vec![key.clone()], true);
+        let sent: Vec<loader::Request> = requests.try_iter().collect();
+        assert!(
+            matches!(&sent[..], [loader::Request::Soon(rows), loader::Request::Now(picked)] if rows == &vec![key.clone()] && picked == &key),
+            "{sent:?}"
+        );
+        // a spectrum already read is not asked for
+        viewer.spectra.insert(("run_1.d".into(), "1".into()), Peaks::default());
+        viewer.request(vec![("run_1.d".into(), "1".into())], true);
+        assert!(requests.try_recv().is_err());
+    }
+
+    /// Pick entries across the whole match list as a user would, and time
+    /// each until its spectrum is annotated and shown: the top 100 rows, 400
+    /// spread over the list, every multivalent species and loop-link, and a
+    /// match of every run (`SAGE_GUI_RESULTS=<folder>`; `SAGE_GUI_WAIT_RUNS`
+    /// waits until every run is open). Fails if any takes more than 5 s.
+    #[test]
+    #[ignore]
+    fn sweep_of_the_match_list() {
+        use egui_kittest::Harness;
+        use std::time::{Duration, Instant};
+        let folder = std::env::var("SAGE_GUI_RESULTS").expect("set SAGE_GUI_RESULTS");
+        let mut viewer = Viewer::default();
+        viewer.open(&folder);
+        viewer.wait_until_open();
+        let results = viewer.results.clone().unwrap();
+        let shown = viewer.shown.clone();
+        let mut picks: Vec<usize> = shown.iter().copied().take(100).collect();
+        let step = (shown.len() / 400).max(1);
+        picks.extend(shown.iter().copied().step_by(step).take(400));
+        picks.extend(shown.iter().copied().filter(|&i| matches!(results.matches[i].kind, Kind::Multi | Kind::Loop)).take(150));
+        let mut runs = HashSet::new();
+        picks.extend(shown.iter().copied().filter(|&i| runs.insert(results.matches[i].file.clone())));
+        let mut seen = HashSet::new();
+        picks.retain(|i| seen.insert(*i));
+
+        let mut installed = false;
+        let mut harness = Harness::builder().with_size(egui::vec2(1500.0, 1200.0)).build_ui_state(
+            move |ui, v: &mut Viewer| {
+                if !installed {
+                    crate::theme::install(ui.ctx(), false);
+                    installed = true;
+                    return;
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| v.ui(ui, ""));
+            },
+            viewer,
+        );
+        harness.run_steps(3);
+        // SAGE_GUI_WAIT_RUNS: pick once every run is open (else right away,
+        // while they are opened in the background)
+        let t = Instant::now();
+        while std::env::var("SAGE_GUI_WAIT_RUNS").is_ok() && t.elapsed().as_secs() < 120 {
+            let (open, total) = harness.state().runs;
+            if total > 0 && open == total {
+                println!("all {total} runs open {:.2?} after the results", t.elapsed());
+                break;
+            }
+            harness.step();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // (seconds, slowest frame, first of its run, kind, title)
+        let mut times: Vec<(f64, f64, bool, Kind, String)> = Vec::new();
+        let mut failed = Vec::new();
+        for &i in &picks {
+            let m = &results.matches[i];
+            let first_of_run = !harness.state().spectra.keys().any(|(f, _)| f == &m.file);
+            harness.state_mut().selected = Some(i);
+            let t = Instant::now();
+            let mut slowest = Duration::ZERO;
+            while harness.state().annotated != Some((i, harness.state().model)) && t.elapsed().as_secs() < 30 {
+                if harness.state().not_found.contains(&m.key()) {
+                    break;
+                }
+                let f = Instant::now();
+                harness.step();
+                slowest = slowest.max(f.elapsed());
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let s = t.elapsed().as_secs_f64();
+            if harness.state().annotated != Some((i, harness.state().model)) || s > 5.0 {
+                failed.push(format!("{} ({} scan {}): {s:.2} s", m.title(), m.file, m.scan));
+            }
+            times.push((s, slowest.as_secs_f64(), first_of_run, m.kind, format!("{} ({} scan {})", m.title(), m.file, m.scan)));
+        }
+        let summary = |name: &str, keep: &dyn Fn(&(f64, f64, bool, Kind, String)) -> bool| {
+            let mut v: Vec<f64> = times.iter().filter(|t| keep(t)).map(|t| t.0 * 1000.0).collect();
+            if v.is_empty() {
+                return;
+            }
+            v.sort_by(f64::total_cmp);
+            let at = |q: f64| v[((v.len() - 1) as f64 * q).round() as usize];
+            println!(
+                "{name:34} {:4} picks: median {:7.1} ms, 95% {:7.1} ms, max {:7.1} ms",
+                v.len(),
+                at(0.5),
+                at(0.95),
+                v[v.len() - 1]
+            );
+        };
+        println!("{} matches shown, {} picked, {} runs", shown.len(), picks.len(), runs.len());
+        summary("first match picked from a run", &|t| t.2);
+        summary("run already open: all", &|t| !t.2);
+        summary("run already open: linear", &|t| !t.2 && t.3 == Kind::Linear);
+        summary("run already open: crosslink", &|t| !t.2 && t.3 == Kind::Crosslink);
+        summary("run already open: loop-link", &|t| !t.2 && t.3 == Kind::Loop);
+        summary("run already open: multivalent", &|t| !t.2 && t.3 == Kind::Multi);
+        let mut slow = times.clone();
+        slow.sort_by(|a, b| b.0.total_cmp(&a.0));
+        println!("slowest picks:");
+        for (s, frame, first, _, title) in slow.iter().take(8) {
+            println!("  {:7.1} ms (slowest frame {:6.1} ms){}  {title}", s * 1000.0, frame * 1000.0, if *first { ", first of its run" } else { "" });
+        }
+        assert!(failed.is_empty(), "not shown within 5 s: {failed:#?}");
+    }
+
+    /// The viewer picking each match whose title starts with one of
+    /// `SAGE_GUI_TITLES` (`;`-separated), as a user would: time until its
+    /// spectrum is read, and the time of each frame after (`SAGE_GUI_RESULTS`)
+    #[test]
+    #[ignore]
+    fn picking_matches_timing() {
+        use egui_kittest::Harness;
+        use std::time::Instant;
+        let folder = std::env::var("SAGE_GUI_RESULTS").expect("set SAGE_GUI_RESULTS");
+        let titles = std::env::var("SAGE_GUI_TITLES").unwrap_or_default();
+        let mut viewer = Viewer::default();
+        viewer.open(&folder);
+        viewer.wait_until_open();
+        let results = viewer.results.clone().unwrap();
+        let mut installed = false;
+        let mut harness = Harness::builder().with_size(egui::vec2(1500.0, 1200.0)).build_ui_state(
+            move |ui, v: &mut Viewer| {
+                if !installed {
+                    crate::theme::install(ui.ctx(), false);
+                    installed = true;
+                    return;
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| v.ui(ui, ""));
+            },
+            viewer,
+        );
+        harness.run_steps(3);
+        for wanted in titles.split(';').filter(|t| !t.is_empty()) {
+            let Some(i) = harness.state().shown.iter().copied().find(|&i| results.matches[i].title().starts_with(wanted)) else {
+                println!("not shown: {wanted}");
+                continue;
+            };
+            let key = results.matches[i].key();
+            harness.state_mut().selected = Some(i);
+            let t = Instant::now();
+            let mut frames = Vec::new();
+            while harness.state().annotated != Some((i, harness.state().model)) && t.elapsed().as_secs() < 120 {
+                let f = Instant::now();
+                harness.step();
+                frames.push(f.elapsed());
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let shown = t.elapsed();
+            let slowest = frames.iter().max().copied().unwrap_or_default();
+            let mut after = Vec::new();
+            for _ in 0..5 {
+                let f = Instant::now();
+                harness.step();
+                after.push(f.elapsed().as_secs_f64() * 1000.0);
+            }
+            println!(
+                "{wanted} ({} scan {}): annotated and shown after {shown:.2?} ({} frames, slowest {slowest:.2?}); \
+                 frames after: {:?} ms",
+                key.0,
+                key.1,
+                frames.len(),
+                after.iter().map(|x| (x * 10.0).round() / 10.0).collect::<Vec<_>>()
+            );
         }
     }
 

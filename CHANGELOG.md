@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.20.1] - 2026-11-04
+
+### Changed
+- `sage-gui`: the Annotated spectra tab opens the timsTOF runs of the shown matches in the background when a results folder is loaded (two at a time, the best match's run first; about a second each, and 30 MB each while open), so the first match picked from a run no longer waits for its run to open. The tab shows "opening runs 5 of 21" meanwhile; a run picked before its turn is opened right away.
+
+### Fixed
+- `sage-gui`: in the Annotated spectra tab, some matches stayed on "Reading the spectrum…" (in v0.20.0, e.g. multivalent species of another timsTOF run than the first one shown). Rows in view are read ahead only from runs already open, and a match whose row had been in view was then never asked for when picked, so its run was not opened. A picked match is now always read first, opening its run (about a second the first time). Annotator's ontologies also load in the background when a results folder is opened, instead of on the first match shown.
+
 ## [v0.20.0] - 2026-11-04
 
 ### Added

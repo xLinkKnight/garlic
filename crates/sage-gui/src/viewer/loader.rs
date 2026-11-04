@@ -1,24 +1,31 @@
 //! Reads the spectra of matches in the background, so the viewer never waits
 //! for a whole run: the match picked first, then the rows in view of runs
 //! already open. Bruker runs are read spectrum by spectrum, by id, exactly as
-//! the search read them (a run is opened, in about a second, when one of its
-//! matches is picked). Files without an index of spectra (mzML, MGF) are read
-//! whole, once, keeping the spectra of every shown match, one after another.
+//! the search read them. Opening a run takes about a second, so the runs of
+//! the shown matches are opened in the background, the best match's run
+//! first, by threads of their own (a run picked before its turn is opened at
+//! once). Files without an index of spectra (mzML, MGF) are read whole, once,
+//! keeping the spectra of every shown match, one after another.
 
 use super::model::{Peaks, Results, SpectrumFile, SpectrumKey};
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+#[derive(Debug)]
 pub enum Request {
     /// The match picked: read before anything else
     Now(SpectrumKey),
     /// Rows in view: read next
     Soon(Vec<SpectrumKey>),
     /// Every shown match (replacing the last list): files read whole keep
-    /// these, and are read in the background
+    /// these, and are read in the background; their timsTOF runs are opened
     Shown(Vec<SpectrumKey>),
+    /// A run opened in the background
+    Opened(String, Result<SpectrumFile, String>),
+    /// The viewer is done with the reader
+    Stop,
 }
 
 pub enum Event {
@@ -29,6 +36,8 @@ pub enum Event {
     Failed(String),
     /// The file being read, or `None` once everything asked for is read
     Busy(Option<String>),
+    /// timsTOF runs of the shown matches open, of all of them
+    Runs { open: usize, total: usize },
 }
 
 pub struct Loader {
@@ -36,18 +45,64 @@ pub struct Loader {
     pub events: Receiver<Event>,
 }
 
+/// Threads opening runs in the background: two at a time take half as long
+/// as one, and leave the rest of the computer free
+const OPENERS: usize = 2;
+
 impl Loader {
     pub fn start(results: Arc<Results>, ctx: egui::Context) -> Loader {
         let (requests, incoming) = channel();
         let (events, received) = channel();
+        let (to_open, queue) = channel::<String>();
+        let queue = Arc::new(Mutex::new(queue));
+        // runs opened, or being opened, by either side
+        let claimed: Arc<Mutex<HashSet<String>>> = Arc::default();
+        for n in 0..OPENERS {
+            let (results, queue, claimed, back) = (results.clone(), queue.clone(), claimed.clone(), requests.clone());
+            let _ = std::thread::Builder::new()
+                .name(format!("open runs {n}"))
+                .spawn(move || open_runs(&results, &queue, &claimed, &back));
+        }
         let _ = std::thread::Builder::new()
             .name("spectra".into())
-            .spawn(move || serve(&results, &incoming, &events, &ctx));
+            .spawn(move || serve(&results, &incoming, &events, &ctx, &to_open, &claimed));
         Loader { requests, events: received }
     }
 
     pub fn send(&self, request: Request) {
         let _ = self.requests.send(request);
+    }
+
+    /// A loader without a reading thread: the test reads its requests
+    #[cfg(test)]
+    pub fn fake() -> (Loader, Receiver<Request>) {
+        let (requests, incoming) = channel();
+        let (_, events) = channel();
+        (Loader { requests, events }, incoming)
+    }
+}
+
+impl Drop for Loader {
+    /// The opener threads hold the request channel open too: stop the reader
+    /// (which lets the openers end) when the viewer lets go
+    fn drop(&mut self) {
+        let _ = self.requests.send(Request::Stop);
+    }
+}
+
+/// An opener thread: opens the runs queued, unless the reader has opened
+/// them meanwhile, and hands them to the reader. Ends with the reader.
+fn open_runs(results: &Results, queue: &Mutex<Receiver<String>>, claimed: &Mutex<HashSet<String>>, back: &Sender<Request>) {
+    loop {
+        let next = queue.lock().map_err(|_| ()).and_then(|q| q.recv().map_err(|_| ()));
+        let Ok(file) = next else { return };
+        if !claimed.lock().is_ok_and(|mut c| c.insert(file.clone())) {
+            continue;
+        }
+        let run = guarded(&file, || results.open_file(&file));
+        if back.send(Request::Opened(file, run)).is_err() {
+            return;
+        }
     }
 }
 
@@ -76,22 +131,36 @@ fn guarded<T>(file: &str, read: impl FnOnce() -> Result<T, String>) -> Result<T,
 }
 
 /// The reading thread: ends when the viewer drops its [`Loader`]
-fn serve(results: &Results, incoming: &Receiver<Request>, events: &Sender<Event>, ctx: &egui::Context) {
+fn serve(
+    results: &Results,
+    incoming: &Receiver<Request>,
+    events: &Sender<Event>,
+    ctx: &egui::Context,
+    to_open: &Sender<String>,
+    claimed: &Mutex<HashSet<String>>,
+) {
     let mut files: HashMap<String, Result<SpectrumFile, String>> = HashMap::new();
     let mut done: Ids = HashMap::new();
     let mut now: Vec<SpectrumKey> = Vec::new();
     let mut soon: Vec<SpectrumKey> = Vec::new();
     // files read whole: the ids of their shown matches
     let mut shown: Ids = HashMap::new();
+    // timsTOF runs queued for opening in the background
+    let mut queued: HashSet<String> = HashSet::new();
     let mut busy = false;
     let send = |event: Event| {
         let sent = events.send(event).is_ok();
         ctx.request_repaint();
         sent
     };
+    let runs = |files: &HashMap<String, Result<SpectrumFile, String>>, queued: &HashSet<String>| Event::Runs {
+        open: queued.iter().filter(|f| files.contains_key(*f)).count(),
+        total: queued.len(),
+    };
     // Rows in view are read only from files already open: opening a timsTOF
     // run takes about a second, which a match picked meanwhile would wait
-    // for. A file is opened when one of its matches is picked.
+    // for. Runs are opened in the background, or when one of their matches
+    // is picked.
     let first_open = |soon: &[SpectrumKey], files: &HashMap<String, Result<SpectrumFile, String>>| {
         soon.iter().find(|(f, _)| matches!(files.get(f), Some(Ok(_)))).map(|(f, _)| f.clone())
     };
@@ -119,12 +188,27 @@ fn serve(results: &Results, incoming: &Receiver<Request>, events: &Sender<Event>
                 Request::Soon(keys) => soon.extend(keys),
                 Request::Shown(keys) => {
                     shown.clear();
+                    let before = queued.len();
                     for (file, id) in keys {
                         if results.read_whole(&file) {
                             shown.entry(file).or_default().insert(id);
+                        } else if !files.contains_key(&file) && queued.insert(file.clone()) {
+                            // the shown matches' runs, the best match's first
+                            let _ = to_open.send(file);
                         }
                     }
+                    if queued.len() != before && !send(runs(&files, &queued)) {
+                        return;
+                    }
                 }
+                Request::Opened(file, run) => {
+                    // (unless a match of it was picked and the run opened meanwhile)
+                    files.entry(file).or_insert(run);
+                    if !send(runs(&files, &queued)) {
+                        return;
+                    }
+                }
+                Request::Stop => return,
             }
         }
 
@@ -163,7 +247,14 @@ fn serve(results: &Results, incoming: &Receiver<Request>, events: &Sender<Event>
             if !send(Event::Busy(Some(file.clone()))) {
                 return;
             }
-            let source = files.entry(file.clone()).or_insert_with(|| guarded(&file, || results.open_file(&file)));
+            let opening = !files.contains_key(&file);
+            let source = files.entry(file.clone()).or_insert_with(|| {
+                // the openers skip a run opened here
+                if let Ok(mut c) = claimed.lock() {
+                    c.insert(file.clone());
+                }
+                guarded(&file, || results.open_file(&file))
+            });
             let read = match source {
                 Ok(source) => guarded(&file, || source.read(&ids).map_err(|e| format!("{file}: {e}"))),
                 Err(e) => Err(e.clone()),
@@ -179,7 +270,7 @@ fn serve(results: &Results, incoming: &Receiver<Request>, events: &Sender<Event>
                 Err(e) => send(Event::Failed(e)),
             };
             done.entry(file).or_default().extend(ids);
-            if !sent {
+            if !sent || (opening && !queued.is_empty() && !send(runs(&files, &queued))) {
                 return;
             }
         }

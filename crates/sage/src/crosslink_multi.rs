@@ -753,6 +753,126 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
 mod test {
     use super::*;
 
+    /// Every species shape the search can report, for up to 2, 3 and 4
+    /// linkers, with the `topology` names it prints for each:
+    /// `cargo test -p sage-core topology_catalogue -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn topology_catalogue() {
+        use std::collections::{BTreeMap, BTreeSet};
+        // the peptides of a species as the search picks them: p - 1 seeds as a
+        // multiset (equal ones next to each other), then one peptide by mass,
+        // a copy of a seed or not. Peptides as "colours", equal = copies.
+        fn colourings(p: usize) -> Vec<Vec<u32>> {
+            let mut out = Vec::new();
+            // compositions of p - 1 into blocks of copies
+            fn blocks(left: usize, colour: u32, current: &mut Vec<u32>, out: &mut Vec<Vec<u32>>) {
+                if left == 0 {
+                    out.push(current.clone());
+                    return;
+                }
+                for size in 1..=left {
+                    current.extend(std::iter::repeat_n(colour, size));
+                    blocks(left - size, colour + 1, current, out);
+                    current.truncate(current.len() - size);
+                }
+            }
+            let mut seeds = Vec::new();
+            blocks(p - 1, 0, &mut Vec::new(), &mut seeds);
+            for s in seeds {
+                let colours = s.iter().max().map_or(0, |m| m + 1);
+                for last in 0..=colours {
+                    let mut c = s.clone();
+                    c.push(last);
+                    out.push(c);
+                }
+            }
+            out
+        }
+        // the same species whatever the order of its peptides and whatever
+        // they are called: the smallest relabelling
+        fn canonical(colours: &[u32], edges: &[(u8, u8)]) -> (Vec<u32>, Vec<(u8, u8)>) {
+            let p = colours.len();
+            let mut best: Option<(Vec<u32>, Vec<(u8, u8)>)> = None;
+            let mut order: Vec<usize> = (0..p).collect();
+            fn permute(k: usize, order: &mut Vec<usize>, visit: &mut dyn FnMut(&[usize])) {
+                if k == order.len() {
+                    visit(order);
+                    return;
+                }
+                for i in k..order.len() {
+                    order.swap(k, i);
+                    permute(k + 1, order, visit);
+                    order.swap(k, i);
+                }
+            }
+            permute(0, &mut order, &mut |order: &[usize]| {
+                // new position of each old one; colours renamed by first appearance
+                let mut at = vec![0u8; p];
+                for (new, &old) in order.iter().enumerate() {
+                    at[old] = new as u8;
+                }
+                let mut names: Vec<u32> = Vec::new();
+                let c: Vec<u32> = order
+                    .iter()
+                    .map(|&old| {
+                        let x = colours[old];
+                        names.iter().position(|&n| n == x).unwrap_or_else(|| {
+                            names.push(x);
+                            names.len() - 1
+                        }) as u32
+                    })
+                    .collect();
+                let mut e: Vec<(u8, u8)> =
+                    edges.iter().map(|&(a, b)| (at[a as usize].min(at[b as usize]), at[a as usize].max(at[b as usize]))).collect();
+                e.sort();
+                let key = (c, e);
+                if best.as_ref().is_none_or(|b| key < *b) {
+                    best = Some(key);
+                }
+            });
+            best.unwrap()
+        }
+
+        // shape -> (linkers, peptides, distinct peptides, names printed)
+        let mut shapes: BTreeMap<(Vec<u32>, Vec<(u8, u8)>), (usize, usize, usize, BTreeSet<String>)> = BTreeMap::new();
+        for k in 2..=4usize {
+            for p in 2..=k + 1 {
+                for edges in arrangements(p, k) {
+                    for colours in colourings(p) {
+                        let species = Species {
+                            peptides: colours.iter().map(|&c| PeptideIx(c)).collect(),
+                            links: edges.iter().map(|&(a, b)| (a, 0, b, 0)).collect(),
+                            ..Default::default()
+                        };
+                        let distinct = colours.iter().collect::<BTreeSet<_>>().len();
+                        shapes
+                            .entry(canonical(&colours, &edges))
+                            .or_insert((k, p, distinct, BTreeSet::new()))
+                            .3
+                            .insert(species.topology());
+                    }
+                }
+            }
+        }
+        for valency in 2..=4 {
+            let n = shapes.values().filter(|s| s.0 <= valency).count();
+            let names: BTreeSet<&String> = shapes.values().filter(|s| s.0 <= valency).flat_map(|s| &s.3).collect();
+            println!("up to {valency} linkers: {n} species shapes, {} names", names.len());
+        }
+        for k in 2..=4 {
+            for p in 2..=k + 1 {
+                let here: Vec<_> = shapes.values().filter(|s| s.0 == k && s.1 == p).collect();
+                let all_different = here.iter().filter(|s| s.2 == p).count();
+                println!("\n{k} linkers, {p} peptides: {} shapes ({all_different} with all peptides different)", here.len());
+                for (_, _, distinct, names) in &here {
+                    let names: Vec<&String> = names.iter().collect();
+                    println!("  {:>2} distinct  {}", distinct, names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("  =  "));
+                }
+            }
+        }
+    }
+
     #[test]
     fn arrangements_are_connected_multigraphs() {
         // two peptides, two links: only a2b

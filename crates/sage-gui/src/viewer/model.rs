@@ -352,6 +352,15 @@ pub enum SpectrumFile {
     Whole(Url, BrukerProcessingConfig),
 }
 
+impl std::fmt::Debug for SpectrumFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpectrumFile::Bruker(_) => f.write_str("timsTOF run"),
+            SpectrumFile::Whole(url, _) => write!(f, "{url}"),
+        }
+    }
+}
+
 impl SpectrumFile {
     /// The spectra with these ids (Sage's spectrum ids), as `(id, peaks)`
     pub fn read(&self, ids: &HashSet<String>) -> Result<Vec<(String, Peaks)>, String> {
@@ -1704,6 +1713,102 @@ pub(crate) mod test {
 #[cfg(test)]
 mod real_data {
     use super::*;
+
+    /// Where the time of annotating goes, for the matches whose title starts
+    /// with one of `SAGE_GUI_TITLES` (`;`-separated): `SAGE_GUI_RESULTS=<folder>`
+    #[test]
+    #[ignore]
+    fn annotation_timing() {
+        use std::time::Instant;
+        let folder = std::env::var("SAGE_GUI_RESULTS").expect("set SAGE_GUI_RESULTS");
+        let titles = std::env::var("SAGE_GUI_TITLES").unwrap_or_default();
+        let results = Results::load(Path::new(&folder)).unwrap();
+        for wanted in titles.split(';').filter(|t| !t.is_empty()) {
+            let Some(m) = results.matches.iter().find(|m| m.target && m.title().starts_with(wanted)) else {
+                println!("not found: {wanted}");
+                continue;
+            };
+            let ids: HashSet<String> = [m.scan.clone()].into();
+            let t = Instant::now();
+            let source = results.open_file(&m.file).unwrap();
+            let opened = t.elapsed();
+            let t = Instant::now();
+            let peaks = source.read(&ids).unwrap().remove(0).1;
+            let read = t.elapsed();
+            let proforma = results.proforma(m);
+            let link = results.link(m);
+            let t = Instant::now();
+            let ions = PeptidoformIonSet::pro_forma(&proforma, &mzcore::ontology::STATIC_ONTOLOGIES).unwrap().0;
+            let parsed = t.elapsed();
+            let t = Instant::now();
+            let fragments = ions.generate_theoretical_fragments::<OutputMolecularFormula>(
+                Charge::new::<mzcore::system::e>(m.charge as isize),
+                Model::CidHcd.model(),
+            );
+            let generated = t.elapsed();
+            let t = Instant::now();
+            let a = annotate(&peaks, &proforma, m.charge, Model::CidHcd, results.fragment_tol, link.as_ref()).unwrap();
+            let whole = t.elapsed();
+            let t = Instant::now();
+            let mut views: Vec<PeakView> =
+                peaks.mz.iter().zip(&peaks.intensity).map(|(&mz, &intensity)| PeakView { mz, intensity, labels: Vec::new() }).collect();
+            let stubs = match &link {
+                Some(l) if l.kind == Kind::Multi && !l.stubs.is_empty() => {
+                    find_multi_stub_ions(&mut views, l, m.charge, Model::CidHcd, results.fragment_tol).len()
+                }
+                Some(l) if !l.stubs.is_empty() => find_stub_ions(&mut views, l, m.charge, Model::CidHcd, results.fragment_tol).len(),
+                _ => 0,
+            };
+            let stub_time = t.elapsed();
+            println!(
+                "{} ({}+, {} peaks)\n  open run {opened:.2?}, read {read:.2?}, parse {parsed:.2?}, fragments {} in {generated:.2?}, \
+                 whole annotate {whole:.2?}, stub ions {stubs} in {stub_time:.2?}, {} of {} peaks annotated",
+                m.title(),
+                m.charge,
+                peaks.mz.len(),
+                fragments.len(),
+                a.explained_peaks,
+                a.peaks.len()
+            );
+        }
+    }
+
+    /// Memory and time of keeping every run open (`SAGE_GUI_RESULTS`)
+    #[test]
+    #[ignore]
+    fn every_run_open() {
+        let folder = std::env::var("SAGE_GUI_RESULTS").expect("set SAGE_GUI_RESULTS");
+        let results = Results::load(Path::new(&folder)).unwrap();
+        let memory = || {
+            let out = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {}", std::process::id()), "/FO", "CSV", "/NH"])
+                .output()
+                .unwrap();
+            // the last CSV field, `"1,234,567 K"`
+            let text = String::from_utf8_lossy(&out.stdout).trim().trim_end_matches('"').to_string();
+            text.rsplit("\",\"").next().unwrap_or("").to_string()
+        };
+        let mut files: Vec<&String> = results.files.keys().collect();
+        files.sort();
+        println!("before: {}", memory());
+        let t = std::time::Instant::now();
+        let mut open = Vec::new();
+        for f in &files {
+            let t1 = std::time::Instant::now();
+            open.push(results.open_file(f).unwrap());
+            println!("{f}: {:.2?}, process {}", t1.elapsed(), memory());
+        }
+        println!("{} runs open in {:.2?}: {}", open.len(), t.elapsed(), memory());
+        drop(open);
+        // two at a time
+        let t = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for half in files.chunks(files.len().div_ceil(2)) {
+                s.spawn(|| half.iter().for_each(|f| drop(results.open_file(f).unwrap())));
+            }
+        });
+        println!("opened again, two at a time: {:.2?}", t.elapsed());
+    }
 
     /// Bruker spectra read by id are the ones the whole-run read gives, peak
     /// for peak: `SAGE_GUI_RESULTS=<folder>` (a search of timsTOF data)

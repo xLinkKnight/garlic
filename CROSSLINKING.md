@@ -539,8 +539,11 @@ generates and matches its fragments. Nothing else needs to be installed.
 * Spectra are read in the background as they are needed: the match picked
   first, then the rows in view of runs already open. Bruker `.d` spectra are
   read one by one by their id, the same way the whole-run read gets each of
-  them (identical peaks), so a spectrum shows within milliseconds; the first
-  one picked from a run waits about a second while the run is opened. mzML and MGF files have no
+  them (identical peaks), so a spectrum shows within milliseconds. Opening a
+  run takes about a second, so the runs of the shown matches are opened in
+  the background when a results folder is loaded, two at a time, the best
+  match's run first ("opening runs 5 of 21"); a run picked before its turn is
+  opened right away. Each open run holds about 30 MB. mzML and MGF files have no
   index by spectrum id: each is read whole once, keeping the spectra of every
   match shown, the picked match's file first. The results folder itself is
   read in the background too.
