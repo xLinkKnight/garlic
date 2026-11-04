@@ -467,6 +467,11 @@ generates and matches its fragments. Nothing else needs to be installed.
   A crosslinked pair is drawn as two rows with the linked residues aligned and
   joined by a **bridge** labelled with the linker; a loop-link as a bracket
   under its peptide.
+  Left of each crosslinked peptide: `peptide 1 · RPO21` (the gene, else the
+  UniProt entry name), the protein's name, and the link residues' positions in
+  the protein (`K1246`), read from the search's FASTA. A peptide in more
+  proteins shows `+ n`; hover for every protein and position. Decoys show
+  their target's positions.
 * MS-cleavable linkers: ions carrying a **stub** are found for each peptide
   (the peptide alone with the stub on its linked residue, fragmented by
   Annotator's engine) and shown in the stub's colour (DSSO: A alkene teal, T

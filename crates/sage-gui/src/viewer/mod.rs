@@ -46,6 +46,8 @@ pub struct Viewer {
     label_all: bool,
     export: ExportSettings,
     annotation: Option<Result<Annotation, String>>,
+    /// Its peptides' proteins and link positions, for the peptide map
+    labels: Vec<model::PeptideLabel>,
     annotated: Option<(usize, Model)>,
     mobiligram: MobiligramView,
     /// Width of the match list; the divider next to it is dragged to change it
@@ -86,6 +88,7 @@ impl Default for Viewer {
             label_all: false,
             export: ExportSettings::default(),
             annotation: None,
+            labels: Vec::new(),
             annotated: None,
             mobiligram: MobiligramView::default(),
             list_width: LIST_WIDTH,
@@ -546,6 +549,7 @@ impl Viewer {
         if self.annotated != Some((i, self.model)) {
             let proforma = results.proforma(m);
             self.annotation = Some(annotate(peaks, &proforma, m.charge, self.model, results.fragment_tol, results.link(m).as_ref()));
+            self.labels = results.peptide_labels(m);
             self.annotated = Some((i, self.model));
         }
         let Some(annotation) = &self.annotation else { return };
@@ -578,7 +582,10 @@ impl Viewer {
             );
         });
         let range = spectrum_plot(ui, a, self.label_all);
-        coverage_view(ui, a);
+        // wide maps (long peptides, protein labels) scroll rather than clip
+        egui::ScrollArea::horizontal()
+            .id_salt("viewer_map")
+            .show(ui, |ui| coverage_view(ui, a, &self.labels));
         legend(ui, a);
 
         // Figure export
@@ -991,8 +998,95 @@ fn spectrum_plot(ui: &mut Ui, a: &Annotation, label_all: bool) -> Option<(f64, f
 const CELL: egui::Vec2 = egui::vec2(18.0, 30.0);
 /// Room above and below a peptide row for nested stub hooks
 const PAD: f32 = 12.0;
-/// Width of the "peptide 1" column
+/// Width of the "peptide 1" column, and of one that names proteins
 const LABEL_W: f32 = 76.0;
+const PROTEIN_LABEL_W: f32 = 236.0;
+
+fn label_width(labels: &[model::PeptideLabel]) -> f32 {
+    if labels.iter().any(|l| !l.protein.is_empty()) {
+        PROTEIN_LABEL_W
+    } else {
+        LABEL_W
+    }
+}
+
+/// `text` on one line at most `width` wide: when longer, shortened in the
+/// middle, so both ends stay (`DNA-directed RNA … subunit RPB2`)
+fn one_line(painter: &egui::Painter, text: &str, font: egui::FontId, color: Color32, width: f32) -> Arc<egui::Galley> {
+    let layout = |t: String| painter.layout_no_wrap(t, font.clone(), color);
+    let whole = layout(text.to_string());
+    if whole.size().x <= width {
+        return whole;
+    }
+    // whole words, the end first (it says which subunit, which isoform)
+    let words: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
+    let join = |h: usize, t: usize| format!("{} … {}", words[..h].join(" "), words[words.len() - t..].join(" "));
+    if words.len() >= 3 && layout(join(1, 1)).size().x <= width {
+        let (mut h, mut t) = (1, 1);
+        loop {
+            let mut grew = false;
+            if h + t + 1 < words.len() && layout(join(h, t + 1)).size().x <= width {
+                t += 1;
+                grew = true;
+            }
+            if h + t + 1 < words.len() && layout(join(h + 1, t)).size().x <= width {
+                h += 1;
+                grew = true;
+            }
+            if !grew {
+                return layout(join(h, t));
+            }
+        }
+    }
+    // else by characters
+    let chars: Vec<char> = text.chars().collect();
+    let shortened = |keep: usize| -> String {
+        let head = keep.div_ceil(2);
+        let tail = keep - head;
+        let mut t: String = chars[..head].iter().collect::<String>().trim_end().to_string();
+        t.push_str(" … ");
+        t.extend(chars[chars.len() - tail..].iter().collect::<String>().trim_start().chars());
+        t
+    };
+    // the most characters that fit (galleys are cached, so this is cheap)
+    let (mut lo, mut hi) = (0, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if layout(shortened(mid)).size().x <= width {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    layout(shortened(lo))
+}
+
+/// The label left of a peptide row, centred on `y`: `peptide 1 · RPO21`
+/// (the gene), the protein's name, and the link residues' positions in the
+/// protein (`K1246`). Hover: every protein the peptide is in, its residues
+/// and links there. Just the title when the proteins are not known.
+fn peptide_label(ui: &mut Ui, painter: &egui::Painter, left: f32, y: f32, width: f32, title: &str, label: Option<&model::PeptideLabel>) {
+    let text_color = ui.visuals().text_color();
+    let Some(l) = label.filter(|l| !l.protein.is_empty()) else {
+        painter.text(egui::pos2(left, y), egui::Align2::LEFT_CENTER, title, egui::FontId::proportional(14.0), text_color);
+        return;
+    };
+    let w = width - 12.0;
+    let lines = [
+        (format!("{title} · {}", l.protein), egui::FontId::proportional(14.0), text_color, -16.0),
+        (l.name.clone(), egui::FontId::proportional(12.0), ui.visuals().weak_text_color(), 0.0),
+        (l.sites.clone(), egui::FontId::proportional(12.5), crate::theme::accent(ui), 15.0),
+    ];
+    for (text, font, color, dy) in lines {
+        if text.is_empty() {
+            continue;
+        }
+        let galley = one_line(painter, &text, font, color, w);
+        painter.galley(egui::pos2(left, y + dy - galley.size().y / 2.0), galley, color);
+    }
+    let area = egui::Rect::from_min_max(egui::pos2(left, y - 25.0), egui::pos2(left + w, y + 24.0));
+    ui.interact(area, ui.id().with(("peptide_label", title)), egui::Sense::hover()).on_hover_text(&l.detail);
+}
 
 /// A hook at a residue corner: N-terminal ions over its right (ending after
 /// it), C-terminal ions under its left (starting at it). `level` 0 is a plain
@@ -1112,12 +1206,12 @@ fn stub_summary(a: &Annotation, link: &model::Link) -> String {
 /// ion ending there, one under the left for a C-terminal (x/y/z) ion starting
 /// there. Crosslinked pairs are joined by a bridge between their linked
 /// residues; loop-links by a bracket.
-fn coverage_view(ui: &mut Ui, a: &Annotation) {
+fn coverage_view(ui: &mut Ui, a: &Annotation, labels: &[model::PeptideLabel]) {
     match &a.link {
-        Some(link) if link.kind == Kind::Crosslink && a.coverage.len() == 2 => crosslink_map(ui, a, link),
-        Some(link) if link.kind == Kind::Loop && a.coverage.len() == 1 => loop_map(ui, a, link),
+        Some(link) if link.kind == Kind::Crosslink && a.coverage.len() == 2 => crosslink_map(ui, a, link, labels),
+        Some(link) if link.kind == Kind::Loop && a.coverage.len() == 1 => loop_map(ui, a, link, labels),
         Some(link) if link.kind == Kind::Multi && a.coverage.len() >= 2 && !link.links.is_empty() => {
-            species_map(ui, a, link)
+            species_map(ui, a, link, labels)
         }
         _ => {
             for k in 0..a.coverage.len() {
@@ -1137,7 +1231,7 @@ fn coverage_view(ui: &mut Ui, a: &Annotation) {
 /// bridge, a triangle per stub found on the whole peptide (the doublet
 /// peaks), pointing to the peptide that carries it; around the residues,
 /// stub-carrying fragment ions as nested hooks in the stub's colour.
-fn crosslink_map(ui: &mut Ui, a: &Annotation, link: &model::Link) {
+fn crosslink_map(ui: &mut Ui, a: &Annotation, link: &model::Link, labels: &[model::PeptideLabel]) {
     let (s0, s1) = (link.sites[0].1, link.sites[1].1);
     let shift = s0.max(s1);
     let (o0, o1) = ((shift - s0) as f32, (shift - s1) as f32);
@@ -1145,24 +1239,19 @@ fn crosslink_map(ui: &mut Ui, a: &Annotation, link: &model::Link) {
     let cells = (o0 + n0).max(o1 + n1);
     let row_h = CELL.y + 2.0 * PAD;
     let bridge_h = 54.0;
-    let size = egui::vec2(LABEL_W + CELL.x * cells + 330.0, 2.0 * row_h + bridge_h);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let label_w = label_width(labels);
+    let size = egui::vec2(label_w + CELL.x * cells + 330.0, 2.0 * row_h + bridge_h);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect.expand(4.0));
     let text_color = ui.visuals().text_color();
     let weak = ui.visuals().weak_text_color();
     let small = egui::FontId::proportional(12.0);
 
-    let x0 = rect.left() + LABEL_W;
+    let x0 = rect.left() + label_w;
     let top0 = rect.top() + PAD;
     let top1 = rect.top() + row_h + bridge_h + PAD;
     for (k, top, offset) in [(0, top0, o0), (1, top1, o1)] {
-        painter.text(
-            egui::pos2(rect.left(), top + CELL.y / 2.0),
-            egui::Align2::LEFT_CENTER,
-            format!("peptide {}", k + 1),
-            egui::FontId::proportional(14.0),
-            text_color,
-        );
+        peptide_label(ui, &painter, rect.left(), top + CELL.y / 2.0, label_w, &format!("peptide {}", k + 1), labels.get(k));
         let origin = egui::pos2(x0 + CELL.x * offset, top);
         draw_peptide(&painter, origin, a, k, &[link.sites[k].1], text_color);
         let end = x0 + CELL.x * cells + 14.0;
@@ -1200,7 +1289,8 @@ fn crosslink_map(ui: &mut Ui, a: &Annotation, link: &model::Link) {
         }
     }
     if !link.stubs.is_empty() {
-        response.on_hover_text(stub_summary(a, link));
+        ui.interact(rect.with_min_x(x0 - 6.0), ui.id().with("stub_summary"), egui::Sense::hover())
+            .on_hover_text(stub_summary(a, link));
     }
 }
 
@@ -1253,13 +1343,14 @@ const LANE: f32 = 12.0;
 /// that linker broke (pointing at the side carrying it), after a peptide
 /// with two or more links its peptide + stubs peaks, and around the residues
 /// the stub-carrying fragment ions as nested hooks.
-fn species_map(ui: &mut Ui, a: &Annotation, link: &model::Link) {
+fn species_map(ui: &mut Ui, a: &Annotation, link: &model::Link, labels: &[model::PeptideLabel]) {
     let lengths: Vec<usize> = a.coverage.iter().map(|c| c.residues.len()).collect();
     let l = species::layout(&lengths, &link.links);
     let rows = l.rows.len() as f32;
     let row_h = CELL.y + 2.0 * PAD;
     let lanes_w = if l.lanes > 0 { 14.0 + LANE * l.lanes as f32 } else { 0.0 };
-    let size = egui::vec2(LABEL_W + CELL.x * l.cells as f32 + lanes_w + 380.0, rows * row_h + (rows - 1.0) * GAP);
+    let label_w = label_width(labels);
+    let size = egui::vec2(label_w + CELL.x * l.cells as f32 + lanes_w + 380.0, rows * row_h + (rows - 1.0) * GAP);
     ui.label(
         RichText::new(format!(
             "{} {} linkers: XL1–XL{} as #XL1… in the ProForma above",
@@ -1270,26 +1361,20 @@ fn species_map(ui: &mut Ui, a: &Annotation, link: &model::Link) {
         .weak()
         .small(),
     );
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect.expand(4.0));
     let text_color = ui.visuals().text_color();
     let weak = ui.visuals().weak_text_color();
     let small = egui::FontId::proportional(12.0);
 
-    let x0 = rect.left() + LABEL_W;
+    let x0 = rect.left() + label_w;
     let top = |row: usize| rect.top() + PAD + row as f32 * (row_h + GAP);
     let x_of = |row: usize, residue: usize| x0 + CELL.x * (l.column(row, residue) as f32 + 0.5);
     let cells_end = x0 + CELL.x * l.cells as f32;
     let text_x = cells_end + lanes_w + 14.0;
     for (row, &k) in l.rows.iter().enumerate() {
         let y = top(row);
-        painter.text(
-            egui::pos2(rect.left(), y + CELL.y / 2.0),
-            egui::Align2::LEFT_CENTER,
-            format!("peptide {}", k + 1),
-            egui::FontId::proportional(14.0),
-            text_color,
-        );
+        peptide_label(ui, &painter, rect.left(), y + CELL.y / 2.0, label_w, &format!("peptide {}", k + 1), labels.get(k));
         let origin = egui::pos2(x0 + CELL.x * l.offsets[row] as f32, y);
         draw_peptide(&painter, origin, a, k, &link.ends_of(k), text_color);
         // a peptide with two or more links, freed whole with its stubs
@@ -1351,22 +1436,24 @@ fn species_map(ui: &mut Ui, a: &Annotation, link: &model::Link) {
         }
     }
     if !link.stubs.is_empty() {
-        response.on_hover_text(stub_summary(a, link));
+        ui.interact(rect.with_min_x(x0 - 6.0), ui.id().with("stub_summary"), egui::Sense::hover())
+            .on_hover_text(stub_summary(a, link));
     }
 }
 
 /// One peptide with a bracket under it joining its two linked residues
-fn loop_map(ui: &mut Ui, a: &Annotation, link: &model::Link) {
+fn loop_map(ui: &mut Ui, a: &Annotation, link: &model::Link, labels: &[model::PeptideLabel]) {
     let (i0, i1) = (link.sites[0].1.min(link.sites[1].1), link.sites[0].1.max(link.sites[1].1));
     let n = a.coverage[0].residues.len() as f32;
     let row_h = CELL.y + 2.0 * PAD;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(LABEL_W + CELL.x * n + 330.0, row_h + 24.0), egui::Sense::hover());
+    let label_w = label_width(labels);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(label_w + CELL.x * n + 330.0, row_h + 24.0), egui::Sense::hover());
     let painter = ui.painter_at(rect.expand(4.0));
     let text_color = ui.visuals().text_color();
     let weak = ui.visuals().weak_text_color();
-    let x0 = rect.left() + LABEL_W;
+    let x0 = rect.left() + label_w;
     let top = rect.top() + PAD;
-    painter.text(egui::pos2(rect.left(), top + CELL.y / 2.0), egui::Align2::LEFT_CENTER, "loop-link", egui::FontId::proportional(14.0), text_color);
+    peptide_label(ui, &painter, rect.left(), top + CELL.y / 2.0, label_w, "loop-link", labels.first());
     draw_peptide(&painter, egui::pos2(x0, top), a, 0, &[i0, i1], text_color);
     let (xa, xb) = (x0 + CELL.x * (i0 as f32 + 0.5), x0 + CELL.x * (i1 as f32 + 0.5));
     let (y0, y1) = (top + CELL.y + 4.0, top + CELL.y + PAD + 8.0);
@@ -1455,7 +1542,7 @@ mod test {
         let (_, a) = model::test::cleaved_dsso();
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| coverage_view(ui, &a));
+            egui::CentralPanel::default().show(ctx, |ui| coverage_view(ui, &a, &[]));
         });
         let (mut triangles, mut segments, mut texts) = (Vec::new(), Vec::new(), Vec::new());
         for clipped in &output.shapes {
@@ -1481,6 +1568,70 @@ mod test {
         assert!(segments.len() >= 7, "bridge and hooks");
     }
 
+    /// A protein name too long for the label keeps both ends
+    #[test]
+    fn long_names_are_shortened_in_the_middle() {
+        let ctx = egui::Context::default();
+        let mut shown = (String::new(), 0.0f32);
+        let mut short = String::new();
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let font = egui::FontId::proportional(12.0);
+                    let g = one_line(ui.painter(), "DNA-directed RNA polymerases I, II, and III subunit RPABC1", font.clone(), Color32::GRAY, 200.0);
+                    shown = (g.text().to_string(), g.size().x);
+                    short = one_line(ui.painter(), "Test protein", font, Color32::GRAY, 200.0).text().to_string();
+                });
+            });
+        }
+        let (text, width) = shown;
+        assert!(width <= 200.0, "{width}");
+        assert!(text.starts_with("DNA-directed") && text.ends_with("subunit RPABC1") && text.contains(" … "), "{text}");
+        // cut between words
+        assert!(text.split(" … ").all(|part| "DNA-directed RNA polymerases I, II, and III subunit RPABC1".contains(part)), "{text}");
+        assert_eq!(short, "Test protein");
+    }
+
+    /// The labels left of the peptides: `peptide 1 · gene`, the protein's
+    /// name and the link residues' positions in the protein
+    #[test]
+    fn maps_label_peptides_with_their_proteins() {
+        let label = |gene: &str, sites: &str| model::PeptideLabel {
+            protein: gene.into(),
+            name: "DNA-directed RNA polymerase II subunit RPB1".into(),
+            sites: sites.into(),
+            detail: "sp|P04050|RPB1_YEAST: …".into(),
+        };
+        let texts = |a: &Annotation, labels: &[model::PeptideLabel]| {
+            let ctx = egui::Context::default();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| coverage_view(ui, a, labels));
+            });
+            output
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let (_, pair) = model::test::cleaved_dsso();
+        let shown = texts(&pair, &[label("RPO21", "K1246"), label("RPB2", "K1102")]);
+        for t in ["peptide 1 · RPO21", "peptide 2 · RPB2", "K1246", "K1102"] {
+            assert!(shown.iter().any(|s| s == t), "{t} in {shown:?}");
+        }
+        // the name, shortened in the middle if it does not fit
+        assert!(shown.iter().any(|s| s.starts_with("DNA-directed") && s.ends_with("subunit RPB1")), "{shown:?}");
+        let (_, multi) = model::test::cleaved_multi();
+        let shown = texts(&multi, &[label("RPO21", "K9"), label("RPB2", "T3, K12"), label("RPO21", "K25")]);
+        for t in ["peptide 3 · RPO21", "T3, K12", "K25"] {
+            assert!(shown.iter().any(|s| s == t), "{t} in {shown:?}");
+        }
+        // proteins not known: the plain title
+        assert!(texts(&pair, &[]).iter().any(|s| s == "peptide 1"));
+    }
+
     /// The map of a cleaved DSSO `a1b1c` species: both links drawn and
     /// labelled, the stubs where each linker broke, the triplet peaks of the
     /// middle peptide and its stub-carrying y ions as hooks
@@ -1489,7 +1640,7 @@ mod test {
         let (_, a) = model::test::cleaved_multi();
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| coverage_view(ui, &a));
+            egui::CentralPanel::default().show(ctx, |ui| coverage_view(ui, &a, &[]));
         });
         let (mut triangles, mut segments, mut texts) = (Vec::new(), Vec::new(), Vec::new());
         for clipped in &output.shapes {
@@ -1582,9 +1733,23 @@ mod test {
         if let Some(Ok(a)) = &state.annotation {
             println!("{}: {} stub ions: {:?}", a.proforma, a.stub_ions.len(), a.stub_ions.iter().map(|s| &s.text).collect::<Vec<_>>());
         }
+        println!("labels: {:#?}", harness.state().labels);
         if let Ok(out) = std::env::var("SAGE_GUI_FIGURES") {
             std::fs::create_dir_all(&out).unwrap();
             harness.render().unwrap().save(Path::new(&out).join("viewer_multivalent.png")).unwrap();
+            // the best pair crosslink and loop-link too
+            for (kind, name) in [(Kind::Crosslink, "viewer_crosslink.png"), (Kind::Loop, "viewer_loop.png")] {
+                let Some(i) = harness.state().shown.iter().copied().find(|&i| results.matches[i].kind == kind) else { continue };
+                harness.state_mut().selected = Some(i);
+                let t = Instant::now();
+                while harness.state().annotated != Some((i, harness.state().model)) && t.elapsed().as_secs() < 30 {
+                    harness.step();
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                harness.run_steps(4);
+                println!("{name}: {:#?}", harness.state().labels);
+                harness.render().unwrap().save(Path::new(&out).join(name)).unwrap();
+            }
         }
     }
 

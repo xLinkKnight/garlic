@@ -44,6 +44,9 @@ pub struct Match {
     /// 1-based link residues within the peptides (loop: both on `peptide`)
     pub sites: (usize, usize),
     pub proteins: String,
+    /// Sage's protein lists (`;`-separated): of the peptide (linear), or of
+    /// `peptide` and `partner` (crosslinks, loop-links, multivalent species)
+    pub protein_lists: Vec<String>,
     pub score: f64,
     pub spectrum_q: f32,
     /// Peptide q-value (linear) or crosslink q-value
@@ -118,6 +121,71 @@ pub struct Results {
     pub fragment_tol: Tolerance,
     /// Configured modification names → mass, for names ProForma readers do not know
     mod_masses: HashMap<String, f32>,
+    /// The proteins of the search's FASTA, by accession (as Sage names them:
+    /// the header's first word); empty when the FASTA cannot be read
+    proteins: HashMap<String, Protein>,
+    /// Prefix of decoy protein accessions (`rev_`)
+    decoy_tag: String,
+}
+
+/// A protein of the search's FASTA
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Protein {
+    /// `DNA-directed RNA polymerase II subunit RPB1` (UniProt headers: up to `OS=`)
+    pub name: String,
+    /// `RPO21` (UniProt `GN=`), empty if the header has none
+    pub gene: String,
+    pub sequence: String,
+}
+
+/// The FASTA file at `path` by accession (the header's first word)
+fn read_fasta(path: &str) -> HashMap<String, Protein> {
+    let Ok(text) = std::fs::read_to_string(path) else { return HashMap::new() };
+    let mut proteins = HashMap::new();
+    let mut current: Option<(String, Protein)> = None;
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if let Some(header) = line.strip_prefix('>') {
+            proteins.extend(current.take());
+            let (accession, rest) = header.split_once(char::is_whitespace).unwrap_or((header, ""));
+            let name = rest[..rest.find(" OS=").unwrap_or(rest.len())].trim().to_string();
+            let gene = rest.split_whitespace().find_map(|w| w.strip_prefix("GN=")).unwrap_or("").to_string();
+            current = Some((accession.to_string(), Protein { name, gene, sequence: String::new() }));
+        } else if let Some((_, protein)) = &mut current {
+            protein.sequence.push_str(line);
+        }
+    }
+    proteins.extend(current);
+    proteins
+}
+
+/// A peptide in Sage's notation without its modifications: `M[+15.9949]K` → `MK`
+fn bare(peptide: &str) -> String {
+    let mut out = String::with_capacity(peptide.len());
+    let mut depth = 0;
+    for c in peptide.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            c if depth == 0 && c.is_ascii_alphabetic() => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// What the peptide map says left of a peptide: its protein and where its
+/// link residues are in it
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PeptideLabel {
+    /// Gene (`RPO21`), else the entry name (`RPB1_YEAST`) or accession;
+    /// `+ 1` when the peptide is in more proteins; empty if not known
+    pub protein: String,
+    /// `DNA-directed RNA polymerase II subunit RPB1`
+    pub name: String,
+    /// The link residues as positions in the protein: `K1246`, `K18, K22`
+    pub sites: String,
+    /// Every protein and position, for the tooltip
+    pub detail: String,
 }
 
 /// Header → column index of a TSV
@@ -180,6 +248,9 @@ impl Results {
             }
         }
 
+        let decoy_tag = database.and_then(|d| d.get("decoy_tag")).and_then(Value::as_str).unwrap_or("rev_").to_string();
+        let proteins = database.and_then(|d| d.get("fasta")).and_then(Value::as_str).map(read_fasta).unwrap_or_default();
+
         let mut matches = Vec::new();
         if let Some(text) = read_tsv(&folder.join("results.sage.tsv")) {
             matches.extend(parse_linear(&text));
@@ -197,7 +268,128 @@ impl Results {
             crosslink,
             fragment_tol,
             mod_masses,
+            proteins,
+            decoy_tag,
         })
+    }
+
+    /// The label of each peptide of a match in the peptide map: its protein
+    /// (gene and name, from the FASTA) and the positions of its link residues
+    /// in the protein. The proteins are the ones Sage listed for the peptide;
+    /// a multivalent species' other peptides are looked up in the FASTA.
+    pub fn peptide_labels(&self, m: &Match) -> Vec<PeptideLabel> {
+        let link = self.link(m);
+        let peptides: Vec<String> = match m.kind {
+            Kind::Linear | Kind::Loop => vec![m.peptide.clone()],
+            Kind::Crosslink => vec![m.peptide.clone(), m.partner.clone()],
+            Kind::Multi => parse_species(&m.species).0,
+        };
+        peptides
+            .iter()
+            .enumerate()
+            .map(|(k, peptide)| {
+                let sequence = bare(peptide);
+                let listed = [&m.peptide, &m.partner]
+                    .iter()
+                    .position(|p| bare(p) == sequence)
+                    .and_then(|i| m.protein_lists.get(i))
+                    .filter(|list| !list.is_empty());
+                let accessions: Vec<String> = match listed {
+                    Some(list) => list.split(';').map(str::trim).filter(|a| !a.is_empty()).map(String::from).collect(),
+                    None => self.proteins_with(&sequence),
+                };
+                let ends = link.as_ref().map(|l| l.ends_of(k)).unwrap_or_default();
+                self.label(&sequence, &accessions, &ends)
+            })
+            .collect()
+    }
+
+    /// Accessions of the FASTA proteins holding `sequence` (a decoy, reversed
+    /// as Sage reverses peptides, when no target holds it)
+    fn proteins_with(&self, sequence: &str) -> Vec<String> {
+        let mut found: Vec<String> =
+            self.proteins.iter().filter(|(_, p)| p.sequence.contains(sequence)).map(|(a, _)| a.clone()).collect();
+        if found.is_empty() {
+            let target = unreverse(sequence);
+            found = self
+                .proteins
+                .iter()
+                .filter(|(_, p)| p.sequence.contains(&target))
+                .map(|(a, _)| format!("{}{a}", self.decoy_tag))
+                .collect();
+        }
+        found.sort();
+        found
+    }
+
+    /// The label of a peptide (`sequence`, no modifications) in `accessions`,
+    /// with link residues `ends` (0-based in the peptide)
+    fn label(&self, sequence: &str, accessions: &[String], ends: &[usize]) -> PeptideLabel {
+        let n = sequence.len();
+        let residues: Vec<char> = sequence.chars().collect();
+        // (accession, protein, decoy, 0-based start of the peptide in the protein)
+        let mut places: Vec<(&str, Option<&Protein>, bool, Option<usize>)> = Vec::new();
+        for accession in accessions {
+            let (target, decoy) = match accession.strip_prefix(&self.decoy_tag) {
+                Some(target) => (target, true),
+                None => (accession.as_str(), false),
+            };
+            let protein = self.proteins.get(target);
+            // a decoy peptide is its target peptide reversed but for its ends
+            let query = if decoy { unreverse(sequence) } else { sequence.to_string() };
+            let starts: Vec<usize> = protein.map(|p| p.sequence.match_indices(&query).map(|(i, _)| i).collect()).unwrap_or_default();
+            if starts.is_empty() {
+                places.push((accession, protein, decoy, None));
+            }
+            places.extend(starts.into_iter().map(|s| (accession.as_str(), protein, decoy, Some(s))));
+        }
+        // 1-based position in the protein of residue r of the peptide
+        let position = |start: usize, decoy: bool, r: usize| {
+            let i = if decoy && r > 0 && r + 1 < n { n - 1 - r } else { r };
+            start + i + 1
+        };
+        let sites_at = |start: usize, decoy: bool| -> String {
+            ends.iter().map(|&r| format!("{}{}", residues.get(r).copied().unwrap_or('?'), position(start, decoy, r))).collect::<Vec<_>>().join(", ")
+        };
+        let short = |accession: &str, protein: Option<&Protein>| -> String {
+            match protein {
+                Some(p) if !p.gene.is_empty() => p.gene.clone(),
+                // UniProt `sp|P04050|RPB1_YEAST` → `RPB1_YEAST`
+                _ => accession.rsplit('|').next().unwrap_or(accession).to_string(),
+            }
+        };
+        let Some(&(accession, protein, decoy, start)) = places.first() else { return PeptideLabel::default() };
+        let others = places.iter().map(|p| p.0).collect::<HashSet<_>>().len() - 1;
+        let mut short_name = short(accession.strip_prefix(&self.decoy_tag).unwrap_or(accession), protein);
+        if decoy {
+            short_name.push_str(" (decoy)");
+        }
+        if others > 0 {
+            short_name.push_str(&format!(" + {others}"));
+        }
+        let detail = places
+            .iter()
+            .map(|&(accession, protein, decoy, start)| {
+                let what = match protein {
+                    Some(p) if !p.gene.is_empty() => format!("{} ({})", p.name, p.gene),
+                    Some(p) => p.name.clone(),
+                    None => "not in the FASTA".into(),
+                };
+                let note = if decoy { ", decoy (positions of its target)" } else { "" };
+                match start {
+                    Some(s) if ends.is_empty() => format!("{accession}: {what}, residues {}–{}{note}", s + 1, s + n),
+                    Some(s) => format!("{accession}: {what}, residues {}–{}, link {}{note}", s + 1, s + n, sites_at(s, decoy)),
+                    None => format!("{accession}: {what}"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        PeptideLabel {
+            protein: short_name,
+            name: protein.map(|p| p.name.clone()).unwrap_or_default(),
+            sites: start.map(|s| sites_at(s, decoy)).unwrap_or_default(),
+            detail,
+        }
     }
 
     /// The link of a crosslinked match: sites, linker and, for MS-cleavable
@@ -386,6 +578,16 @@ impl SpectrumFile {
             })
             .collect())
     }
+}
+
+/// A decoy peptide back to its target: Sage reverses all but the ends
+fn unreverse(sequence: &str) -> String {
+    let mut residues: Vec<char> = sequence.chars().collect();
+    let n = residues.len();
+    if n > 2 {
+        residues[1..n - 1].reverse();
+    }
+    residues.into_iter().collect()
 }
 
 /// A remnant an MS-cleavable linker leaves on its peptide
@@ -581,6 +783,7 @@ fn parse_linear(text: &str) -> Vec<Match> {
             partner: String::new(),
             sites: (0, 0),
             proteins: field(&f, &col, "proteins").to_string(),
+            protein_lists: vec![field(&f, &col, "proteins").to_string()],
             score: field(&f, &col, "hyperscore").parse().unwrap_or(0.0),
             spectrum_q: field(&f, &col, "spectrum_q").parse().unwrap_or(1.0),
             q: field(&f, &col, "peptide_q").parse().unwrap_or(1.0),
@@ -626,6 +829,7 @@ fn parse_crosslinks(text: &str) -> Vec<Match> {
                     field(&f, &col, "link_b").parse().unwrap_or(1),
                 ),
                 proteins,
+                protein_lists: vec![field(&f, &col, "proteins_a").to_string(), field(&f, &col, "proteins_b").to_string()],
                 score: field(&f, &col, "hyperscore").parse().unwrap_or(0.0),
                 spectrum_q: field(&f, &col, "spectrum_q").parse().unwrap_or(1.0),
                 q: field(&f, &col, "crosslink_q").parse().unwrap_or(1.0),
@@ -1413,6 +1617,8 @@ pub(crate) mod test {
             crosslink: Some(CrosslinkSettings::default()),
             fragment_tol: Tolerance::Ppm(-10.0, 10.0),
             mod_masses: HashMap::new(),
+            proteins: HashMap::new(),
+            decoy_tag: "rev_".into(),
         };
         let m = Match {
             kind: Kind::Multi,
@@ -1423,6 +1629,7 @@ pub(crate) mod test {
             partner: peptides[1].clone(),
             sites: (4, 10),
             proteins: String::new(),
+            protein_lists: Vec::new(),
             score: 50.0,
             spectrum_q: 0.0,
             q: 0.0,
@@ -1453,6 +1660,106 @@ pub(crate) mod test {
         assert!(a.stub_ions.is_empty());
     }
 
+    /// A crosslink match for the label tests
+    fn crosslink(kind: Kind, peptide: &str, partner: &str, sites: (usize, usize), lists: [&str; 2], species: &str) -> Match {
+        Match {
+            kind,
+            file: "a.d".into(),
+            scan: "1".into(),
+            charge: 4,
+            peptide: peptide.into(),
+            partner: partner.into(),
+            sites,
+            proteins: String::new(),
+            protein_lists: lists.iter().map(|l| l.to_string()).collect(),
+            score: 50.0,
+            spectrum_q: 0.0,
+            q: 0.0,
+            target: true,
+            rank: 1,
+            expmass: 0.0,
+            calcmass: 0.0,
+            rt: 10.0,
+            ion_mobility: None,
+            intra_protein: false,
+            topology: String::new(),
+            species: species.into(),
+        }
+    }
+
+    /// The peptide map's labels: gene, protein name and the link residues'
+    /// positions in the protein, from the search's FASTA
+    #[test]
+    fn peptide_labels_name_proteins_and_link_positions() {
+        let dir = std::env::temp_dir().join(format!("sage-gui-labels-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fasta = dir.join("two.fasta");
+        std::fs::write(
+            &fasta,
+            ">sp|P04050|RPB1_YEAST DNA-directed RNA polymerase II subunit RPB1 OS=Saccharomyces cerevisiae (strain ATCC 204508 / S288c) OX=559292 GN=RPO21 PE=1 SV=2\n\
+             MAAAKGLEKVSTAAMQR\nCCCPPPPKR\n\n\
+             >sp|Q00001|TEST_YEAST Test protein OS=Yeast\nWWTDYHFPNEWKLIRGLEKVSTAAMQR\n",
+        )
+        .unwrap();
+        let proteins = read_fasta(&fasta.display().to_string());
+        let rpb1 = &proteins["sp|P04050|RPB1_YEAST"];
+        assert_eq!(rpb1.name, "DNA-directed RNA polymerase II subunit RPB1");
+        assert_eq!(rpb1.gene, "RPO21");
+        assert_eq!(rpb1.sequence, "MAAAKGLEKVSTAAMQRCCCPPPPKR");
+        assert_eq!(proteins["sp|Q00001|TEST_YEAST"].gene, "");
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let results = Results {
+            matches: Vec::new(),
+            files: HashMap::new(),
+            bruker: Default::default(),
+            crosslink: Some(CrosslinkSettings::default()),
+            fragment_tol: Tolerance::Ppm(-10.0, 10.0),
+            mod_masses: HashMap::new(),
+            proteins,
+            decoy_tag: "rev_".into(),
+        };
+        // GLEKVSTAAMQR (K4) is residues 6-17 of RPB1 and 16-27 of the test
+        // protein; TDYHFPNEWKLIR (K10) residues 3-15 of the test protein
+        let m = crosslink(
+            Kind::Crosslink,
+            "GLEKVSTAAMQR",
+            "TDYHFPNEWKLIR",
+            (4, 10),
+            ["sp|P04050|RPB1_YEAST;sp|Q00001|TEST_YEAST", "sp|Q00001|TEST_YEAST"],
+            "",
+        );
+        let labels = results.peptide_labels(&m);
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0].protein, "RPO21 + 1", "gene, and one more protein");
+        assert_eq!(labels[0].name, "DNA-directed RNA polymerase II subunit RPB1");
+        assert_eq!(labels[0].sites, "K9");
+        assert!(labels[0].detail.contains("sp|Q00001|TEST_YEAST: Test protein, residues 16–27, link K19"), "{}", labels[0].detail);
+        // no gene name: the UniProt entry name
+        assert_eq!((labels[1].protein.as_str(), labels[1].sites.as_str()), ("TEST_YEAST", "K12"));
+
+        // a decoy (Sage reverses all but the ends): its target's positions
+        let decoy = crosslink(Kind::Crosslink, "GQMAATSVKELR", "TDYHFPNEWKLIR", (9, 10), ["rev_sp|P04050|RPB1_YEAST", "sp|Q00001|TEST_YEAST"], "");
+        let labels = results.peptide_labels(&decoy);
+        assert_eq!((labels[0].protein.as_str(), labels[0].sites.as_str()), ("RPO21 (decoy)", "K9"));
+
+        // a loop-link: both residues
+        let looped = crosslink(Kind::Loop, "AAAKGLEKVSTAAMQR", "", (4, 8), ["sp|P04050|RPB1_YEAST", ""], "");
+        assert_eq!(results.peptide_labels(&looped)[0].sites, "K5, K9");
+
+        // multivalent: the third peptide is not in the protein columns, so it
+        // is looked up in the FASTA (residues 18-26 of RPB1)
+        let species = "[1] GLEKVSTAAMQR [2] TDYHFPNEWKLIR [3] CCCPPPPKR | 1:K4-2:K10; 2:T1-3:K8";
+        let multi = crosslink(Kind::Multi, "GLEKVSTAAMQR", "TDYHFPNEWKLIR", (4, 10), ["sp|P04050|RPB1_YEAST", "sp|Q00001|TEST_YEAST"], species);
+        let labels = results.peptide_labels(&multi);
+        let sites: Vec<&str> = labels.iter().map(|l| l.sites.as_str()).collect();
+        assert_eq!(sites, ["K9", "T3, K12", "K25"]);
+        assert_eq!(labels[2].protein, "RPO21");
+        // without the FASTA: no label (the map shows "peptide 3" alone)
+        let bare_results = Results { proteins: HashMap::new(), ..results };
+        assert_eq!(bare_results.peptide_labels(&multi)[2], PeptideLabel::default());
+    }
+
     pub(crate) const MULTI_SPECIES: &str =
         "[1] GLEKVSTAAMQR [2] AEFGHDSTWKLMNPQSTVKGYEDFAR [3] TDYHFPNEWKLIR | 1:K4-2:K10; 2:K19-3:K10";
 
@@ -1470,6 +1777,8 @@ pub(crate) mod test {
             crosslink: Some(settings.clone()),
             fragment_tol: Tolerance::Ppm(-10.0, 10.0),
             mod_masses: HashMap::new(),
+            proteins: HashMap::new(),
+            decoy_tag: "rev_".into(),
         };
         let (peptides, _) = parse_species(MULTI_SPECIES);
         let m = Match {
@@ -1481,6 +1790,7 @@ pub(crate) mod test {
             partner: peptides[1].clone(),
             sites: (4, 10),
             proteins: String::new(),
+            protein_lists: Vec::new(),
             score: 50.0,
             spectrum_q: 0.0,
             q: 0.0,

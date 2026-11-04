@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.21.0] - 2026-11-04
+
+### Added
+- `sage-gui`: in the Annotated spectra peptide map, each crosslinked peptide's label names its protein and where it is linked: `peptide 1 · RPO21` (the gene, else the UniProt entry name), the protein's name, and the link residues' positions in the protein (`K1246`; `T3, K12` for a peptide with two links; both residues of a loop-link). Read from the search's FASTA (UniProt headers: name up to `OS=`, gene `GN=`). A peptide in more than one protein shows `+ n`; hover the label for every protein, the residues the peptide spans and its links there. Decoys show their target's positions. Multivalent species' peptides that are not in the protein columns are looked up in the FASTA.
+
+### Changed
+- `sage-gui`: a peptide map wider than the window (long peptides, protein labels) scrolls sideways instead of being cut off.
+
 ## [v0.20.1] - 2026-11-04
 
 ### Changed
