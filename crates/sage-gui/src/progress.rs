@@ -631,7 +631,7 @@ fn diagnose(failure: &str, errors: &[String], log: &[String], plan: &Plan, stage
         d("The GPU crosslink backend is not available",
           "The crosslink search was set to the gpu backend, but sage.exe could not use a GPU.",
           &["Choose cpu or auto as the backend on the Crosslinking tab (auto falls back to the CPU).",
-            "Check Files > Resources > GPU support: it needs a sage.exe built with --features gpu and a DirectX 12 capable graphics driver.",
+            "Check Files > Resources > GPU support: it needs a sage.exe with GPU support (the default build) and a DirectX 12 capable graphics driver.",
             "Update the graphics driver."])
     } else if has(&["0xc0000005", "access_violation", "3221225477"]) {
         if plan.gpu_backend {

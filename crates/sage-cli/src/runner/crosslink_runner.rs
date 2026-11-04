@@ -27,6 +27,45 @@ const FDR_FILTERED: &str = "crosslinks_FDRfiltered.sage.tsv";
 
 type Reporters = HashMap<(usize, String), (f32, Vec<f32>)>;
 
+/// `link_type` column: `crosslink`, `loop` or `multivalent`
+fn link_type(kind: LinkKind) -> &'static str {
+    match kind {
+        LinkKind::Inter => "crosslink",
+        LinkKind::Loop => "loop",
+        LinkKind::Multi => "multivalent",
+    }
+}
+
+/// `topology` column: `a1b` (two peptides), `a1a` (two copies of one
+/// peptide), `loop`, or a multivalent species' shape (`a2b`, `a1b1c`, …)
+fn topology(m: &CrosslinkMatch) -> String {
+    match (m.kind, &m.species, m.beta) {
+        (LinkKind::Multi, Some(s), _) => s.topology(),
+        (LinkKind::Loop, ..) => "loop".into(),
+        (_, _, Some(b)) if b == m.alpha => "a1a".into(),
+        _ => "a1b".into(),
+    }
+}
+
+/// `species` column of a multivalent species: its peptides, numbered, and
+/// each link by peptide and residue (1-based):
+/// `[1] PEPKTIDE [2] KPEPTIDE | 1:K4-2:K1; …`
+fn species_text(db: &sage_core::database::IndexedDatabase, s: &sage_core::crosslink::Species) -> String {
+    let peptides: Vec<String> = s
+        .peptides
+        .iter()
+        .enumerate()
+        .map(|(i, &ix)| format!("[{}] {}", i + 1, db[ix].display(&db.modifications)))
+        .collect();
+    let residue = |p: u8, site: u16| {
+        let seq = &db[s.peptides[p as usize]].sequence;
+        let aa = seq.get(site as usize).map_or('?', |&c| c as char);
+        format!("{}:{aa}{}", p + 1, site + 1)
+    };
+    let links: Vec<String> = s.links.iter().map(|&(a, sa, b, sb)| format!("{}-{}", residue(a, sa), residue(b, sb))).collect();
+    format!("{} | {}", peptides.join(" "), links.join("; "))
+}
+
 impl Runner {
     pub(super) fn run_crosslink(
         mut self,
@@ -146,7 +185,13 @@ impl Runner {
         let path = self.write_crosslinks(FDR_FILTERED, &accepted, &filenames, reporters_out)?;
         info!("wrote {} ({} target crosslink-spectrum matches at 1% FDR)", FDR_FILTERED, accepted.len());
         self.parameters.output_paths.push(path);
-        self.write_viewer_exports(&matches, &settings, &filenames)?;
+        // xiVIEW, ProXL and mzIdentML describe pairs and loop-links only
+        let pairs: Vec<CrosslinkMatch> = matches.iter().filter(|m| m.kind != LinkKind::Multi).cloned().collect();
+        let multi = matches.len() - pairs.len();
+        if multi > 0 {
+            info!("{multi} multivalent matches are in crosslinks.sage.tsv only (not in the xiVIEW, ProXL and mzIdentML files)");
+        }
+        self.write_viewer_exports(&pairs, &settings, &filenames)?;
         if self.parameters.write_annotator {
             let path = self.write_annotator_crosslinks(&matches, &settings)?;
             self.parameters.output_paths.push(path);
@@ -246,6 +291,9 @@ impl Runner {
             "ion_mobility",
             "spectrum_q",
             "crosslink_q",
+            "topology",
+            "species",
+            "topology_peaks",
         ]
         .into_iter()
         .map(String::from)
@@ -277,11 +325,7 @@ impl Runner {
                 m.rank.to_string(),
                 (if m.class == PairClass::TT { 1 } else { -1 }).to_string(),
                 format!("{:?}", m.class),
-                match m.kind {
-                    LinkKind::Inter => "crosslink",
-                    LinkKind::Loop => "loop",
-                }
-                .to_string(),
+                link_type(m.kind).to_string(),
                 alpha.display(&db.modifications).to_string(),
                 peptide_b,
                 (m.alpha_site + 1).to_string(),
@@ -308,6 +352,9 @@ impl Runner {
                 m.ims.to_string(),
                 m.spectrum_q.to_string(),
                 m.crosslink_q.to_string(),
+                topology(m),
+                m.species.as_deref().map(|s| species_text(db, s)).unwrap_or_default(),
+                m.species.as_deref().map(|s| s.topology_peaks.to_string()).unwrap_or_default(),
             ];
             if let Some(reporters) = reporters.filter(|_| !reporter_headers.is_empty()) {
                 // Spectra without reporter ions (e.g. no matching MS3) get empty cells
@@ -482,11 +529,7 @@ impl Runner {
             let mut record = vec![
                 alpha.display(&db.modifications).to_string(),
                 peptide_b,
-                match m.kind {
-                    LinkKind::Inter => "crosslink",
-                    LinkKind::Loop => "loop",
-                }
-                .to_string(),
+                link_type(m.kind).to_string(),
                 (m.alpha_site + 1).to_string(),
                 (m.beta_site + 1).to_string(),
                 alpha.proteins(&db.decoy_tag, db.generate_decoys),

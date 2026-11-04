@@ -1,11 +1,163 @@
 //! Look of the window: a clean light theme (white panels, thin grey borders,
 //! blue accents) and a matching dark theme, plus the few widgets that carry it
-//! (section headings with a rule, outlined coloured buttons, a light/dark switch).
+//! (section headings with a rule, outlined coloured buttons, a light/dark switch,
+//! number fields with + / − buttons, bold titles).
 
 use eframe::egui::{
-    self, pos2, vec2, Button, Color32, CornerRadius, FontId, Response, RichText, Sense, Stroke,
-    StrokeKind, TextStyle, Theme, Ui, Visuals,
+    self, emath::Numeric, pos2, vec2, Button, Color32, CornerRadius, DragValue, FontFamily, FontId, Rect,
+    Response, RichText, Sense, Stroke, StrokeKind, TextStyle, Theme, Ui, Visuals,
 };
+use std::ops::RangeInclusive;
+
+/// Font family of titles: a bold system font, or the regular one when none is found
+pub const BOLD: &str = "bold";
+
+fn bold_family() -> FontFamily {
+    FontFamily::Name(BOLD.into())
+}
+
+/// Title text (tabs, sections, column headers) in the bold font
+pub fn bold(text: impl Into<String>) -> RichText {
+    RichText::new(text).family(bold_family())
+}
+
+/// Register the bold font family: Segoe UI Bold or Arial Bold on Windows
+/// (DejaVu Sans Bold, Arial Bold elsewhere), then the regular fonts for
+/// anything it lacks
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let candidates = [
+        r"C:\Windows\Fonts\segoeuib.ttf",
+        r"C:\Windows\Fonts\arialbd.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ];
+    let mut family = Vec::new();
+    if let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) {
+        fonts.font_data.insert(BOLD.into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+        family.push(BOLD.to_string());
+    }
+    family.extend(fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default());
+    fonts.families.insert(bold_family(), family);
+    ctx.set_fonts(fonts);
+}
+
+/// A number field: the value is typed in (dragging does nothing), and two
+/// stacked buttons to its right step it by `step`, + above −, within `range`.
+/// `style` adds prefix, suffix or decimals to the field.
+pub fn number<T: Numeric>(
+    ui: &mut Ui,
+    value: &mut T,
+    range: RangeInclusive<T>,
+    step: f64,
+    style: impl FnOnce(DragValue) -> DragValue,
+) -> Response {
+    let (lo, hi) = (range.start().to_f64(), range.end().to_f64());
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 1.0;
+        // 2 px taller than other fields, so each stacked button has room for its symbol
+        ui.spacing_mut().interact_size.y += 2.0;
+        // without a drag speed egui would show every decimal: up to 6 (or the
+        // field's own maximum), trailing zeros trimmed
+        let field = DragValue::new(value)
+            .range(range)
+            .speed(0.0)
+            .custom_formatter(|v, decimals| plain_number(v, (*decimals.end()).min(6)));
+        let mut field = ui.add(style(field)).on_hover_cursor(egui::CursorIcon::Text);
+        let (area, _) = ui.allocate_exact_size(vec2(16.0, field.rect.height()), Sense::hover());
+        let mut buttons = Vec::with_capacity(2);
+        for (up, rect) in [
+            (true, Rect::from_min_max(area.min, pos2(area.max.x, area.center().y))),
+            (false, Rect::from_min_max(pos2(area.min.x, area.center().y), area.max)),
+        ] {
+            let rect = rect.shrink2(vec2(0.0, 0.5));
+            let button = ui.interact(rect, field.id.with(up), Sense::click());
+            let look = ui.style().interact(&button);
+            let painter = ui.painter();
+            painter.rect(rect, 2.0, look.weak_bg_fill, look.bg_stroke, StrokeKind::Inside);
+            // the symbol fits its half-height box with 2 px clear of the border,
+            // on whole pixels so it stays crisp
+            // pixel centre at or below the middle (rounding up would push the + into the top border)
+            let ppp = ui.pixels_per_point();
+            let mid = rect.center();
+            let c = pos2(
+                ((mid.x * ppp - 0.5).round() + 0.5) / ppp,
+                ((mid.y * ppp - 0.5).ceil() + 0.5) / ppp,
+            );
+            let arm = 2.5f32;
+            let rise = (rect.height() / 2.0 - 3.0).clamp(1.5, arm);
+            let stroke = Stroke::new(1.2f32, look.fg_stroke.color);
+            painter.line_segment([c - vec2(arm, 0.0), c + vec2(arm, 0.0)], stroke);
+            if up {
+                painter.line_segment([c - vec2(0.0, rise), c + vec2(0.0, rise)], stroke);
+            }
+            if button.clicked() {
+                *value = T::from_f64(stepped(value.to_f64(), step, up, lo, hi));
+                field.mark_changed();
+            }
+            buttons.push(button.on_hover_text(if up { format!("+{step}") } else { format!("−{step}") }));
+        }
+        buttons.into_iter().fold(field, |acc, b| acc | b)
+    })
+    .inner
+}
+
+/// `v` with at most `decimals` decimals, trailing zeros trimmed: 5000, 0.01, 15.9949
+fn plain_number(v: f64, decimals: usize) -> String {
+    let text = format!("{v:.decimals$}");
+    if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        text
+    }
+}
+
+/// `value` one `step` up or down, within `lo..=hi`. Rounded to the decimals of
+/// the step or of the value, whichever has more (up to 6), so 0.03 + 0.01 is
+/// 0.04, not 0.04000000000000001, and 15.9949 + 1 stays 16.9949.
+fn stepped(value: f64, step: f64, up: bool, lo: f64, hi: f64) -> f64 {
+    let decimals_of = |x: f64| {
+        (0..=6)
+            .find(|&d| {
+                let s = 10f64.powi(d);
+                ((x * s).round() / s - x).abs() < 1e-9
+            })
+            .unwrap_or(6)
+    };
+    let scale = 10f64.powi(decimals_of(step).max(decimals_of(value)));
+    let next = value + if up { step } else { -step };
+    ((next * scale).round() / scale).clamp(lo, hi)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn steps_round_and_stay_in_range() {
+        assert_eq!(stepped(3.0, 1.0, true, 0.0, 10.0), 4.0);
+        assert_eq!(stepped(0.0, 1.0, false, 0.0, 10.0), 0.0);
+        assert_eq!(stepped(10.0, 1.0, true, 0.0, 10.0), 10.0);
+        assert_eq!(stepped(0.03, 0.01, true, 0.0, 1.0), 0.04);
+        assert_eq!(stepped(0.7, 0.05, false, 0.0, 1.0), 0.65);
+        // a typed value keeps its own decimals
+        assert_eq!(stepped(20.37, 1.0, true, -1e4, 1e4), 21.37);
+        assert_eq!(stepped(15.9949, 1.0, true, -1e4, 1e4), 16.9949);
+        assert_eq!(stepped(-17.026549, 1.0, false, -1e4, 1e4), -18.026549);
+        assert_eq!(stepped(4096.0, 1024.0, true, 1024.0, 1_048_576.0), 5120.0);
+    }
+
+    #[test]
+    fn numbers_show_without_trailing_zeros() {
+        assert_eq!(plain_number(5000.0, 6), "5000");
+        assert_eq!(plain_number(0.01, 6), "0.01");
+        assert_eq!(plain_number(15.994915, 6), "15.994915");
+        assert_eq!(plain_number(0.7, 6), "0.7");
+        assert_eq!(plain_number(-17.026549, 6), "-17.026549");
+        assert_eq!(plain_number(0.0125, 3), "0.013");
+        assert_eq!(plain_number(2.0, 0), "2");
+    }
+}
 
 const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
     Color32::from_rgb(r, g, b)
@@ -101,11 +253,12 @@ fn visuals(dark: bool) -> Visuals {
 
 /// Install both themes and pick one
 pub fn install(ctx: &egui::Context, dark: bool) {
+    install_fonts(ctx);
     for theme in [Theme::Light, Theme::Dark] {
         ctx.style_mut_of(theme, |s| {
             s.visuals = visuals(theme == Theme::Dark);
             s.text_styles = [
-                (TextStyle::Heading, FontId::proportional(18.0)),
+                (TextStyle::Heading, FontId::new(18.0, bold_family())),
                 (TextStyle::Body, FontId::proportional(14.0)),
                 (TextStyle::Button, FontId::proportional(14.0)),
                 (TextStyle::Monospace, FontId::monospace(13.0)),
@@ -141,7 +294,7 @@ pub fn muted(ui: &Ui) -> Color32 {
 pub fn section(ui: &mut Ui, text: &str) {
     ui.add_space(10.0);
     ui.horizontal(|ui| {
-        let title = ui.label(RichText::new(text).size(17.0).color(accent(ui)));
+        let title = ui.label(bold(text).size(17.0).color(accent(ui)));
         let right = ui.available_rect_before_wrap().right();
         let left = title.rect.right() + 6.0;
         if right > left {

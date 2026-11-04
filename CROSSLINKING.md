@@ -43,6 +43,7 @@ before. Two strategies are used, chosen by the reagent:
 | `site1`, `site2` | none | heterobifunctional chemistry, set both: what each end reacts with, as residue letters plus `[` (protein N-terminus) and `]` (protein C-terminus). Replaces `residues` / `protein_nterm`; overrides a reagent's sites |
 | `allow_cterm_residue` | `false` | allow linking a peptide's C-terminal residue when it is not the protein C-terminus |
 | `loop_links` | `true` | also search loop-links (both ends of the linker on one peptide) |
+| `multivalent` | off | also search species held together by 2 up to this many linkers (`2`–`4`), see [Multivalent crosslinks](#multivalent-crosslinks). Non-cleavable and MS-cleavable linkers; the search space grows steeply, so use it with small protein sets |
 | `candidates` | `30` | linear "seed" peptides per spectrum used to find partners |
 | `min_chain_peaks` | `3` | minimum matched fragments required on *each* peptide |
 
@@ -176,6 +177,94 @@ linear peptide with any modification of about the linker's mass would pass.
 Loop-links get their own FDR group (`decoys / targets`), as in non-cleavable
 mode; `linked_a` reports the matched ring ions.
 
+## Multivalent crosslinks
+
+With `"multivalent": n` (2–4; in `sage-gui`, "search multivalent crosslinks"
+on the Crosslinking tab) the search also looks for species held together by
+two up to `n` linkers, next to the ordinary pairs and loop-links:
+
+* several links between two peptides: `a2b`, and between two copies of one
+  peptide, `a2a`;
+* chains of three or more peptides: `a1b1c`, `a2b1c`, `a1b1c1d`, copies
+  included (`a1a1b`, `a1b1b`);
+* branches: one peptide linked to several others, written as its links,
+  `a1b,b1c,b1d`.
+
+Letters are distinct peptide sequences, numbers the links between neighbours.
+`n` counts the linkers of a species, so a species has at most `n + 1`
+peptides. A residue carries one linker; loop-links stay in the main search.
+
+**Search.** The precursor is `M = sum of the peptides + k × linker` for `k`
+linkers. The best seeds of the ordinary search (the 10 linear peptides that
+explain the most peaks) are combined, with repetition, into every set of
+`p - 1` peptides; the last peptide's mass is then fixed and looked up in the
+mass-sorted database. Every connected arrangement of the `k` links on the `p`
+peptides is scored (3 for three peptides and two links, 16 trees for four
+peptides and three links, 125 for five peptides and four links), and for
+heterobifunctional reagents each link both ways round.
+
+**Fragment ions.** Take one peptide away from the species: the rest falls into
+groups, each hanging on one or more of its residues. A backbone fragment
+carries every group whose residues it holds all of, with that group's peptides
+and linkers. A fragment that holds only some of a group's residues stays tied
+to the rest through the group (as inside a loop-link) and is not observed.
+Every peptide needs `min_chain_peaks` matched ions, `min_linked_peaks` of them
+carrying a linker; the score is the hyperscore over all peptides.
+
+**MS-cleavable linkers (DSSO, DSBU, cliXlink).** In the collision cell every
+linker of the species can break, which frees each peptide with one stub on
+each of its link residues (DSSO: alkene, sulfenic acid or thiol). Each
+peptide is scored that way: an ion carries one stub (any of its arm's) for
+every link residue it holds. The free peptide with its stubs gives a doublet,
+or with two links a triplet (`P+A+A`, `P+A+S`, `P+S+S`, spaced 49.98 Da), as in
+the pair search: every peptide needs at least one such peak, and one peptide
+two. Once every linker has broken, the fragments no longer show which peptides
+were linked to which, only how many links each carries. Pieces where only one
+linker broke do: in `a1b1c`, breaking the a–b linker frees `b1c` with a stub,
+and breaking b–c frees `a1b` with one. Those peaks are counted per arrangement
+as `topology_peaks`, and among equally scoring arrangements the one with most
+is reported. A `topology_peaks` of 0 means the arrangement is not shown by the
+spectrum (always so for `a2b`, where no single broken linker frees anything).
+cliXlink's two arms leave different stubs, so each link is tried both ways
+round. On the DSSO Pol II run (2 or 3 linkers) 16 spectra were best explained
+by a multivalent species and one passed 1% FDR: an RPB2 `a2b`,
+SAGNIVQVFKKAAPSPISHVAEIR (K10, K11) with DGKLAKPR (K3, K6), 29 and 13 matched
+ions and 6 doublet / triplet peaks, on a spectrum the pair search had left
+unexplained; pairs and loop-links were unchanged.
+
+**FDR.** Multivalent species are their own FDR group. A species with any decoy
+peptide is a decoy. A random species of `n` distinct peptides is all-target
+with chance `1 / 2^n`, so each decoy species stands for `1 / (2^n − 1)` false
+targets: `(TD + DD) / 3` for two peptides, which the usual `TD − DD` also
+estimates. Copies of one peptide count once (`a2a` has one distinct peptide, so
+a decoy `a2a` counts fully, like a decoy loop-link). Unlike an
+inclusion–exclusion estimate (`N1 − N2 + …`) this never turns negative when
+all-decoy species are common, as they are with copies. The species compete
+with pairs and loop-links for each spectrum.
+
+**Output.** `crosslinks.sage.tsv` lists them with `link_type` `multivalent`;
+`peptide_a` / `peptide_b` and `link_a` / `link_b` hold the first link, and two
+columns describe the whole species:
+
+* `topology`: `a2b`, `a1b1c`, … (`a1b` or `a1a` for ordinary crosslinks, `loop`
+  for loop-links);
+* `species`: the peptides, numbered, and each link by peptide and residue,
+  `[1] GLEKVSTAAMQR [2] AEFGHDSTWKLMNPQSTVKGYEDFAR [3] TDYHFPNEWKLIR | 1:K4-2:K10; 2:K19-3:K10`;
+* `topology_peaks`: MS-cleavable linkers, the peaks of parts freed by one broken
+  linker that support the arrangement (above). `stub_peaks` holds the free
+  peptides' doublet and triplet peaks.
+
+The Annotator CSV writes them as ProForma with one label per link (`#XL1`,
+`#XL2`, …), and the viewer annotates them with every peptide in the map. They
+are left out of the xiVIEW, ProXL and mzIdentML files, which describe pairs
+only, and out of crosslink LFQ. The mobiligram shows them in green (#6FB120).
+
+**Search space.** Each extra peptide multiplies the candidates by about the
+number of seeds, and each extra linker adds arrangements, so a search with
+`n = 3` or `4` takes far longer than an ordinary one. Use a FASTA of the
+complex under study (a few dozen proteins), not a proteome; `sage-gui` warns
+while the option is on.
+
 ## Choosing a backend
 
 Non-cleavable reagents can be searched with three interchangeable strategies,
@@ -192,16 +281,20 @@ ignored for them, with a log message.
 
 ### Building with GPU support
 
+GPU support is built into `sage` by default:
+
 ```
-cargo build --release -p sage-cli --features gpu
+cargo build --release -p sage-cli
 ```
 
-This uses [wgpu](https://wgpu.rs), so it runs on DirectX 12 (Windows), Vulkan
-(Linux) and Metal (macOS) with NVIDIA, AMD, Intel or Apple GPUs; there is no CUDA
-dependency. Windows uses DirectX 12 only: some Windows Vulkan drivers (Intel UHD
-31.0.101.2145) crash when a device is opened. `sage --gpu-info` lists the adapters
-a build can use. It needs Rust 1.87 or newer. Without `--features gpu`, `"backend":
-"gpu"` is an error and `"auto"` falls back to `cpu`.
+(`--no-default-features` builds without it.) This uses [wgpu](https://wgpu.rs),
+so it runs on DirectX 12 (Windows), Vulkan (Linux) and Metal (macOS) with NVIDIA,
+AMD, Intel or Apple GPUs; there is no CUDA dependency. Windows uses DirectX 12
+only: some Windows Vulkan drivers (Intel UHD 31.0.101.2145) crash when a device
+is opened. `sage --gpu-info` lists the adapters a build can use. It needs Rust
+1.87 or newer. In a build without GPU support, `"backend": "gpu"` is an error and
+`"auto"` falls back to `cpu`. Searches run on the CPU unless the backend is set
+to `gpu` or `auto`, so the GPU support costs nothing when it is not used.
 
 The peptide ion table is uploaded once and stays resident; for a human proteome at
 2 missed cleavages expect on the order of 1 GB of device memory (Sage reports the
@@ -412,6 +505,14 @@ generates and matches its fragments. Nothing else needs to be installed.
   the charge shapes. Needs `crosslinks.sage.tsv` from garlic 0.18 or later,
   which has an `ion_mobility` column. Precursors where Sage found no candidate
   peptide at all are not in Sage's result tables and so not shown.
+  A search run from `sage-gui` on timsTOF data also writes mobiligrams by
+  itself, into a `Mobiligrams` folder inside the results folder, as SVG and
+  PDF (all precursors, white background, titled): one per MS file, named
+  after it with `_MG` (`Bruker.d` → `Bruker_MG.svg`), and, when two or more
+  MS files were searched, `Combined_Mobiligram.svg` / `.pdf` with all of them
+  together (a single MS file gets only its `_MG` figure, which would show the
+  same). Save… in the viewer suggests the same names. MS files without ion
+  mobility (anything but timsTOF) get none.
 * Spectra are read with Sage's own reader by Sage's spectrum ids, exactly as
   searched: mzML, MGF and, for Bruker `.d`, the precursor's spectrum merged over
   all its frames. The matches' peptidoforms are written as for the Annotator

@@ -167,7 +167,8 @@ pub fn quantify_lfq(
     let mut order = (0..matches.len())
         .filter(|&i| {
             let m = &matches[i];
-            m.class == PairClass::TT && m.crosslink_q <= lfq.peptide_q_value
+            // multivalent species are not quantified (yet): pairs and loop-links only
+            m.kind != LinkKind::Multi && m.class == PairClass::TT && m.crosslink_q <= lfq.peptide_q_value
         })
         .collect::<Vec<_>>();
     order.sort_by(|&a, &b| matches[b].hyperscore.total_cmp(&matches[a].hyperscore));

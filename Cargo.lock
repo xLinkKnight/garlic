@@ -31,11 +31,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c5dd55e6e94949498698daf4d48fb5659e824d7abec0d394089656ceaf99d4f"
 dependencies = [
  "accesskit",
- "accesskit_consumer",
+ "accesskit_consumer 0.26.0",
  "atspi-common",
  "serde",
  "thiserror 1.0.69",
  "zvariant 4.2.0",
+]
+
+[[package]]
+name = "accesskit_consumer"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa3a17950ce0d911f132387777b9b3d05eddafb59b773ccaa53fceefaeb0228e"
+dependencies = [
+ "accesskit",
+ "immutable-chunkmap",
 ]
 
 [[package]]
@@ -56,7 +66,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7329821f3bd1101e03a7d2e03bd339e3ac0dc64c70b4c9f9ae1949e3ba8dece1"
 dependencies = [
  "accesskit",
- "accesskit_consumer",
+ "accesskit_consumer 0.26.0",
  "hashbrown 0.15.5",
  "objc2 0.5.3",
  "objc2-app-kit 0.2.2",
@@ -88,7 +98,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "24fcd5d23d70670992b823e735e859374d694a3d12bfd8dd32bd3bd8bedb5d81"
 dependencies = [
  "accesskit",
- "accesskit_consumer",
+ "accesskit_consumer 0.26.0",
  "hashbrown 0.15.5",
  "paste",
  "static_assertions",
@@ -1628,6 +1638,7 @@ dependencies = [
  "objc2-foundation 0.2.2",
  "parking_lot",
  "percent-encoding",
+ "pollster 0.4.0",
  "profiling",
  "raw-window-handle",
  "static_assertions",
@@ -1635,6 +1646,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "web-time",
+ "wgpu 24.0.5",
  "winapi",
  "windows-sys 0.59.0",
  "winit",
@@ -1712,6 +1724,21 @@ dependencies = [
  "wasm-bindgen",
  "web-sys",
  "winit",
+]
+
+[[package]]
+name = "egui_kittest"
+version = "0.31.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c46def610cf9486675aeec698d4e36a949ec0b0e1f6096135b0584dcfd52aa47"
+dependencies = [
+ "eframe",
+ "egui",
+ "egui-wgpu",
+ "image",
+ "kittest",
+ "pollster 0.4.0",
+ "wgpu 24.0.5",
 ]
 
 [[package]]
@@ -2339,6 +2366,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2bbed164dd10ed526c2e4fe3e721ca4a71c61730e5aafac6844b417b3227058"
 dependencies = [
  "bitflags 2.11.0",
+]
+
+[[package]]
+name = "gpu-allocator"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c151a2a5ef800297b4e79efa4f4bec035c5f51d5ae587287c9b952bdf734cacd"
+dependencies = [
+ "log",
+ "presser",
+ "thiserror 1.0.69",
+ "windows 0.58.0",
 ]
 
 [[package]]
@@ -2976,6 +3015,17 @@ name = "khronos_api"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
+
+[[package]]
+name = "kittest"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f659954571a3c132356bd15c25f0dcf14d270a28ec5c58797adc2f432831bed5"
+dependencies = [
+ "accesskit",
+ "accesskit_consumer 0.25.0",
+ "parking_lot",
+]
 
 [[package]]
 name = "kurbo"
@@ -5240,7 +5290,7 @@ dependencies = [
 
 [[package]]
 name = "sage-cli"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -5266,7 +5316,7 @@ dependencies = [
 
 [[package]]
 name = "sage-cloudpath"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "async-compression",
  "base64 0.13.1",
@@ -5291,7 +5341,7 @@ dependencies = [
 
 [[package]]
 name = "sage-core"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "dashmap",
  "fnv",
@@ -5309,9 +5359,10 @@ dependencies = [
 
 [[package]]
 name = "sage-gui"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "eframe",
+ "egui_kittest",
  "egui_plot",
  "image",
  "mzannotate",
@@ -7033,6 +7084,7 @@ dependencies = [
  "document-features",
  "js-sys",
  "log",
+ "naga 24.0.0",
  "parking_lot",
  "profiling",
  "raw-window-handle",
@@ -7171,13 +7223,16 @@ dependencies = [
  "android_system_properties",
  "arrayvec",
  "ash",
+ "bit-set 0.8.0",
  "bitflags 2.11.0",
+ "block",
  "bytemuck",
  "cfg_aliases",
  "core-graphics-types",
  "glow 0.16.0",
  "glutin_wgl_sys",
  "gpu-alloc",
+ "gpu-allocator 0.27.0",
  "gpu-descriptor",
  "js-sys",
  "khronos-egl",
@@ -7192,6 +7247,7 @@ dependencies = [
  "ordered-float 4.6.0",
  "parking_lot",
  "profiling",
+ "range-alloc",
  "raw-window-handle",
  "renderdoc-sys",
  "rustc-hash 1.1.0",
@@ -7201,6 +7257,7 @@ dependencies = [
  "web-sys",
  "wgpu-types 24.0.0",
  "windows 0.58.0",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -7220,7 +7277,7 @@ dependencies = [
  "cfg_aliases",
  "glow 0.17.0",
  "glutin_wgl_sys",
- "gpu-allocator",
+ "gpu-allocator 0.28.0",
  "hashbrown 0.17.1",
  "js-sys",
  "khronos-egl",

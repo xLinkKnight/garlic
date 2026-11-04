@@ -1,7 +1,7 @@
 //! Mobiligram of a timsTOF (Bruker `.d`) run: every precursor Sage searched,
 //! placed by m/z and inverse ion mobility (1/K0). The marker shape gives the
 //! charge state, the colour what the precursor was identified as: crosslinks
-//! (between proteins, within a protein, loop-links), linear peptides, or
+//! (between proteins, within a protein, multivalent, loop-links), linear peptides, or
 //! nothing at 1% FDR. Drawn in the viewer and exported as SVG or PDF.
 
 use super::figure;
@@ -9,6 +9,7 @@ use super::model::{Kind, Match, Results};
 use eframe::egui::Color32;
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::path::{Path, PathBuf};
 
 /// Proton mass, for m/z from Sage's neutral precursor mass
 const PROTON: f64 = 1.007_276_466_6;
@@ -28,13 +29,16 @@ pub enum Class {
     Loop,
     IntraProtein,
     InterProtein,
+    Multivalent,
 }
 
 impl Class {
-    pub const ALL: [Class; 5] = [Class::Unidentified, Class::Linear, Class::Loop, Class::IntraProtein, Class::InterProtein];
+    pub const ALL: [Class; 6] =
+        [Class::Unidentified, Class::Linear, Class::Loop, Class::IntraProtein, Class::InterProtein, Class::Multivalent];
 
     pub fn label(self) -> &'static str {
         match self {
+            Class::Multivalent => "crosslink, multivalent",
             Class::InterProtein => "crosslink, between proteins",
             Class::IntraProtein => "crosslink, within a protein",
             Class::Loop => "loop-link",
@@ -44,10 +48,11 @@ impl Class {
     }
 
     /// Fill colour: crosslinks between proteins red (#FF523B), within a
-    /// protein orange (#FF9D35), loop-links pink; linear peptides blue,
-    /// unidentified precursors grey
+    /// protein orange (#FF9D35), multivalent green (#6FB120), loop-links pink;
+    /// linear peptides blue, unidentified precursors grey
     pub fn color(self) -> Color32 {
         match self {
+            Class::Multivalent => Color32::from_rgb(0x6F, 0xB1, 0x20),
             Class::InterProtein => Color32::from_rgb(0xFF, 0x52, 0x3B),
             Class::IntraProtein => Color32::from_rgb(0xFF, 0x9D, 0x35),
             Class::Loop => Color32::from_rgb(204, 121, 167),
@@ -68,7 +73,7 @@ impl Class {
     }
 
     pub fn is_crosslink(self) -> bool {
-        matches!(self, Class::InterProtein | Class::IntraProtein | Class::Loop)
+        matches!(self, Class::InterProtein | Class::IntraProtein | Class::Loop | Class::Multivalent)
     }
 }
 
@@ -148,6 +153,7 @@ fn class_of(m: &Match) -> Class {
         _ if !identified => Class::Unidentified,
         Kind::Linear => Class::Linear,
         Kind::Loop => Class::Loop,
+        Kind::Multi => Class::Multivalent,
         Kind::Crosslink if m.intra_protein => Class::IntraProtein,
         Kind::Crosslink => Class::InterProtein,
     }
@@ -350,6 +356,98 @@ pub fn svg(points: &[Point], opts: &MobiligramOptions) -> String {
     svg
 }
 
+/// An MS file name without its extension, safe in a file name:
+/// `Bruker.d` → `Bruker`, `run_01.mzML.gz` → `run_01`, `My run.raw` → `My_run`
+pub fn file_stem(source: &str) -> String {
+    let name = source.strip_suffix(".gz").unwrap_or(source);
+    let name = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && (1..=5).contains(&ext.len()) && ext.bytes().all(|b| b.is_ascii_alphanumeric()) => stem,
+        _ => name,
+    };
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
+/// Folder within the results folder that a search writes its mobiligrams to
+pub const FOLDER: &str = "Mobiligrams";
+/// Name of the mobiligram of every MS file together
+pub const COMBINED: &str = "Combined_Mobiligram";
+
+/// File name (without extension) of a mobiligram: `<MS file>_MG` for one MS
+/// file, `Combined_Mobiligram` for all of them
+pub fn figure_name(file: Option<&str>) -> String {
+    match file {
+        Some(f) => format!("{}_MG", file_stem(f)),
+        None => COMBINED.to_string(),
+    }
+}
+
+/// The figure title: `Mobiligram · Bruker.d · 14551 precursors`, or
+/// `Combined mobiligram · 3 files · 40112 precursors`
+pub fn title(points: &[Point], opts: &MobiligramOptions) -> String {
+    let n = selected(points, opts).len();
+    match &opts.file {
+        Some(f) => format!("Mobiligram · {f} · {n} precursors"),
+        None => {
+            let files = ms_files(points).len();
+            let s = if files == 1 { "" } else { "s" };
+            format!("Combined mobiligram · {files} file{s} · {n} precursors")
+        }
+    }
+}
+
+/// The MS files the precursors come from, sorted
+pub fn ms_files(points: &[Point]) -> Vec<&str> {
+    let mut files: Vec<&str> = points.iter().map(|p| p.file.as_str()).collect();
+    files.sort_unstable();
+    files.dedup();
+    files
+}
+
+/// The MS file a mobiligram of `file` (`None`: all files) is of: `file`
+/// itself, or the only MS file when there is just one; `None` means a
+/// combined figure of several files
+pub fn figure_file(points: &[Point], file: Option<&str>) -> Option<String> {
+    match (file, ms_files(points).as_slice()) {
+        (Some(f), _) => Some(f.to_string()),
+        (None, [only]) => Some(only.to_string()),
+        (None, _) => None,
+    }
+}
+
+/// After a search: the mobiligrams of a results folder, written to its
+/// [`FOLDER`] folder as SVG and PDF (all precursors, white background, with a
+/// title): `<MS file>_MG` for every MS file with ion mobility and, when there
+/// are several, `Combined_Mobiligram` of all of them (for one MS file it would
+/// show the same). MS files without ion mobility (anything but timsTOF) get
+/// none. Returns the files written.
+pub fn write_figures(folder: &Path) -> Result<Vec<PathBuf>, String> {
+    let results = Results::load(folder)?;
+    let points = points(&results);
+    if points.is_empty() {
+        return Ok(Vec::new());
+    }
+    let files = ms_files(&points);
+    let dir = folder.join(FOLDER);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let combined = (files.len() > 1).then_some(None);
+    let figures = files.iter().map(|f| Some(f.to_string())).chain(combined);
+    let mut written = Vec::new();
+    for file in figures {
+        let name = figure_name(file.as_deref());
+        let mut opts = MobiligramOptions { background: true, title: None, unidentified: true, file };
+        opts.title = Some(title(&points, &opts));
+        let svg = svg(&points, &opts);
+        for format in [figure::Format::Svg, figure::Format::Pdf] {
+            let path = dir.join(format!("{name}.{}", format.extension()));
+            figure::export(&svg, format, 300, true, &path)?;
+            written.push(path);
+        }
+    }
+    Ok(written)
+}
+
 fn hex(c: Color32) -> String {
     format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
 }
@@ -397,9 +495,12 @@ mod test {
             point(855.4, 1.02, 4, Class::InterProtein),
             point(901.9, 1.05, 4, Class::IntraProtein),
             point(1002.2, 1.10, 5, Class::Loop),
+            point(1150.6, 1.12, 3, Class::Multivalent),
         ];
         let with = svg(&points, &options(true));
-        assert_eq!(with.matches("<use xlink:href=\"#z").count(), 6 + 5 + 4, "points, colour and charge keys");
+        assert_eq!(with.matches("<use xlink:href=\"#z").count(), 7 + 6 + 4, "points, colour and charge keys");
+        // multivalent crosslinks in #6FB120, outlined like the other crosslinks
+        assert!(with.contains(r##"<g fill="#6fb120" stroke="#222222""##) && with.contains("multivalent"));
         for class in Class::ALL {
             assert!(with.contains(&hex(class.color())), "{class:?}");
         }
@@ -413,7 +514,7 @@ mod test {
         assert!(legend.contains(">loop-link</text>") && legend.contains("n = 0"));
         let without = svg(&points, &options(false));
         assert!(!without.contains("not identified"));
-        assert_eq!(without.matches("<use xlink:href=\"#z").count(), 5 + 4 + 4);
+        assert_eq!(without.matches("<use xlink:href=\"#z").count(), 6 + 5 + 4);
 
         // renders, and converts to a one-page PDF
         let image = figure::rasterize(&with, 150).unwrap();
@@ -451,6 +552,92 @@ mod test {
                 figure::export(&svg, format, 150, background, &path).unwrap();
                 println!("{} ({} kB)", path.display(), std::fs::metadata(&path).unwrap().len() / 1024);
             }
+        }
+    }
+
+    /// A results folder: `results.json` and a `results.sage.tsv` with these
+    /// (file, ion mobility) rows
+    fn results_folder(name: &str, rows: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sage-gui-mobiligram-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("results.json"), r#"{"mzml_paths": ["a.d", "b.d"]}"#).unwrap();
+        let mut tsv = String::from(
+            "peptide\tproteins\tfilename\tscannr\trank\tlabel\texpmass\tcalcmass\tcharge\thyperscore\trt\tion_mobility\tspectrum_q\tpeptide_q\n",
+        );
+        for (i, (file, im)) in rows.iter().enumerate() {
+            let mass = 1000.0 + 100.0 * i as f64;
+            tsv.push_str(&format!("PEPTIDEK\tsp|P1|X\t{file}\t{i}\t1\t1\t{mass}\t{mass}\t2\t30\t10\t{im}\t0.001\t0.001\n"));
+        }
+        std::fs::write(dir.join("results.sage.tsv"), tsv).unwrap();
+        dir
+    }
+
+    #[test]
+    fn search_writes_mobiligram_files() {
+        // two timsTOF runs: one figure per MS file and the combined one, as SVG
+        // and PDF, in the Mobiligrams folder
+        let dir = results_folder("tims", &[("a.d", "0.91"), ("a.d", "1.02"), ("b.d", "0.95")]);
+        let written = write_figures(&dir).unwrap();
+        assert!(written.iter().all(|p| p.parent() == Some(dir.join("Mobiligrams").as_path())));
+        let mut names: Vec<String> = written.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["Combined_Mobiligram.pdf", "Combined_Mobiligram.svg", "a_MG.pdf", "a_MG.svg", "b_MG.pdf", "b_MG.svg"]
+        );
+        let figures = dir.join("Mobiligrams");
+        let combined = std::fs::read_to_string(figures.join("Combined_Mobiligram.svg")).unwrap();
+        assert!(combined.contains("Combined mobiligram · 2 files · 3 precursors"));
+        assert!(std::fs::read_to_string(figures.join("a_MG.svg")).unwrap().contains("Mobiligram · a.d · 2 precursors"));
+        assert!(std::fs::read(figures.join("Combined_Mobiligram.pdf")).unwrap().starts_with(b"%PDF"));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // one run: its _MG figure only (a combined one would show the same)
+        let dir = results_folder("one", &[("a.d", "0.91"), ("a.d", "1.02")]);
+        let mut names: Vec<String> = write_figures(&dir)
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a_MG.pdf", "a_MG.svg"]);
+        assert!(!dir.join("Mobiligrams").join("Combined_Mobiligram.svg").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // the viewer's "all files" names and titles follow: the only file, or combined
+        let one = [point(500.0, 0.8, 2, Class::Linear)];
+        assert_eq!(figure_file(&one, None).as_deref(), Some("run.d"));
+        let mut two = one.to_vec();
+        two.push(Point { file: "other.d".into(), ..point(600.0, 0.9, 2, Class::Linear) });
+        assert_eq!(figure_file(&two, None), None);
+        assert_eq!(figure_file(&two, Some("other.d")).as_deref(), Some("other.d"));
+
+        // no ion mobility (e.g. Orbitrap mzML): nothing is written, no folder made
+        let dir = results_folder("orbitrap", &[("a.d", "0"), ("a.d", "0")]);
+        assert!(write_figures(&dir).unwrap().is_empty());
+        assert!(!dir.join("Mobiligrams").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn figure_names_come_from_the_ms_files() {
+        assert_eq!(figure_name(Some("Bruker.d")), "Bruker_MG");
+        assert_eq!(figure_name(Some("20261103_PolII_DSSO_01.d")), "20261103_PolII_DSSO_01_MG");
+        assert_eq!(figure_name(Some("run_01.mzML.gz")), "run_01_MG");
+        assert_eq!(figure_name(Some("My run.raw")), "My_run_MG");
+        assert_eq!(figure_name(Some("sample.v2.mgf")), "sample_v2_MG");
+        assert_eq!(figure_name(None), "Combined_Mobiligram");
+    }
+
+    /// Write the mobiligram files into an existing results folder
+    /// (`SAGE_GUI_RESULTS`), as a finished search does
+    #[test]
+    #[ignore]
+    fn write_real_figures() {
+        let folder = std::env::var("SAGE_GUI_RESULTS").expect("set SAGE_GUI_RESULTS");
+        for path in write_figures(std::path::Path::new(&folder)).unwrap() {
+            println!("{} ({} kB)", path.display(), std::fs::metadata(&path).unwrap().len() / 1024);
         }
     }
 

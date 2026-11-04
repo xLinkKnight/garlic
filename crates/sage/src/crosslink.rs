@@ -54,6 +54,11 @@ const MIN_SEED_PEAKS: u16 = 2;
 const MAX_CHAINS_PER_SIDE: usize = 10;
 /// Safety valve for absurdly wide precursor tolerances
 const MAX_PARTNERS_PER_SEED: usize = 5_000;
+/// Multivalent search: most linkers per species
+pub const MAX_VALENCY: u8 = 4;
+
+#[path = "crosslink_multi.rs"]
+mod multi;
 
 fn default_residues() -> String {
     "K".into()
@@ -304,6 +309,13 @@ pub struct CrosslinkSettings {
     /// Also search for loop-links (both ends of the linker on one peptide)
     #[serde(default = "default_true")]
     pub loop_links: bool,
+    /// Multivalent crosslinks: also search species held together by 2 up to
+    /// this many linkers (2–4): several links between two peptides (`a2b`),
+    /// chains and branches of three or more peptides (`a1b1c`), copies of one
+    /// peptide (`a2a`, `a1a1b`). Non-cleavable and MS-cleavable linkers. The search space
+    /// grows steeply; meant for small protein sets. `None`: off.
+    #[serde(default)]
+    pub multivalent: Option<u8>,
     /// Number of top-scoring linear peptides per spectrum used as seeds
     #[serde(default = "default_candidates")]
     pub candidates: usize,
@@ -348,6 +360,7 @@ impl Default for CrosslinkSettings {
             protein_nterm: true,
             allow_cterm_residue: false,
             loop_links: true,
+            multivalent: None,
             candidates: default_candidates(),
             min_chain_peaks: default_chain_peaks(),
             require_complete_doublets: false,
@@ -462,6 +475,11 @@ impl CrosslinkSettings {
         }
         if self.min_chain_peaks == 0 {
             return Err("crosslink.min_chain_peaks must be at least 1".into());
+        }
+        if let Some(n) = self.multivalent {
+            if !(2..=MAX_VALENCY).contains(&n) {
+                return Err(format!("crosslink.multivalent must be 2 to {MAX_VALENCY} (linkers per species), got {n}"));
+            }
         }
         Ok(())
     }
@@ -601,6 +619,83 @@ pub enum LinkKind {
     Inter,
     /// One peptide linked to itself
     Loop,
+    /// Multivalent: two or more linkers holding peptides together (several
+    /// links between two peptides, or three or more peptides); see [`Species`]
+    Multi,
+}
+
+/// A multivalent crosslinked species: peptides (copies of one peptide count
+/// separately) and the links between them
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct Species {
+    pub peptides: Vec<PeptideIx>,
+    /// `(peptide, site, peptide, site)`: indices into `peptides` and 0-based
+    /// link residues
+    pub links: Vec<(u8, u16, u8, u16)>,
+    /// Matched fragment ions per peptide, and those carrying a linker
+    pub matched: Vec<u16>,
+    pub linked: Vec<u16>,
+    /// Decoy peptides in the species
+    pub decoys: u8,
+    /// MS-cleavable linkers: peaks of parts of the species freed by breaking a
+    /// single linker (`b1c` + stub from `a1b1c`), the evidence for which
+    /// peptides are linked to which; 0 otherwise
+    pub topology_peaks: u16,
+}
+
+impl Species {
+    /// Topology in letters: distinct peptides `a`, `b`, … in order, links as
+    /// their count: `a2b`, `a1b1c`, `a1a1b`; a branched species lists its
+    /// edges, `a1b,b1c,b1d`
+    pub fn topology(&self) -> String {
+        let mut letters: Vec<PeptideIx> = Vec::new();
+        let letter = |ix: PeptideIx, letters: &mut Vec<PeptideIx>| {
+            let i = letters.iter().position(|&l| l == ix).unwrap_or_else(|| {
+                letters.push(ix);
+                letters.len() - 1
+            });
+            (b'a' + i as u8) as char
+        };
+        let n = self.peptides.len();
+        // edge multiplicities between nodes
+        let mut count: Vec<((u8, u8), usize)> = Vec::new();
+        for &(a, _, b, _) in &self.links {
+            let key = (a.min(b), a.max(b));
+            match count.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, c)) => *c += 1,
+                None => count.push((key, 1)),
+            }
+        }
+        count.sort();
+        let degree = |v: u8| count.iter().filter(|((a, b), _)| *a == v || *b == v).count();
+        // a chain: every peptide meets at most two others; walk it from an end
+        let is_chain = (0..n as u8).all(|v| degree(v) <= 2) && count.len() + 1 == n;
+        if is_chain {
+            let start = (0..n as u8).find(|&v| degree(v) <= 1).unwrap_or(0);
+            let mut out = String::new();
+            let (mut prev, mut cur) = (u8::MAX, start);
+            for _ in 0..n {
+                out.push(letter(self.peptides[cur as usize], &mut letters));
+                let next = count
+                    .iter()
+                    .find(|((a, b), _)| (*a == cur && *b != prev) || (*b == cur && *a != prev));
+                let Some(&((a, b), k)) = next else { break };
+                out.push_str(&k.to_string());
+                prev = cur;
+                cur = if a == cur { b } else { a };
+            }
+            return out;
+        }
+        let parts: Vec<String> = count
+            .iter()
+            .map(|&((a, b), k)| {
+                let la = letter(self.peptides[a as usize], &mut letters);
+                let lb = letter(self.peptides[b as usize], &mut letters);
+                format!("{la}{k}{lb}")
+            })
+            .collect();
+        parts.join(",")
+    }
 }
 
 /// Target/decoy composition of a match. For loop-links (one peptide) the class
@@ -668,6 +763,9 @@ pub struct CrosslinkMatch {
     pub ims: f32,
     pub spectrum_q: f32,
     pub crosslink_q: f32,
+    /// Multivalent species (`kind == Multi`): every peptide and link. `alpha`
+    /// / `beta` and their sites are then the species' first link.
+    pub species: Option<Box<Species>>,
 }
 
 static CSM_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -935,6 +1033,8 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
             hits.select_nth_unstable_by(k - 1, |a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
             hits.truncate(k);
         }
+        // best first (the multivalent search takes the first few)
+        hits.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         hits.into_iter().map(|(_, ix)| PeptideIx(ix)).collect()
     }
 
@@ -1420,7 +1520,7 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
     }
 
     /// Rank candidate matches for one spectrum and keep the best `report_psms`
-    fn finalize(&self, query: &ProcessedSpectrum, mut found: Vec<CrosslinkMatch>, pairs_scored: u32) -> Vec<CrosslinkMatch> {
+    fn finalize(&self, query: &ProcessedSpectrum, mut found: Vec<CrosslinkMatch>, mut pairs_scored: u32) -> Vec<CrosslinkMatch> {
         found.retain(|m| m.hyperscore.is_finite());
         if !self.settings.is_cleavable() {
             // cleavable links are evidenced by their stub doublets instead
@@ -1429,6 +1529,13 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
             }
             let min = self.settings.min_linked_peaks;
             found.retain(|m| m.alpha_linked >= min && (m.beta.is_none() || m.beta_linked >= min));
+        }
+        // multivalent species compete with the pairs and loop-links for the spectrum
+        // (their linked ions are checked per peptide while scoring)
+        if self.settings.multivalent.is_some() {
+            let (multi, scored) = self.score_multivalent(query);
+            found.extend(multi.into_iter().filter(|m| m.hyperscore.is_finite()));
+            pairs_scored += scored;
         }
         found.sort_by(|a, b| b.hyperscore.total_cmp(&a.hyperscore));
         found.truncate(self.scorer.report_psms.max(1));
@@ -1919,28 +2026,74 @@ fn q_from_sorted(classes: &[PairClass], loops: bool) -> Vec<f32> {
     q
 }
 
-/// FDR groups: loop-links, intra-protein links, inter-protein links.
-/// Intra-protein links are far more likely to be true than inter-protein
-/// links, so pooling them would hide inter-protein false positives
-/// (Fischer & Rappsilber, Anal. Chem. 2017).
+/// q-values of multivalent species sorted by score (best first), from
+/// `(any decoy peptide, number of distinct peptides)` of each.
+///
+/// A random species of `n` distinct peptides is all-target with chance
+/// `1 / 2^n`, so each species with a decoy stands for `1 / (2^n - 1)` false
+/// targets. For pairs that is `(TD + DD) / 3`, which `TD - DD` also estimates;
+/// unlike `N1 - N2 + …` it never turns negative, and copies of one peptide
+/// (`a2a`: one distinct peptide, decoy or not) count like a single peptide.
+fn q_multivalent(species: &[(bool, u8)]) -> Vec<f32> {
+    let (mut targets, mut false_hits) = (0f64, 0f64);
+    let mut q = Vec::with_capacity(species.len());
+    for &(decoy, distinct) in species {
+        if decoy {
+            false_hits += 1.0 / ((1u32 << distinct.clamp(1, 16)) - 1) as f64;
+        } else {
+            targets += 1.0;
+        }
+        q.push((false_hits / targets.max(1.0)).clamp(0.0, 1.0) as f32);
+    }
+    let mut running = 1.0f32;
+    for v in q.iter_mut().rev() {
+        running = running.min(*v);
+        *v = running;
+    }
+    q
+}
+
+/// FDR groups: loop-links, intra-protein links, inter-protein links,
+/// multivalent species. Intra-protein links are far more likely to be true
+/// than inter-protein links, so pooling them would hide inter-protein false
+/// positives (Fischer & Rappsilber, Anal. Chem. 2017).
 fn fdr_group(m: &CrosslinkMatch) -> usize {
     match (m.kind, m.intra_protein) {
         (LinkKind::Loop, _) => 0,
         (LinkKind::Inter, true) => 1,
         (LinkKind::Inter, false) => 2,
+        (LinkKind::Multi, _) => 3,
     }
 }
 
 /// Canonical identity of a unique crosslink (peptide pair + link sites),
-/// independent of which chain is called alpha
-fn link_key(m: &CrosslinkMatch) -> (u32, u16, u32, u16) {
+/// independent of which chain is called alpha; multivalent species add a
+/// hash of all their peptides and links
+fn link_key(m: &CrosslinkMatch) -> (u32, u16, u32, u16, u64) {
+    if let Some(s) = &m.species {
+        use std::hash::{Hash, Hasher};
+        // links by (peptide, residue) at both ends, ends and links in order
+        let mut links: Vec<((u32, u16), (u32, u16))> = s
+            .links
+            .iter()
+            .map(|&(a, sa, b, sb)| {
+                let x = (s.peptides[a as usize].0, sa);
+                let y = (s.peptides[b as usize].0, sb);
+                if x <= y { (x, y) } else { (y, x) }
+            })
+            .collect();
+        links.sort_unstable();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        links.hash(&mut h);
+        return (u32::MAX, 0, u32::MAX, 0, h.finish());
+    }
     match m.beta {
-        None => (m.alpha.0, m.alpha_site, u32::MAX, m.beta_site),
+        None => (m.alpha.0, m.alpha_site, u32::MAX, m.beta_site, 0),
         Some(b) => {
             let x = (m.alpha.0, m.alpha_site);
             let y = (b.0, m.beta_site);
             let (lo, hi) = if x <= y { (x, y) } else { (y, x) };
-            (lo.0, lo.1, hi.0, hi.1)
+            (lo.0, lo.1, hi.0, hi.1, 0)
         }
     }
 }
@@ -1952,16 +2105,36 @@ fn link_key(m: &CrosslinkMatch) -> (u32, u16, u32, u16) {
 pub fn assign_q_values(matches: &mut [CrosslinkMatch]) -> (usize, usize) {
     let (mut csm_count, mut link_count) = (0, 0);
 
-    for group in 0..3 {
+    for group in 0..4 {
         let loops = group == 0;
+        // q-values of matches sorted best first, by the group's estimate
+        let q_of = |sorted: &[usize], matches: &[CrosslinkMatch]| {
+            if group == 3 {
+                let species: Vec<(bool, u8)> = sorted
+                    .iter()
+                    .map(|&i| match &matches[i].species {
+                        Some(s) => {
+                            let mut distinct = s.peptides.clone();
+                            distinct.sort_unstable();
+                            distinct.dedup();
+                            (s.decoys > 0, distinct.len() as u8)
+                        }
+                        None => (matches[i].class != PairClass::TT, 2),
+                    })
+                    .collect();
+                q_multivalent(&species)
+            } else {
+                let classes: Vec<PairClass> = sorted.iter().map(|&i| matches[i].class).collect();
+                q_from_sorted(&classes, loops)
+            }
+        };
 
         // CSM level
         let mut idx = (0..matches.len())
             .filter(|&i| fdr_group(&matches[i]) == group)
             .collect::<Vec<_>>();
         idx.sort_by(|&a, &b| matches[b].hyperscore.total_cmp(&matches[a].hyperscore));
-        let classes = idx.iter().map(|&i| matches[i].class).collect::<Vec<_>>();
-        for (&i, q) in idx.iter().zip(q_from_sorted(&classes, loops)) {
+        for (&i, q) in idx.iter().zip(q_of(&idx, matches)) {
             matches[i].spectrum_q = q;
             if q <= 0.01 && matches[i].class == PairClass::TT {
                 csm_count += 1;
@@ -1969,7 +2142,7 @@ pub fn assign_q_values(matches: &mut [CrosslinkMatch]) -> (usize, usize) {
         }
 
         // Unique-crosslink level: best CSM per link
-        let mut best: HashMap<(u32, u16, u32, u16), usize> = HashMap::new();
+        let mut best: HashMap<(u32, u16, u32, u16, u64), usize> = HashMap::new();
         for &i in &idx {
             best.entry(link_key(&matches[i]))
                 .and_modify(|j| {
@@ -1986,9 +2159,8 @@ pub fn assign_q_values(matches: &mut [CrosslinkMatch]) -> (usize, usize) {
                 .total_cmp(&matches[a].hyperscore)
                 .then(link_key(&matches[a]).cmp(&link_key(&matches[b])))
         });
-        let classes = reps.iter().map(|&i| matches[i].class).collect::<Vec<_>>();
         let mut link_q = HashMap::new();
-        for (&i, q) in reps.iter().zip(q_from_sorted(&classes, loops)) {
+        for (&i, q) in reps.iter().zip(q_of(&reps, matches)) {
             link_q.insert(link_key(&matches[i]), q);
             if q <= 0.01 && matches[i].class == PairClass::TT {
                 link_count += 1;
@@ -2936,6 +3108,278 @@ mod test {
         let linear = chain_ions(&l, &db.modifications, &[Kind::B, Kind::Y], Link::Single { site: 0, shift: 0.0 });
         let query = spectrum(l.monoisotopic + cfg.linker_mass(), 3, &linear);
         assert!(CrosslinkScorer::new(&sc, &cfg).score(&query).is_empty());
+    }
+
+    /// Ions of one peptide of a multivalent species: `groups` are the
+    /// residues each group of other peptides hangs on, and the group's mass.
+    /// An ion holding only some of a group's residues does not come apart.
+    fn species_ions(p: &Peptide, mods: &Modifications, groups: &[(&[usize], f32)]) -> Vec<(Kind, f32)> {
+        let mut out = Vec::new();
+        for kind in [Kind::B, Kind::Y] {
+            for (idx, ion) in IonSeries::new(p, kind, mods).enumerate() {
+                let contains = |s: usize| if kind == Kind::B { idx >= s } else { idx < s };
+                let mut mass = ion.monoisotopic_mass;
+                let mut apart = true;
+                for (sites, shift) in groups {
+                    let held = sites.iter().filter(|&&s| contains(s)).count();
+                    if held == sites.len() {
+                        mass += shift;
+                    } else if held > 0 {
+                        apart = false;
+                    }
+                }
+                if apart {
+                    out.push((kind, mass));
+                }
+            }
+        }
+        out
+    }
+
+    fn multivalent(n: u8) -> CrosslinkSettings {
+        CrosslinkSettings { multivalent: Some(n), ..Default::default() }
+    }
+
+    fn sites_of(db: &IndexedDatabase, s: &Species) -> Vec<(String, Vec<u16>)> {
+        let mut out: Vec<(String, Vec<u16>)> = (0..s.peptides.len())
+            .map(|x| {
+                let mut sites: Vec<u16> = s
+                    .links
+                    .iter()
+                    .flat_map(|&(a, sa, b, sb)| [(a, sa), (b, sb)])
+                    .filter(|&(p, _)| p as usize == x)
+                    .map(|(_, site)| site)
+                    .collect();
+                sites.sort_unstable();
+                (String::from_utf8(db[s.peptides[x]].sequence.to_vec()).unwrap(), sites)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn finds_doubly_linked_pair() {
+        // a2b: two DSS links between the same two peptides (K10, K19 on a; K9, K14 on b)
+        let a = peptide("AEFGHDSTWKLMNPQSTVKGYEDFAR", "PROT_A", Position::Internal);
+        let b = peptide("TDYHFPNEKWLIGKSTPR", "PROT_B", Position::Internal);
+        let mut targets = distractors(400);
+        targets.push(a.clone());
+        targets.push(b.clone());
+        let db = database(targets);
+        let sc = scorer(&db);
+        let cfg = multivalent(2);
+        let mods = &db.modifications;
+        let mut ions = species_ions(&a, mods, &[(&[9, 18], b.monoisotopic + 2.0 * DSS)]);
+        ions.extend(species_ions(&b, mods, &[(&[8, 13], a.monoisotopic + 2.0 * DSS)]));
+        let query = spectrum(a.monoisotopic + b.monoisotopic + 2.0 * DSS, 4, &ions);
+
+        let hits = CrosslinkScorer::new(&sc, &cfg).score(&query);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        let hit = &hits[0];
+        assert_eq!(hit.kind, LinkKind::Multi);
+        assert_eq!(hit.class, PairClass::TT);
+        assert!(hit.precursor_ppm.abs() < 1.0);
+        let s = hit.species.as_ref().unwrap();
+        assert_eq!(s.topology(), "a2b");
+        assert_eq!(
+            sites_of(&db, s),
+            vec![("AEFGHDSTWKLMNPQSTVKGYEDFAR".into(), vec![9, 18]), ("TDYHFPNEKWLIGKSTPR".into(), vec![8, 13])]
+        );
+        assert!(s.linked.iter().all(|&l| l >= cfg.min_linked_peaks));
+
+        // off by default: a two-linker species is not looked for
+        assert!(CrosslinkScorer::new(&sc, &CrosslinkSettings::default()).score(&query).is_empty());
+    }
+
+    #[test]
+    fn finds_three_peptide_chain() {
+        // a1b1c: a (K4) – b (K10) and b (K19) – c (K10)
+        let a = peptide("GLEKVSTAAMQR", "PROT_A", Position::Internal);
+        let b = peptide("AEFGHDSTWKLMNPQSTVKGYEDFAR", "PROT_B", Position::Internal);
+        let c = peptide("TDYHFPNEWKLIR", "PROT_C", Position::Internal);
+        let mut targets = distractors(400);
+        targets.extend([a.clone(), b.clone(), c.clone()]);
+        let db = database(targets);
+        let sc = scorer(&db);
+        let cfg = multivalent(2);
+        let mods = &db.modifications;
+        let (ma, mb, mc) = (a.monoisotopic, b.monoisotopic, c.monoisotopic);
+        let mut ions = species_ions(&a, mods, &[(&[3], mb + mc + 2.0 * DSS)]);
+        ions.extend(species_ions(&b, mods, &[(&[9], ma + DSS), (&[18], mc + DSS)]));
+        ions.extend(species_ions(&c, mods, &[(&[9], ma + mb + 2.0 * DSS)]));
+        let query = spectrum(ma + mb + mc + 2.0 * DSS, 4, &ions);
+
+        let hits = CrosslinkScorer::new(&sc, &cfg).score(&query);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        let s = hits[0].species.as_ref().unwrap();
+        assert_eq!(hits[0].kind, LinkKind::Multi);
+        assert_eq!(s.peptides.len(), 3);
+        assert_eq!(s.links.len(), 2);
+        // b in the middle: a chain of three distinct peptides
+        assert_eq!(s.topology(), "a1b1c");
+        assert_eq!(
+            sites_of(&db, s),
+            vec![
+                ("AEFGHDSTWKLMNPQSTVKGYEDFAR".into(), vec![9, 18]),
+                ("GLEKVSTAAMQR".into(), vec![3]),
+                ("TDYHFPNEWKLIR".into(), vec![9]),
+            ]
+        );
+    }
+
+    #[test]
+    fn multivalent_search_keeps_plain_pairs() {
+        // an ordinary crosslink stays a pair with the multivalent search on
+        let (db, a, b) = pair_fixture();
+        let sc = scorer(&db);
+        let cfg = multivalent(3);
+        let query = pair_spectrum(&db, &a, &b, 3, 9);
+        let hits = CrosslinkScorer::new(&sc, &cfg).score(&query);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].kind, LinkKind::Inter);
+    }
+
+    #[test]
+    fn species_topology_names() {
+        let s = |peptides: &[u32], links: &[(u8, u8)]| Species {
+            peptides: peptides.iter().map(|&p| PeptideIx(p)).collect(),
+            links: links.iter().map(|&(a, b)| (a, 0, b, 0)).collect(),
+            ..Default::default()
+        };
+        assert_eq!(s(&[1, 2], &[(0, 1), (0, 1)]).topology(), "a2b");
+        assert_eq!(s(&[1, 1], &[(0, 1), (0, 1)]).topology(), "a2a");
+        assert_eq!(s(&[1, 1, 2], &[(0, 1), (1, 2)]).topology(), "a1a1b");
+        assert_eq!(s(&[1, 2, 2], &[(0, 1), (1, 2)]).topology(), "a1b1b");
+        assert_eq!(s(&[5, 6, 7], &[(0, 1), (1, 2), (1, 2)]).topology(), "a1b2c");
+        // the chain is walked from an end and lettered in that order, whatever
+        // the order of the peptides
+        assert_eq!(s(&[5, 6, 7], &[(0, 2), (1, 2)]).topology(), "a1b1c");
+        assert_eq!(s(&[1, 2, 3, 4], &[(0, 1), (1, 2), (1, 3)]).topology(), "a1b,b1c,b1d");
+    }
+
+    #[test]
+    fn multivalent_fdr_and_settings() {
+        // two distinct peptides: each decoy species is 1/3 false target, as
+        // (TD + DD) / 3 for pairs
+        let (t, d) = ((false, 2), (true, 2));
+        let q = q_multivalent(&[t, t, t, d, t, d, t, d]);
+        assert_eq!(q[0], 0.0);
+        assert!((q[7] - 1.0 / 5.0).abs() < 1e-6, "{q:?}");
+        // three distinct peptides: 1/7 each; copies of one peptide (a2a): 1 each
+        assert!((q_multivalent(&[(false, 3), (true, 3)])[1] - 1.0 / 7.0).abs() < 1e-6);
+        assert_eq!(q_multivalent(&[(false, 1), (true, 1)])[1], 1.0);
+        // many all-decoy species never push the estimate below zero
+        let q = q_multivalent(&[t, (true, 2), (true, 2), (true, 2), t]);
+        assert!(q.iter().all(|&v| v > 0.0 || v == 0.0) && q[4] > 0.4, "{q:?}");
+        assert!(multivalent(2).validate().is_ok());
+        assert!(multivalent(4).validate().is_ok());
+        assert!(multivalent(5).validate().unwrap_err().contains("2 to 4"));
+        // MS-cleavable linkers too
+        assert!(CrosslinkSettings { multivalent: Some(3), ..dsso() }.validate().is_ok());
+        let cfg: CrosslinkSettings = serde_json::from_str(r#"{"multivalent": 3}"#).unwrap();
+        assert_eq!(cfg.multivalent, Some(3));
+        let off: CrosslinkSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(off.multivalent, None);
+    }
+
+    /// Ions of one peptide of a DSSO species whose linkers all broke: each
+    /// link residue keeps the stub given for it, and an ion carries the stubs
+    /// of the residues it holds
+    fn cleaved_species_ions(p: &Peptide, mods: &Modifications, stubs: &[(usize, f32)]) -> Vec<(Kind, f32)> {
+        let mut out = Vec::new();
+        for kind in [Kind::B, Kind::Y] {
+            for (idx, ion) in IonSeries::new(p, kind, mods).enumerate() {
+                let contains = |s: usize| if kind == Kind::B { idx >= s } else { idx < s };
+                let shift: f32 = stubs.iter().filter(|(s, _)| contains(*s)).map(|(_, m)| m).sum();
+                out.push((kind, ion.monoisotopic_mass + shift));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn finds_cleavable_doubly_linked_pair() {
+        // a2b with DSSO: each link breaks into alkene (A) on one side, sulfenic
+        // acid (S) on the other
+        let a = peptide("AEFGHDSTWKLMNPQSTVKGYEDFAR", "PROT_A", Position::Internal);
+        let b = peptide("TDYHFPNEKWLIGKSTPR", "PROT_B", Position::Internal);
+        let mut targets = distractors(400);
+        targets.push(a.clone());
+        targets.push(b.clone());
+        let db = database(targets);
+        let sc = scorer(&db);
+        let cfg = CrosslinkSettings { multivalent: Some(2), ..dsso() };
+        let s = cfg.stubs().unwrap();
+        let mods = &db.modifications;
+        let mut ions = cleaved_species_ions(&a, mods, &[(9, s.short), (18, s.long)]);
+        ions.extend(cleaved_species_ions(&b, mods, &[(8, s.long), (13, s.short)]));
+        let fragments = ions.clone();
+        // the free peptides with both their stubs: a triplet member pair for a, one for b
+        ions.push((Kind::B, a.monoisotopic + s.short + s.long));
+        ions.push((Kind::B, a.monoisotopic + 2.0 * s.long));
+        ions.push((Kind::B, b.monoisotopic + s.short + s.long));
+        let precursor = a.monoisotopic + b.monoisotopic + 2.0 * cfg.linker_mass();
+
+        let hits = CrosslinkScorer::new(&sc, &cfg).score(&spectrum(precursor, 4, &ions));
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        let hit = &hits[0];
+        assert_eq!(hit.kind, LinkKind::Multi);
+        assert_eq!(hit.class, PairClass::TT);
+        assert!(hit.stub_peaks >= 3, "stub peaks {}", hit.stub_peaks);
+        let sp = hit.species.as_ref().unwrap();
+        assert_eq!(sp.topology(), "a2b");
+        assert_eq!(
+            sites_of(&db, sp),
+            vec![("AEFGHDSTWKLMNPQSTVKGYEDFAR".into(), vec![9, 18]), ("TDYHFPNEKWLIGKSTPR".into(), vec![8, 13])]
+        );
+
+        // the same fragments without any peptide + stubs peak: not reported
+        assert!(CrosslinkScorer::new(&sc, &cfg).score(&spectrum(precursor, 4, &fragments)).is_empty());
+    }
+
+    #[test]
+    fn finds_cleavable_three_peptide_chain() {
+        // a1b1c with DSSO: a (K4) – b (K10), b (K19) – c (K10)
+        let a = peptide("GLEKVSTAAMQR", "PROT_A", Position::Internal);
+        let b = peptide("AEFGHDSTWKLMNPQSTVKGYEDFAR", "PROT_B", Position::Internal);
+        let c = peptide("TDYHFPNEWKLIR", "PROT_C", Position::Internal);
+        let mut targets = distractors(400);
+        targets.extend([a.clone(), b.clone(), c.clone()]);
+        let db = database(targets);
+        let sc = scorer(&db);
+        let cfg = CrosslinkSettings { multivalent: Some(2), ..dsso() };
+        let s = cfg.stubs().unwrap();
+        let mods = &db.modifications;
+        let (ma, mb, mc, l) = (a.monoisotopic, b.monoisotopic, c.monoisotopic, cfg.linker_mass());
+        let mut ions = cleaved_species_ions(&a, mods, &[(3, s.short)]);
+        ions.extend(cleaved_species_ions(&b, mods, &[(9, s.long), (18, s.short)]));
+        ions.extend(cleaved_species_ions(&c, mods, &[(9, s.long)]));
+        // free peptides with their stubs (a doublet for a)
+        ions.push((Kind::B, ma + s.short));
+        ions.push((Kind::B, ma + s.long));
+        ions.push((Kind::B, mb + s.long + s.short));
+        ions.push((Kind::B, mc + s.long));
+        // only one linker broken: b1c with b's stub, a1b with b's stub
+        ions.push((Kind::B, mb + mc + l + s.long));
+        ions.push((Kind::B, ma + mb + l + s.short));
+
+        let hits = CrosslinkScorer::new(&sc, &cfg).score(&spectrum(ma + mb + mc + 2.0 * l, 4, &ions));
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        let sp = hits[0].species.as_ref().unwrap();
+        assert_eq!(sp.topology(), "a1b1c");
+        assert!(sp.topology_peaks >= 2, "topology peaks {}", sp.topology_peaks);
+        assert_eq!(
+            sites_of(&db, sp),
+            vec![
+                ("AEFGHDSTWKLMNPQSTVKGYEDFAR".into(), vec![9, 18]),
+                ("GLEKVSTAAMQR".into(), vec![3]),
+                ("TDYHFPNEWKLIR".into(), vec![9]),
+            ]
+        );
+        // b sits in the middle: it is linked to both a and c
+        let middle = sp.peptides.iter().position(|&ix| db[ix].sequence.len() == 26).unwrap() as u8;
+        assert!(sp.links.iter().all(|&(x, _, y, _)| x == middle || y == middle));
     }
 
     #[test]

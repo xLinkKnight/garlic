@@ -335,6 +335,9 @@ pub struct Crosslink {
     pub linear_search: bool,
     /// Non-cleavable: matched linker-carrying ions required per chain
     pub min_linked_peaks: u32,
+    /// Also search multivalent species (several linkers), up to `valency` linkers
+    pub multivalent: bool,
+    pub valency: u8,
 }
 
 impl Default for Crosslink {
@@ -366,6 +369,8 @@ impl Default for Crosslink {
             chain_survivors: 20000,
             linear_search: true,
             min_linked_peaks: 2,
+            multivalent: false,
+            valency: 2,
         }
     }
 }
@@ -476,6 +481,10 @@ impl Crosslink {
         if self.min_linked_peaks != 2 {
             m.insert("min_linked_peaks".into(), json!(self.min_linked_peaks));
         }
+        // only when on (off is Sage's default)
+        if self.multivalent {
+            m.insert("multivalent".into(), json!(self.valency));
+        }
         Value::Object(m)
     }
 
@@ -541,6 +550,10 @@ impl Crosslink {
         c.chain_survivors = u32_or(v.get("chain_survivors"), c.chain_survivors);
         c.linear_search = bool_or(v.get("linear_search"), c.linear_search);
         c.min_linked_peaks = u32_or(v.get("min_linked_peaks"), c.min_linked_peaks);
+        if let Some(n) = v.get("multivalent").and_then(Value::as_u64) {
+            c.multivalent = true;
+            c.valency = (n as u8).clamp(2, sage_core::crosslink::MAX_VALENCY);
+        }
         c
     }
 }
@@ -887,6 +900,17 @@ fn unknown_keys(obj: Option<&Map<String, Value>>, known: &[&str]) -> Map<String,
             .collect()
     })
     .unwrap_or_default()
+}
+
+/// Warning shown while the multivalent crosslink search is on
+pub fn multivalent_warning(valency: u8) -> String {
+    format!(
+        "Multivalent crosslinks (up to {valency} linkers per species): the search space is very large. \
+         Every combination of up to {} peptides and every arrangement of their links is scored, so \
+         searches take far longer and use more memory. Only recommended with a small protein subset \
+         (a purified complex of a few dozen proteins), not a proteome.",
+        valency + 1
+    )
 }
 
 /// Parse a comma separated list of numbers
@@ -1317,6 +1341,9 @@ impl Settings {
                     "Crosslink search with 0 missed cleavages finds no linkable peptides; use 2.".into(),
                 );
             }
+            if xl.multivalent {
+                warnings.push(multivalent_warning(xl.valency));
+            }
             // A fixed modification on a reactive residue (typically TMT on K) blocks every link there
             let reactive = if xl.two_sites {
                 format!("{}{}", xl.site1.residues, xl.site2.residues)
@@ -1454,6 +1481,37 @@ mod test {
         let edc = Settings::from_json(&json!({"crosslink": {"reagent": "dmtmm"}})).unwrap();
         assert!(edc.crosslink.two_sites);
         assert_eq!(edc.crosslink.site2.residues, "DE");
+    }
+
+    #[test]
+    fn multivalent_option_round_trips_and_warns() {
+        let mut s = Settings::default();
+        s.crosslink.enabled = true;
+        // off: not written, Sage's default
+        assert!(s.to_json(&[])["crosslink"].get("multivalent").is_none());
+        s.crosslink.multivalent = true;
+        s.crosslink.valency = 3;
+        let v = s.to_json(&[]);
+        assert_eq!(v["crosslink"]["multivalent"], json!(3));
+        let back = Settings::from_json(&v).unwrap();
+        assert!(back.crosslink.multivalent);
+        assert_eq!(back.crosslink.valency, 3);
+        // Sage reads the same setting
+        let core: sage_core::crosslink::CrosslinkSettings = serde_json::from_value(v["crosslink"].clone()).unwrap();
+        assert_eq!(core.multivalent, Some(3));
+        assert!(core.validate().is_ok());
+
+        // the search-space warning, for non-cleavable and MS-cleavable linkers alike
+        for reagent in [Reagent::Dss, Reagent::Dsso] {
+            s.crosslink.reagent = reagent;
+            s.crosslink.reset_stubs();
+            let (errors, warnings) = s.check();
+            assert!(errors.iter().all(|e| !e.contains("ultivalent")), "{reagent:?}: {errors:?}");
+            assert!(warnings.iter().any(|w| w.contains("search space is very large") && w.contains("small protein subset")));
+            let core: sage_core::crosslink::CrosslinkSettings =
+                serde_json::from_value(s.to_json(&[])["crosslink"].clone()).unwrap();
+            assert!(core.validate().is_ok(), "{reagent:?}");
+        }
     }
 
     #[test]

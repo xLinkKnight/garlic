@@ -12,7 +12,7 @@ mod theme;
 mod unimod;
 mod viewer;
 
-use eframe::egui::{self, Color32, ComboBox, DragValue, Response, RichText, TextEdit, Ui};
+use eframe::egui::{self, Color32, ComboBox, Response, RichText, TextEdit, Ui};
 use runner::{Job, Status, Step};
 use settings::{Backend, ModKind, Modification, Reagent, Settings, TolUnit, Tolerance, Tmt};
 use std::ops::RangeInclusive;
@@ -260,7 +260,7 @@ impl SageGui {
                 Some(system::GpuSupport::Yes(_)) => {}
                 Some(system::GpuSupport::No) => errors.push(
                     "Crosslink backend gpu: this sage.exe was built without GPU support (Files > Resources). \
-                     Choose cpu or auto, or use a sage.exe built with --features gpu."
+                     Choose cpu or auto, or rebuild sage.exe (GPU support is included by default: cargo build --release -p sage-cli)."
                         .into(),
                 ),
                 _ => warnings.push(
@@ -353,7 +353,34 @@ impl SageGui {
         tracker.update(&log, job.total.load(std::sync::atomic::Ordering::Relaxed));
         match job.status() {
             Status::Running(_) => {}
-            Status::Finished => tracker.finish(progress::State::Finished, None, &log),
+            Status::Finished if tracker.state != progress::State::Finished => {
+                // timsTOF data: the run's mobiligram next to the results
+                let mut log = log;
+                let out = tracker.plan.output_dir.clone();
+                let written = match viewer::mobiligram::write_figures(&out) {
+                    Ok(written) => written,
+                    Err(e) => {
+                        log.push(format!("mobiligram not written: {e}"));
+                        Vec::new()
+                    }
+                };
+                if !written.is_empty() {
+                    let names: Vec<String> =
+                        written.iter().filter_map(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
+                    log.push(format!(
+                        "wrote {} to {}\\ (precursor m/z against ion mobility)",
+                        names.join(", "),
+                        viewer::mobiligram::FOLDER
+                    ));
+                }
+                tracker.finish(progress::State::Finished, None, &log);
+                // listed with the search's outputs
+                for path in written {
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    tracker.outputs.push((path, size));
+                }
+            }
+            Status::Finished => {}
             Status::Cancelled => tracker.finish(progress::State::Cancelled, None, &log),
             Status::Failed(e) => tracker.finish(progress::State::Failed, Some(&e), &log),
         }
@@ -466,7 +493,7 @@ impl eframe::App for SageGui {
                         let selected = self.tab == tab;
                         let (fill, border) = progress_tab_colors(ui, state, selected);
                         let r = ui.add(
-                            egui::Button::new(name).selected(selected).fill(fill).stroke(egui::Stroke::NONE),
+                            egui::Button::new(theme::bold(name)).selected(selected).fill(fill).stroke(egui::Stroke::NONE),
                         );
                         if r.clicked() {
                             self.tab = tab;
@@ -478,7 +505,7 @@ impl eframe::App for SageGui {
                             egui::StrokeKind::Outside,
                         );
                     } else {
-                        ui.selectable_value(&mut self.tab, tab, name);
+                        ui.selectable_value(&mut self.tab, tab, theme::bold(name));
                     }
                 }
             });
@@ -638,12 +665,13 @@ fn note(ui: &mut Ui, text: &str) {
     ui.add_space(4.0);
 }
 
-fn num<T: egui::emath::Numeric>(ui: &mut Ui, v: &mut T, range: RangeInclusive<T>, speed: f64) -> Response {
-    ui.add(DragValue::new(v).range(range).speed(speed))
+/// A number typed in, or stepped by `step` with the + / − buttons
+fn num<T: egui::emath::Numeric>(ui: &mut Ui, v: &mut T, range: RangeInclusive<T>, step: f64) -> Response {
+    theme::number(ui, v, range, step, |d| d)
 }
 
 fn mass(ui: &mut Ui, v: &mut f64) -> Response {
-    ui.add(DragValue::new(v).speed(0.01).max_decimals(6).suffix(" Da"))
+    theme::number(ui, v, -10_000.0..=10_000.0, 1.0, |d| d.max_decimals(6).suffix(" Da"))
 }
 
 /// A value Sage can choose itself: unchecked writes nothing to the JSON
@@ -653,6 +681,7 @@ fn optional<T: egui::emath::Numeric>(
     fallback: T,
     auto: &str,
     range: RangeInclusive<T>,
+    step: f64,
 ) -> Response {
     let mut on = v.is_some();
     let mut r = ui.checkbox(&mut on, "set");
@@ -660,7 +689,7 @@ fn optional<T: egui::emath::Numeric>(
         *v = on.then_some(fallback);
     }
     match v {
-        Some(x) => r |= ui.add(DragValue::new(x).range(range)),
+        Some(x) => r |= theme::number(ui, x, range, step, |d| d),
         None => r |= ui.label(RichText::new(auto).weak()),
     }
     r
@@ -671,14 +700,17 @@ const CHARGE_TIP: &str = "Precursor charge states to try when the file does not 
 
 /// Precursor charge range; each bound is limited by the other so min <= max
 fn charge_range(ui: &mut Ui, z: &mut (u8, u8)) -> Response {
-    let r = ui.add(DragValue::new(&mut z.0).range(1..=z.1).speed(0.05).prefix("from ").suffix("+"));
-    r | ui.add(DragValue::new(&mut z.1).range(z.0..=10).speed(0.05).prefix("to ").suffix("+"))
+    let hi = z.1;
+    let r = theme::number(ui, &mut z.0, 1..=hi, 1.0, |d| d.prefix("from ").suffix("+"));
+    let lo = z.0;
+    r | theme::number(ui, &mut z.1, lo..=10, 1.0, |d| d.prefix("to ").suffix("+"))
 }
 
 fn tolerance(ui: &mut Ui, id: &str, t: &mut Tolerance) -> Response {
-    let speed = if t.unit == TolUnit::Ppm { 0.5 } else { 0.005 };
-    let mut r = ui.add(DragValue::new(&mut t.lo).speed(speed).max_decimals(4).prefix("from "));
-    r |= ui.add(DragValue::new(&mut t.hi).speed(speed).max_decimals(4).prefix("to "));
+    let step = if t.unit == TolUnit::Ppm { 1.0 } else { 0.01 };
+    let any = -10_000.0..=10_000.0;
+    let mut r = theme::number(ui, &mut t.lo, any.clone(), step, |d| d.max_decimals(4).prefix("from "));
+    r |= theme::number(ui, &mut t.hi, any, step, |d| d.max_decimals(4).prefix("to "));
     r |= ComboBox::from_id_salt(id)
         .width(70.0)
         .selected_text(t.unit.key())
@@ -936,7 +968,7 @@ impl SageGui {
             if running {
                 ui.spinner();
             }
-            ui.label(RichText::new(text).color(color).strong());
+            ui.label(theme::bold(text).color(color));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new(format!("elapsed {}", progress::format_duration(t.elapsed()))).color(muted));
             });
@@ -1013,16 +1045,16 @@ impl SageGui {
                     .inner_margin(10.0)
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(RichText::new(&d.title).color(bad).strong().size(16.0));
+                        ui.label(theme::bold(&d.title).color(bad).size(16.0));
                         ui.label(&d.cause);
                         ui.add_space(6.0);
-                        ui.strong("How to fix it");
+                        ui.label(theme::bold("How to fix it"));
                         for fix in &d.fixes {
                             ui.label(format!("•  {fix}"));
                         }
                         if !d.evidence.is_empty() {
                             ui.add_space(6.0);
-                            ui.strong("Error message");
+                            ui.label(theme::bold("Error message"));
                             for line in &d.evidence {
                                 ui.label(RichText::new(line).monospace().size(12.0).color(muted));
                             }
@@ -1063,7 +1095,7 @@ impl SageGui {
             });
             if !t.outputs.is_empty() {
                 ui.add_space(6.0);
-                ui.strong("Output files");
+                ui.label(theme::bold("Output files"));
                 let half = t.outputs.len().div_ceil(2);
                 egui::Grid::new("progress_outputs").num_columns(4).spacing([18.0, 4.0]).show(ui, |ui| {
                     for i in 0..half {
@@ -1235,7 +1267,7 @@ impl SageGui {
                  Fewer threads leave the computer responsive for other work; searches take longer."
             );
             row(ui, "CPU threads", &tip, |ui| {
-                let r = ui.add(DragValue::new(&mut self.threads).range(1..=cpus).speed(0.1));
+                let r = theme::number(ui, &mut self.threads, 1..=cpus, 1.0, |d| d);
                 ui.label(RichText::new(format!("of {cpus}")).color(theme::muted(ui)));
                 let all = ui.add_enabled(self.threads != cpus, egui::Button::new("Use all").small());
                 if all.clicked() {
@@ -1252,9 +1284,7 @@ impl SageGui {
             );
             row(ui, "Max RAM", &tip, |ui| {
                 let max = total_gb.unwrap_or(1024.0).ceil();
-                let r = ui.add(
-                    DragValue::new(&mut self.max_ram_gb).range(0.0..=max).speed(0.25).max_decimals(1).suffix(" GB"),
-                );
+                let r = theme::number(ui, &mut self.max_ram_gb, 0.0..=max, 1.0, |d| d.max_decimals(1).suffix(" GB"));
                 let text = match (self.max_ram_gb > 0.0, total_gb) {
                     (false, Some(t)) => format!("0 = all available ({t:.1} GB installed)"),
                     (false, None) => "0 = all available".into(),
@@ -1286,7 +1316,7 @@ impl SageGui {
             });
             row(ui, "GPU support", "Whether this sage.exe can use a GPU. Only the gpu / auto backend of \
                 non-cleavable crosslink searches uses one (Crosslinking tab); everything else runs on the CPU.\n\
-                It needs a sage.exe built with: cargo build --release --features gpu, and a Vulkan or \
+                It needs a sage.exe with GPU support (included by default: cargo build --release -p sage-cli), and a Vulkan or \
                 DirectX 12 graphics driver.", |ui| {
                 let (ok, warn) = (Color32::from_rgb(40, 160, 70), Color32::from_rgb(200, 130, 30));
                 let r = match &self.gpu_support {
@@ -1317,7 +1347,7 @@ impl SageGui {
                         }
                     }
                     Some(system::GpuSupport::No) => ui.label(
-                        RichText::new("✖ this sage.exe was built without GPU support (cargo build --release --features gpu)")
+                        RichText::new("✖ this sage.exe was built without GPU support (rebuild it: cargo build --release -p sage-cli)")
                             .color(warn),
                     ),
                     Some(system::GpuSupport::Unknown(why)) => ui.label(RichText::new(format!("? {why}")).color(warn)),
@@ -1390,9 +1420,9 @@ fn database_tab(ui: &mut Ui, s: &mut Settings) {
         let mut remove = None;
         if !s.custom_enzymes.is_empty() {
             egui::Grid::new("custom_enzymes").num_columns(4).spacing([12.0, 6.0]).show(ui, |ui| {
-                ui.strong("Cleave at").on_hover_text("Residues at which this enzyme cuts, e.g. DE for Glu-C in phosphate buffer.");
-                ui.strong("Not before").on_hover_text("Do not cut when the next residue is one of these, e.g. P. Leave empty for none.");
-                ui.strong("Side").on_hover_text("After the residue (C-terminal, like trypsin) or before it (N-terminal, like Asp-N).");
+                ui.label(theme::bold("Cleave at")).on_hover_text("Residues at which this enzyme cuts, e.g. DE for Glu-C in phosphate buffer.");
+                ui.label(theme::bold("Not before")).on_hover_text("Do not cut when the next residue is one of these, e.g. P. Leave empty for none.");
+                ui.label(theme::bold("Side")).on_hover_text("After the residue (C-terminal, like trypsin) or before it (N-terminal, like Asp-N).");
                 ui.label("");
                 ui.end_row();
                 for (i, rule) in s.custom_enzymes.iter_mut().enumerate() {
@@ -1434,10 +1464,10 @@ fn database_tab(ui: &mut Ui, s: &mut Settings) {
     grid(ui, "enzyme", |ui| {
         row(ui, "Missed cleavages", "Maximum number of internal cleavage sites a peptide may contain.\n\
             Typical: 2 for trypsin. Crosslink searches need at least 1 (a crosslinked lysine is not cleaved).\n\
-            Sage's own default when the field is absent is 0.", |ui| num(ui, &mut s.missed_cleavages, 0..=10, 0.1));
+            Sage's own default when the field is absent is 0.", |ui| num(ui, &mut s.missed_cleavages, 0..=10, 1.0));
         row(ui, "Peptide length", "Shortest and longest peptide (amino acids) to search. Typical: 7 to 50.", |ui| {
-            let r = ui.add(DragValue::new(&mut s.min_len).range(1..=100).prefix("min "));
-            r | ui.add(DragValue::new(&mut s.max_len).range(1..=200).prefix("max "))
+            let r = theme::number(ui, &mut s.min_len, 1..=100, 1.0, |d| d.prefix("min "));
+            r | theme::number(ui, &mut s.max_len, 1..=200, 1.0, |d| d.prefix("max "))
         });
         row(ui, "Semi-enzymatic", "Also allow peptides with only one enzymatic end. Finds in-source fragments \
             and degradation products, but the database grows ~10x and searches get slower.",
@@ -1468,9 +1498,9 @@ fn database_tab(ui: &mut Ui, s: &mut Settings) {
     grid(ui, "peptides", |ui| {
         row(ui, "Minimum peptide mass", "Lightest peptide (monoisotopic, Da) to search.\n\
             Unset = Sage's choice: 500 Da, or 350 Da for crosslink searches so small partner peptides are kept.",
-            |ui| optional(ui, &mut s.peptide_min_mass, 500.0, "automatic (500 Da; 350 Da for crosslinks)", 0.0..=10000.0));
+            |ui| optional(ui, &mut s.peptide_min_mass, 500.0, "automatic (500 Da; 350 Da for crosslinks)", 0.0..=10000.0, 50.0));
         row(ui, "Maximum peptide mass", "Heaviest peptide (monoisotopic, Da) to search. Default 5000.",
-            |ui| ui.add(DragValue::new(&mut s.peptide_max_mass).range(100.0..=20000.0).speed(10.0).suffix(" Da")));
+            |ui| theme::number(ui, &mut s.peptide_max_mass, 100.0..=20000.0, 100.0, |d| d.suffix(" Da")));
         row(ui, "Fragment ion types", "Ion series that are matched in MS2 spectra.\n\
             • CID/HCD: b and y (default)\n• ETD/ECD: c and z (or z_radical)\n• EThcD: b, y, c, z",
             |ui| {
@@ -1481,7 +1511,7 @@ fn database_tab(ui: &mut Ui, s: &mut Settings) {
                 r
             });
         row(ui, "Minimum ion index", "Skip the first N ions of each series: 2 (default) ignores b1/y1, \
-            which are rarely observed and match noise easily.", |ui| num(ui, &mut s.min_ion_index, 0..=10, 0.1));
+            which are rarely observed and match noise easily.", |ui| num(ui, &mut s.min_ion_index, 0..=10, 1.0));
     });
 
     heading(ui, "Decoys & indexing");
@@ -1493,13 +1523,13 @@ fn database_tab(ui: &mut Ui, s: &mut Settings) {
             |ui| ui.add(TextEdit::singleline(&mut s.decoy_tag).desired_width(120.0)));
         row(ui, "Bucket size", "Internal fragment-index tuning (rounded up to a power of two). \
             Default 8192; larger values (e.g. 32768) can be faster for wide precursor windows / open searches.",
-            |ui| num(ui, &mut s.bucket_size, 1024..=1_048_576, 256.0));
+            |ui| num(ui, &mut s.bucket_size, 1024..=1_048_576, 1024.0));
         row(ui, "Prefilter database", "For very large databases (e.g. metaproteomics): first find peptides \
             that match at all, then search only those. Lowers memory use. Not allowed for crosslink searches.",
             |ui| ui.checkbox(&mut s.prefilter, "prefilter in chunks"));
         if s.prefilter {
             row(ui, "Prefilter chunk size", "Number of protein sequences per prefilter chunk. 0 = automatic.",
-                |ui| num(ui, &mut s.prefilter_chunk_size, 0..=10_000_000, 1000.0));
+                |ui| num(ui, &mut s.prefilter_chunk_size, 0..=10_000_000, 10_000.0));
             row(ui, "Low-memory prefilter", "Use as little memory as possible during prefiltering, at some cost in speed.",
                 |ui| ui.checkbox(&mut s.prefilter_low_memory, "low memory"));
         }
@@ -1545,7 +1575,7 @@ fn unimod_panel(ui: &mut Ui, s: &mut Settings, lk: &mut unimod::Lookup) {
     };
     ui.group(|ui| {
         ui.horizontal(|ui| {
-            ui.strong(format!("{}  {}", entry.proforma(), entry.title));
+            ui.label(theme::bold(format!("{}  {}", entry.proforma(), entry.title)));
             ui.label(format!("({})", entry.full_name));
             ui.hyperlink_to(
                 "view on unimod.org",
@@ -1555,10 +1585,10 @@ fn unimod_panel(ui: &mut Ui, s: &mut Settings, lk: &mut unimod::Lookup) {
         ui.label(format!("Monoisotopic mass {:+.6} Da   ·   composition {}", entry.mono_mass, entry.composition));
         ui.add_space(4.0);
         egui::Grid::new("unimod_sites").num_columns(5).spacing([14.0, 4.0]).striped(true).show(ui, |ui| {
-            ui.strong("Site");
-            ui.strong("Position");
-            ui.strong("Classification");
-            ui.strong("Sage target").on_hover_text(TARGET_TIP);
+            ui.label(theme::bold("Site"));
+            ui.label(theme::bold("Position"));
+            ui.label(theme::bold("Classification"));
+            ui.label(theme::bold("Sage target")).on_hover_text(TARGET_TIP);
             ui.label("");
             ui.end_row();
             for spec in &entry.specificities {
@@ -1646,11 +1676,11 @@ fn modifications_tab(ui: &mut Ui, s: &mut Settings, lk: &mut unimod::Lookup) {
 
     let mut remove = None;
     egui::Grid::new("mods").num_columns(6).spacing([12.0, 6.0]).striped(true).show(ui, |ui| {
-        ui.strong("Type").on_hover_text("Fixed: always applied. Variable: searched with and without.");
-        ui.strong("Target").on_hover_text(TARGET_TIP);
-        ui.strong("Mass shift").on_hover_text("Monoisotopic mass added to the residue, in Da. Negative values allowed (e.g. -17.026549 for pyro-Glu from Q).");
-        ui.strong("Max per peptide").on_hover_text("Variable modifications only: how often this modification may occur on one peptide. 0 = only limited by 'Max variable mods'.");
-        ui.strong("Name (optional)").on_hover_text("ProForma name written to the results, e.g. UNIMOD:35 for oxidation. Leave empty to report the mass.");
+        ui.label(theme::bold("Type")).on_hover_text("Fixed: always applied. Variable: searched with and without.");
+        ui.label(theme::bold("Target")).on_hover_text(TARGET_TIP);
+        ui.label(theme::bold("Mass shift")).on_hover_text("Monoisotopic mass added to the residue, in Da. Negative values allowed (e.g. -17.026549 for pyro-Glu from Q).");
+        ui.label(theme::bold("Max per peptide")).on_hover_text("Variable modifications only: how often this modification may occur on one peptide. 0 = only limited by 'Max variable mods'.");
+        ui.label(theme::bold("Name (optional)")).on_hover_text("ProForma name written to the results, e.g. UNIMOD:35 for oxidation. Leave empty to report the mass.");
         ui.label("");
         ui.end_row();
 
@@ -1666,7 +1696,8 @@ fn modifications_tab(ui: &mut Ui, s: &mut Settings, lk: &mut unimod::Lookup) {
             let target = ui.add(TextEdit::singleline(&mut m.target).desired_width(50.0).text_color_opt(bad.then_some(Color32::RED)));
             target.on_hover_text(TARGET_TIP);
             mass(ui, &mut m.mass).on_hover_text("Monoisotopic mass shift in Da, e.g. 15.994915 for oxidation.");
-            ui.add_enabled(m.kind == ModKind::Variable, DragValue::new(&mut m.max_count).range(0..=10))
+            ui.add_enabled_ui(m.kind == ModKind::Variable, |ui| theme::number(ui, &mut m.max_count, 0..=10, 1.0, |d| d))
+                .inner
                 .on_hover_text("0 = no per-modification limit.");
             ui.add(TextEdit::singleline(&mut m.name).hint_text("UNIMOD:…").desired_width(110.0))
                 .on_hover_text("e.g. UNIMOD:4 (carbamidomethyl), UNIMOD:35 (oxidation), UNIMOD:21 (phospho)");
@@ -1684,10 +1715,10 @@ fn modifications_tab(ui: &mut Ui, s: &mut Settings, lk: &mut unimod::Lookup) {
     grid(ui, "modlimits", |ui| {
         row(ui, "Max variable mods", "Maximum variable modifications on one peptide (all kinds together). \
             Default 2; 3 is common for phospho studies. Higher values grow the search space quickly.",
-            |ui| num(ui, &mut s.max_variable_mods, 1..=10, 0.1));
+            |ui| num(ui, &mut s.max_variable_mods, 1..=10, 1.0));
         row(ui, "Max combinations", "Hard cap on modified forms generated per peptide (including the unmodified \
             one). Unset = no cap. Useful against combinatorial explosion, e.g. 64.",
-            |ui| optional(ui, &mut s.max_combinations, 64, "no limit", 1..=100_000));
+            |ui| optional(ui, &mut s.max_combinations, 64, "no limit", 1..=100_000, 16.0));
     });
 }
 
@@ -1707,8 +1738,8 @@ fn spectra_tab(ui: &mut Ui, s: &mut Settings) {
         row(ui, "Isotope errors", "Also accept precursors picked on the wrong isotope peak (C13 errors).\n\
             Example: -1 to 3 tries M-1 … M+3. Default 0 to 0 (off). Increases search time.",
             |ui| {
-                let r = ui.add(DragValue::new(&mut s.isotope_errors.0).range(-5..=5).prefix("from "));
-                r | ui.add(DragValue::new(&mut s.isotope_errors.1).range(-5..=5).prefix("to "))
+                let r = theme::number(ui, &mut s.isotope_errors.0, -5..=5, 1.0, |d| d.prefix("from "));
+                r | theme::number(ui, &mut s.isotope_errors.1, -5..=5, 1.0, |d| d.prefix("to "))
             });
     });
 
@@ -1717,7 +1748,7 @@ fn spectra_tab(ui: &mut Ui, s: &mut Settings) {
     grid(ui, "fragment_charge", |ui| {
         row(ui, "Max fragment charge", "Highest fragment ion charge to consider. Unset = precursor charge - 1. \
             Example: 1 for low charge peptides, 2 for most HCD data.",
-            |ui| optional(ui, &mut s.max_fragment_charge, 2, "precursor charge - 1", 1..=6));
+            |ui| optional(ui, &mut s.max_fragment_charge, 2, "precursor charge - 1", 1..=6, 1.0));
     });
 
     heading(ui, "Spectrum processing");
@@ -1734,9 +1765,9 @@ fn spectra_tab(ui: &mut Ui, s: &mut Settings) {
             |ui| num(ui, &mut s.min_peaks, 0..=1000, 1.0));
         row(ui, "Max peaks", "Keep only the N most intense peaks per spectrum. Unset = Sage's choice: 150, \
             or 300 for MS-cleavable crosslinkers (their doublet peaks are often weak).",
-            |ui| optional(ui, &mut s.max_peaks, 150, "automatic (150; 300 for DSSO/DSBU)", 10..=5000));
+            |ui| optional(ui, &mut s.max_peaks, 150, "automatic (150; 300 for DSSO/DSBU)", 10..=5000, 10.0));
         row(ui, "Min matched peaks", "A PSM needs at least this many matched b/y (etc.) ions. Default 4.",
-            |ui| num(ui, &mut s.min_matched_peaks, 1..=50, 0.1));
+            |ui| num(ui, &mut s.min_matched_peaks, 1..=50, 1.0));
     });
 }
 
@@ -1748,13 +1779,13 @@ fn scoring_tab(ui: &mut Ui, s: &mut Settings) {
             r | ui.radio_value(&mut s.openms_score, true, "OpenMS hyperscore")
         });
         row(ui, "PSMs per spectrum", "Number of peptide matches reported per spectrum. Default 1; use \
-            e.g. 5 when rescoring with Percolator or mokapot.", |ui| num(ui, &mut s.report_psms, 1..=100, 0.1));
+            e.g. 5 when rescoring with Percolator or mokapot.", |ui| num(ui, &mut s.report_psms, 1..=100, 1.0));
         row(ui, "Predict retention time", "Fit a retention time model and use the RT error as a feature for \
             rescoring (recommended). Required for LFQ.", |ui| ui.checkbox(&mut s.predict_rt, "predict RT"));
         row(ui, "Protein grouping", "Group proteins that share the same peptide evidence (parsimony).",
             |ui| ui.checkbox(&mut s.protein_grouping, "group proteins"));
         row(ui, "Grouping peptide FDR", "Peptide q-value cutoff used when building protein groups. Default 0.01 (1%).",
-            |ui| ui.add(DragValue::new(&mut s.protein_grouping_peptide_fdr).range(0.0..=1.0).speed(0.001).max_decimals(3)));
+            |ui| theme::number(ui, &mut s.protein_grouping_peptide_fdr, 0.0..=1.0, 0.01, |d| d.max_decimals(3)));
     });
 
     heading(ui, "Quantification");
@@ -1771,13 +1802,13 @@ fn scoring_tab(ui: &mut Ui, s: &mut Settings) {
         if s.lfq {
             row(ui, "LFQ q-value cutoff", "Only peptides (or crosslinks, by crosslink q-value) at or below this \
                 q-value are quantified. Default 0.01 (1% FDR).",
-                |ui| ui.add(DragValue::new(&mut s.lfq_q).range(0.0..=1.0).speed(0.001).max_decimals(3)));
+                |ui| theme::number(ui, &mut s.lfq_q, 0.0..=1.0, 0.01, |d| d.max_decimals(3)));
             row(ui, "MS1 tolerance", "Mass tolerance for tracing precursor isotopes in MS1, in ppm. Default 5; \
                 10 for older or lower-resolution instruments.",
-                |ui| ui.add(DragValue::new(&mut s.lfq_ppm).range(0.5..=50.0).speed(0.1).suffix(" ppm")));
+                |ui| theme::number(ui, &mut s.lfq_ppm, 0.5..=50.0, 1.0, |d| d.suffix(" ppm")));
             row(ui, "Min spectral angle", "Minimum agreement (0 to 1) between the observed and theoretical isotope \
                 envelope for a peak to be integrated. Default 0.7.",
-                |ui| ui.add(DragValue::new(&mut s.lfq_spectral_angle).range(0.0..=1.0).speed(0.01).max_decimals(2)));
+                |ui| theme::number(ui, &mut s.lfq_spectral_angle, 0.0..=1.0, 0.05, |d| d.max_decimals(2)));
             row(ui, "Charge states", "On: sum all charge states into one intensity per peptide / crosslink \
                 (default). Off: report each charge state separately.",
                 |ui| ui.checkbox(&mut s.lfq_combine_charges, "combine charge states"));
@@ -1799,7 +1830,7 @@ fn scoring_tab(ui: &mut Ui, s: &mut Settings) {
             });
         if s.tmt != Tmt::None {
             row(ui, "TMT MS level", "MS level of the reporter ions: 2 for MS2 methods, 3 for SPS-MS3 (default 3).",
-                |ui| num(ui, &mut s.tmt_level, 2..=3, 0.05));
+                |ui| num(ui, &mut s.tmt_level, 2..=3, 1.0));
             row(ui, "Signal-to-noise", "Report reporter signal-to-noise instead of intensity (Thermo files with noise data).",
                 |ui| ui.checkbox(&mut s.tmt_sn, "use S/N"));
         }
@@ -1828,7 +1859,7 @@ const VIEW_TIP: &str = "Show the matches of this results folder on the \"Annotat
 
 fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
     heading(ui, "Crosslinking (XL-MS)");
-    ui.checkbox(&mut s.crosslink.enabled, RichText::new("Search for crosslinked peptides").strong())
+    ui.checkbox(&mut s.crosslink.enabled, theme::bold("Search for crosslinked peptides"))
         .on_hover_text("Turns this into a crosslink search: results go to crosslinks.sage.tsv \
             (and, with 'Linear search' below, on by default, the usual bottom-up results: \
             results.sage.tsv, peptides.sage.tsv and proteins.sage.tsv). \
@@ -1912,9 +1943,9 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
                     |ui| ui.checkbox(&mut xl.require_complete_doublets, "require complete doublets"));
             }
             row(ui, "Min peaks per chain", "Each of the two peptides needs at least this many matched fragments. Default 3.",
-                |ui| num(ui, &mut xl.min_chain_peaks, 1..=20, 0.1));
+                |ui| num(ui, &mut xl.min_chain_peaks, 1..=20, 1.0));
             row(ui, "Min linked ions per chain", "Non-cleavable linkers: each peptide needs at least this many matched                 fragments that carry the linker (ions containing the link site; for loop-links, both sites). They are                 the direct evidence of the link: without them, a correct peptide carrying any modification of about                 the linker's mass, or a strong peptide paired with a barely matched partner, is reported as a                 crosslink. Default 2; 0 turns the check off. MS-cleavable linkers rely on their stub doublets instead.",
-                |ui| ui.add_enabled(!cleavable, egui::DragValue::new(&mut xl.min_linked_peaks).range(0..=20).speed(0.1)));
+                |ui| ui.add_enabled_ui(!cleavable, |ui| num(ui, &mut xl.min_linked_peaks, 0..=20, 1.0)).inner);
             row(ui, "Linear search", "Before the crosslink search, also run an ordinary linear peptide search on \
                 the same spectra and database, giving the usual bottom-up results next to crosslinks.sage.tsv: \
                 results.sage.tsv (PSMs, with peptide, protein and protein-group FDR), peptides.sage.tsv and \
@@ -1923,7 +1954,33 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
                 minimum peptide mass 350 Da). Unlinked peptides, mono-links and the seeds of crosslinks all show \
                 up here. On by default; roughly doubles the file reading time.",
                 |ui| ui.checkbox(&mut xl.linear_search, "also run a linear peptide search (peptide and protein reports)"));
+            row(ui, "Multivalent crosslinks", "Also search species held together by two or more linkers, up to the \
+                number set here (2-4 linkers per species): several links between two peptides (a2b), chains and \
+                branches of three or more peptides (a1b1c, a1b,b1c,b1d), and copies of one peptide (a2a, a1a1b, as \
+                at a homodimer interface). Non-cleavable linkers: each peptide's ions carry whatever hangs off its \
+                link residues, and every peptide needs its own linker-carrying ions. MS-cleavable linkers (DSSO, \
+                DSBU, cliXlink): every linker breaks, each peptide keeps a stub on each link residue and must show \
+                its peptide + stubs peaks (doublets, triplets); pieces freed by a single broken linker (b1c + stub) \
+                tell the arrangement (topology_peaks). Written to crosslinks.sage.tsv as link_type 'multivalent' \
+                with their topology and species, with their own FDR. The search space grows steeply: only for \
+                small protein sets.",
+                |ui| {
+                    ui.horizontal(|ui| {
+                        let mut r = ui.checkbox(&mut xl.multivalent, "search multivalent crosslinks");
+                        if xl.multivalent {
+                            ui.label("max linkers per species");
+                            r |= num(ui, &mut xl.valency, 2..=sage_core::crosslink::MAX_VALENCY, 1.0);
+                        }
+                        r
+                    })
+                    .inner
+                });
         });
+        if xl.multivalent {
+            let warn = Color32::from_rgb(220, 135, 30);
+            ui.label(RichText::new(format!("⚠ {}", settings::multivalent_warning(xl.valency))).color(warn));
+            ui.add_space(4.0);
+        }
 
         if xl.is_cleavable() {
             stub_masses(ui, xl);
@@ -1937,7 +1994,7 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
             row(ui, "Backend", "How non-cleavable crosslinks are searched:\n\
                 • cpu (default): seed search + partner lookup; validated, fine for complexes and small databases\n\
                 • reflect: chain reflection on the CPU; reference for the GPU, slow\n\
-                • gpu: chain reflection on the graphics card, for proteome-scale searches (needs a sage.exe built with --features gpu)\n\
+                • gpu: chain reflection on the graphics card, for proteome-scale searches (needs a sage.exe with GPU support, the default)\n\
                 • auto: gpu when a real GPU is available, otherwise cpu",
                 |ui| {
                     ComboBox::from_id_salt("backend")
@@ -1954,7 +2011,7 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
                 |ui| num(ui, &mut xl.candidates, 1..=1000, 1.0));
             row(ui, "Chain survivors", "reflect/gpu backends: peptides kept per spectrum after the per-chain filter. \
                 Default 20000; raise it if you suspect missed links, lower it for speed.",
-                |ui| num(ui, &mut xl.chain_survivors, 100..=1_000_000, 100.0));
+                |ui| num(ui, &mut xl.chain_survivors, 100..=1_000_000, 1000.0));
         });
     });
 }
@@ -2081,5 +2138,53 @@ fn human_size(bytes: u64) -> String {
         b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
         b if b >= 1 << 10 => format!("{:.0} KB", b as f64 / 1024.0),
         b => format!("{b} B"),
+    }
+}
+
+/// Screenshots of settings tabs, rendered off-screen:
+/// `SAGE_GUI_FIGURES=<folder> cargo test -p sage-gui screenshots -- --ignored`
+#[cfg(test)]
+mod screenshots {
+    use super::*;
+    use egui_kittest::Harness;
+
+    #[test]
+    #[ignore]
+    fn screenshots() {
+        let out = std::path::PathBuf::from(std::env::var("SAGE_GUI_FIGURES").expect("set SAGE_GUI_FIGURES"));
+        std::fs::create_dir_all(&out).unwrap();
+        let mut s = Settings::default();
+        s.crosslink.enabled = true;
+        s.crosslink.multivalent = true;
+        s.crosslink.valency = 3;
+        let tabs: [(&str, fn(&mut Ui, &mut Settings)); 3] =
+            [("database", database_tab), ("scoring", scoring_tab), ("crosslinking", crosslink_tab)];
+        for (name, tab) in tabs {
+            let mut settings = s.clone();
+            // fonts take effect on the frame after they are set: draw from the second
+            let mut installed = false;
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(980.0, 1300.0))
+                .build_ui(move |ui| {
+                    if !installed {
+                        theme::install(ui.ctx(), false);
+                        installed = true;
+                        return;
+                    }
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for t in ["Files", "Database & enzyme", "Crosslinking"] {
+                                let _ = ui.selectable_label(t == "Crosslinking", theme::bold(t));
+                            }
+                        });
+                        tab(ui, &mut settings)
+                    });
+                });
+            harness.run();
+            let image = harness.render().expect("render");
+            let path = out.join(format!("gui_{name}.png"));
+            image.save(&path).unwrap();
+            println!("{}", path.display());
+        }
     }
 }

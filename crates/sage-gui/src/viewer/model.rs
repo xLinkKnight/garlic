@@ -25,6 +25,8 @@ pub enum Kind {
     Linear,
     Crosslink,
     Loop,
+    /// Multivalent: two or more linkers (see [`Match::species`])
+    Multi,
 }
 
 /// One match from `results.sage.tsv` or `crosslinks.sage.tsv`
@@ -56,6 +58,33 @@ pub struct Match {
     pub ion_mobility: Option<f32>,
     /// Crosslinks: both peptides from the same protein
     pub intra_protein: bool,
+    /// Multivalent species: topology (`a2b`, `a1b1c`) and the `species`
+    /// column (`[1] PEPK [2] KPEP | 1:K4-2:K1; …`); empty otherwise
+    pub topology: String,
+    pub species: String,
+}
+
+/// The peptides of a `species` column and its links as 0-based
+/// `(peptide, residue, peptide, residue)`
+pub fn parse_species(text: &str) -> (Vec<String>, Vec<(usize, usize, usize, usize)>) {
+    let (peptides, links) = text.split_once(" | ").unwrap_or((text, ""));
+    let is_number = |t: &str| t.len() > 2 && t.starts_with('[') && t.ends_with(']') && t[1..t.len() - 1].bytes().all(|b| b.is_ascii_digit());
+    let peptides = peptides.split_whitespace().filter(|t| !is_number(t)).map(String::from).collect();
+    // `1:K10` → (peptide 0, residue 9)
+    let end = |s: &str| -> Option<(usize, usize)> {
+        let (p, residue) = s.split_once(':')?;
+        let digits: String = residue.chars().skip_while(|c| !c.is_ascii_digit()).collect();
+        Some((p.trim().parse::<usize>().ok()? - 1, digits.parse::<usize>().ok()? - 1))
+    };
+    let links = links
+        .split(';')
+        .filter_map(|l| {
+            let (a, b) = l.trim().split_once('-')?;
+            let ((pa, sa), (pb, sb)) = (end(a)?, end(b)?);
+            Some((pa, sa, pb, sb))
+        })
+        .collect();
+    (peptides, links)
 }
 
 impl Match {
@@ -65,6 +94,7 @@ impl Match {
             Kind::Linear => self.peptide.clone(),
             Kind::Crosslink => format!("{} ({}) – {} ({})", self.peptide, self.sites.0, self.partner, self.sites.1),
             Kind::Loop => format!("{} (loop {}–{})", self.peptide, self.sites.0, self.sites.1),
+            Kind::Multi => format!("{} {}", self.topology, parse_species(&self.species).0.join(" – ")),
         }
     }
 
@@ -176,7 +206,8 @@ impl Results {
         let site = |s: usize| s.saturating_sub(1);
         let settings = self.crosslink.clone().unwrap_or_default();
         let sites = match m.kind {
-            Kind::Linear => return None,
+            // multivalent species are non-cleavable: no stubs, peptides stacked in the map
+            Kind::Linear | Kind::Multi => return None,
             Kind::Crosslink => vec![(0, site(m.sites.0)), (1, site(m.sites.1))],
             Kind::Loop => vec![(0, site(m.sites.0)), (0, site(m.sites.1))],
         };
@@ -206,13 +237,34 @@ impl Results {
     /// ProForma 2.0 of a match, as Annotator reads it: crosslinks as
     /// `A[linker#XL1]..//B[#XL1]..`, modifications by accession or mass
     pub fn proforma(&self, m: &Match) -> String {
-        let linker = self
+        let term = self
             .crosslink
             .as_ref()
             .map_or_else(|| "XLMOD:02001".to_string(), CrosslinkSettings::proforma_linker);
-        let linker = format!("{linker}#XL1");
+        let linker = format!("{term}#XL1");
         let site = |s: usize| s.saturating_sub(1);
         match m.kind {
+            // every peptide, link n as #XLn on both its residues
+            Kind::Multi => {
+                let (peptides, links) = parse_species(&m.species);
+                peptides
+                    .iter()
+                    .enumerate()
+                    .map(|(x, peptide)| {
+                        let marks: Vec<(usize, String)> = links
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(n, &(a, sa, b, sb))| {
+                                [(a, sa, format!("{term}#XL{}", n + 1)), (b, sb, format!("#XL{}", n + 1))]
+                            })
+                            .filter(|&(p, _, _)| p == x)
+                            .map(|(_, s, mark)| (s, mark))
+                            .collect();
+                        rewrite(peptide, &marks, &self.mod_masses)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("//")
+            }
             Kind::Linear => rewrite(&m.peptide, &[], &self.mod_masses),
             Kind::Crosslink => format!(
                 "{}//{}",
@@ -447,6 +499,8 @@ fn parse_linear(text: &str) -> Vec<Match> {
             rt: field(&f, &col, "rt").parse().unwrap_or(0.0),
             ion_mobility: field(&f, &col, "ion_mobility").parse().ok().filter(|&x: &f32| x > 0.0),
             intra_protein: false,
+            topology: String::new(),
+            species: String::new(),
         })
         .collect()
 }
@@ -463,8 +517,13 @@ fn parse_crosslinks(text: &str) -> Vec<Match> {
                 .filter(|p| !p.is_empty())
                 .collect::<Vec<_>>()
                 .join(" – ");
+            let kind = match field(&f, &col, "link_type") {
+                "loop" => Kind::Loop,
+                "multivalent" => Kind::Multi,
+                _ => Kind::Crosslink,
+            };
             Match {
-                kind: if field(&f, &col, "link_type") == "loop" { Kind::Loop } else { Kind::Crosslink },
+                kind,
                 file: field(&f, &col, "filename").to_string(),
                 scan: field(&f, &col, "scannr").to_string(),
                 charge: field(&f, &col, "charge").parse().unwrap_or(3),
@@ -485,6 +544,8 @@ fn parse_crosslinks(text: &str) -> Vec<Match> {
                 rt: field(&f, &col, "rt").parse().unwrap_or(0.0),
                 ion_mobility: field(&f, &col, "ion_mobility").parse().ok().filter(|&x: &f32| x > 0.0),
                 intra_protein: field(&f, &col, "intra_protein") == "true",
+                topology: if kind == Kind::Multi { field(&f, &col, "topology").to_string() } else { String::new() },
+                species: if kind == Kind::Multi { field(&f, &col, "species").to_string() } else { String::new() },
             }
         })
         .collect()
@@ -1017,6 +1078,59 @@ pub(crate) mod test {
             .map(|(p, s)| stubs.iter().map(|st| rewrite(p, &[(*s, format!("{:+}", st.mass))], &none)).collect())
             .collect();
         Link { kind: Kind::Crosslink, sites, linker: "DSSO".into(), stubs, stub_peptides }
+    }
+
+    /// A multivalent chain from `crosslinks.sage.tsv`: read, written as
+    /// ProForma with one `#XLn` per link, and annotated as three peptides
+    #[test]
+    fn multivalent_species_annotate() {
+        let species = "[1] GLEKVSTAAMQR [2] AEFGHDSTWKLMNPQSTVKGYEDFAR [3] TDYHFPNEWKLIR | 1:K4-2:K10; 2:K19-3:K10";
+        let (peptides, links) = parse_species(species);
+        assert_eq!(peptides, ["GLEKVSTAAMQR", "AEFGHDSTWKLMNPQSTVKGYEDFAR", "TDYHFPNEWKLIR"]);
+        assert_eq!(links, [(0, 3, 1, 9), (1, 18, 2, 9)]);
+        // peptides with modifications keep their brackets apart from the [n] numbers
+        assert_eq!(parse_species("[1] M[+15.9949]K [2] KR | 1:K2-2:K1").0, ["M[+15.9949]K", "KR"]);
+
+        let results = Results {
+            matches: Vec::new(),
+            files: HashMap::new(),
+            bruker: Default::default(),
+            crosslink: Some(CrosslinkSettings::default()),
+            fragment_tol: Tolerance::Ppm(-10.0, 10.0),
+            mod_masses: HashMap::new(),
+        };
+        let m = Match {
+            kind: Kind::Multi,
+            file: "a.d".into(),
+            scan: "1".into(),
+            charge: 4,
+            peptide: peptides[0].clone(),
+            partner: peptides[1].clone(),
+            sites: (4, 10),
+            proteins: String::new(),
+            score: 50.0,
+            spectrum_q: 0.0,
+            q: 0.0,
+            target: true,
+            rank: 1,
+            expmass: 0.0,
+            calcmass: 0.0,
+            rt: 10.0,
+            ion_mobility: Some(1.0),
+            intra_protein: false,
+            topology: "a1b1c".into(),
+            species: species.into(),
+        };
+        assert_eq!(m.title(), "a1b1c GLEKVSTAAMQR – AEFGHDSTWKLMNPQSTVKGYEDFAR – TDYHFPNEWKLIR");
+        let proforma = results.proforma(&m);
+        assert_eq!(
+            proforma,
+            "GLEK[XLMOD:02001#XL1]VSTAAMQR//AEFGHDSTWK[#XL1]LMNPQSTVK[XLMOD:02001#XL2]GYEDFAR//TDYHFPNEWK[#XL2]LIR"
+        );
+        assert!(results.link(&m).is_none());
+        let peaks = Peaks { mz: vec![300.0, 500.0, 700.0], intensity: vec![10.0; 3], precursor_mz: None, ion_mobility: None };
+        let a = annotate(&peaks, &proforma, 4, Model::CidHcd, Tolerance::Ppm(-10.0, 10.0), None).unwrap();
+        assert_eq!(a.coverage.len(), 3);
     }
 
     /// An opened DSSO loop-link (NEKIQQKLQNER, K3–K7): ring ions carry the stub

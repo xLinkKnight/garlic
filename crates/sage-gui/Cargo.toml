@@ -1,6 +1,6 @@
 [package]
 name = "sage-gui"
-version = "0.18.0"
+version = "0.19.0"
 edition = "2021"
 description = "Desktop front-end for editing Sage search settings and running searches"
 license = "MIT"
@@ -47,3 +47,7 @@ windows = { version = "0.58", features = [
 [target.'cfg(windows)'.build-dependencies]
 # build.rs embeds assets/garlic.ico as the .exe icon
 winresource = "0.1"
+
+[dev-dependencies]
+# headless rendering of the window for screenshots (tests only)
+egui_kittest = { version = "0.31.1", features = ["wgpu"] }

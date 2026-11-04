@@ -62,6 +62,29 @@ pub fn peptide_proforma(db: &IndexedDatabase, p: &Peptide, extra: &[(usize, Stri
 pub fn crosslink_proforma(db: &IndexedDatabase, settings: &CrosslinkSettings, m: &CrosslinkMatch) -> String {
     let linker = format!("{}#XL1", settings.proforma_linker());
     let alpha = &db[m.alpha];
+    // multivalent: every peptide, link `n` as `#XLn` on both of its residues
+    if let Some(s) = &m.species {
+        let term = settings.proforma_linker();
+        return s
+            .peptides
+            .iter()
+            .enumerate()
+            .map(|(x, &ix)| {
+                let marks: Vec<(usize, String)> = s
+                    .links
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(n, &(a, sa, b, sb))| {
+                        [(a, sa, format!("{term}#XL{}", n + 1)), (b, sb, format!("#XL{}", n + 1))]
+                    })
+                    .filter(|(p, _, _)| *p as usize == x)
+                    .map(|(_, site, mark)| (site as usize, mark))
+                    .collect();
+                peptide_proforma(db, &db[ix], &marks)
+            })
+            .collect::<Vec<_>>()
+            .join("//");
+    }
     match (m.kind, m.beta) {
         (LinkKind::Inter, Some(beta)) => format!(
             "{}//{}",
@@ -313,6 +336,19 @@ mod test {
         let n_term = csm(oxidised, Some(b), (0, 2), PairClass::TT, 1, 0.0);
         assert!(crosslink_proforma(&db, &settings, &n_term)
             .starts_with("M[+15.9949][XLMOD:02001#XL1]AGLEK"));
+
+        // multivalent a1b1a: two copies of a, each linked to b; link n is #XLn
+        let mut chain = csm(a, Some(b), (5, 2), PairClass::TT, 1, 0.0);
+        chain.kind = LinkKind::Multi;
+        chain.species = Some(Box::new(sage_core::crosslink::Species {
+            peptides: vec![a, b, a],
+            links: vec![(0, 5, 1, 2), (1, 6, 2, 5)],
+            ..Default::default()
+        }));
+        assert_eq!(
+            crosslink_proforma(&db, &settings, &chain),
+            "MAGLEK[XLMOD:02001#XL1]VSTAAMQR//STK[#XL1]PLEK[XLMOD:02001#XL2]//MAGLEK[#XL2]VSTAAMQR"
+        );
     }
 
     #[test]

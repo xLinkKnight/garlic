@@ -41,7 +41,17 @@ pub struct Viewer {
     annotation: Option<Result<Annotation, String>>,
     annotated: Option<(usize, Model)>,
     mobiligram: MobiligramView,
+    /// Width of the match list; the divider next to it is dragged to change it
+    list_width: f32,
 }
+
+/// Match list width: at start (and on double-clicking the divider), and its limits
+const LIST_WIDTH: f32 = 380.0;
+const MIN_LIST_WIDTH: f32 = 220.0;
+/// Room the spectrum keeps when the list is widened
+const MIN_SPECTRUM_WIDTH: f32 = 420.0;
+/// Height of the match list and its divider
+const LIST_HEIGHT: f32 = 560.0;
 
 impl Default for Viewer {
     fn default() -> Self {
@@ -66,6 +76,7 @@ impl Default for Viewer {
             annotation: None,
             annotated: None,
             mobiligram: MobiligramView::default(),
+            list_width: LIST_WIDTH,
         }
     }
 }
@@ -278,7 +289,7 @@ impl Viewer {
             ui.checkbox(&mut self.targets_only, "targets only")
                 .on_hover_text("Crosslinks: target-target matches only.");
             ui.label("spectrum q ≤");
-            ui.add(egui::DragValue::new(&mut self.max_q).range(0.0..=1.0).speed(0.001).max_decimals(3));
+            crate::theme::number(ui, &mut self.max_q, 0.0..=1.0, 0.01, |d| d.max_decimals(3));
             ui.label("search");
             ui.add(egui::TextEdit::singleline(&mut self.search).desired_width(160.0).hint_text("peptide, protein, scan"));
             self.refilter();
@@ -314,8 +325,11 @@ impl Viewer {
         ui.add_space(4.0);
 
         ui.horizontal_top(|ui| {
+            // the list may not squeeze the spectrum below its minimum (e.g. after the window shrank)
+            let widest = (ui.available_width() - MIN_SPECTRUM_WIDTH).max(MIN_LIST_WIDTH);
+            self.list_width = self.list_width.clamp(MIN_LIST_WIDTH, widest);
             self.match_list(ui, &results);
-            ui.separator();
+            self.divider(ui, widest);
             ui.vertical(|ui| self.spectrum_view(ui, &results));
         });
 
@@ -332,15 +346,49 @@ impl Viewer {
         }
     }
 
+    /// The border between the match list and the spectrum: drag it to widen
+    /// either side (up to `widest` for the list), double-click for the default
+    fn divider(&mut self, ui: &mut Ui, widest: f32) {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(10.0, LIST_HEIGHT), egui::Sense::click_and_drag());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Resize the match list"));
+        let response = response
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+            .on_hover_text("Drag to resize the list; double-click to reset");
+        if response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            self.list_width = (self.list_width + response.drag_delta().x).clamp(MIN_LIST_WIDTH, widest);
+        }
+        if response.double_clicked() {
+            self.list_width = LIST_WIDTH.min(widest);
+        }
+        let active = response.hovered() || response.dragged();
+        let stroke = if active {
+            egui::Stroke::new(2.0f32, crate::theme::accent(ui))
+        } else {
+            ui.visuals().widgets.noninteractive.bg_stroke
+        };
+        let x = rect.center().x;
+        ui.painter().vline(x, rect.y_range(), stroke);
+        // a grip in the middle, so the border reads as something to grab
+        let grip = if active { crate::theme::accent(ui) } else { ui.visuals().weak_text_color() };
+        for dy in [-8.0f32, 0.0, 8.0] {
+            ui.painter().circle_filled(egui::pos2(x, rect.center().y + dy), 1.8, grip);
+        }
+    }
+
     fn match_list(&mut self, ui: &mut Ui, results: &Results) {
         let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
         let list = egui::Layout::top_down(egui::Align::LEFT);
-        ui.allocate_ui_with_layout(egui::vec2(380.0, 560.0), list, |ui| {
-            ui.set_width(380.0);
+        let width = self.list_width;
+        ui.allocate_ui_with_layout(egui::vec2(width, LIST_HEIGHT), list, |ui| {
+            ui.set_width(width);
+            // one line per match (rows must be of equal height): long titles end in "…",
+            // shown whole on hover or by widening the list
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
             egui::ScrollArea::vertical()
                 .id_salt("viewer_matches")
                 .auto_shrink([false, false])
-                .max_height(560.0)
+                .max_height(LIST_HEIGHT)
                 .show_rows(ui, row_height, self.shown.len(), |ui, rows| {
                     for &i in &self.shown[rows] {
                         let m = &results.matches[i];
@@ -348,12 +396,14 @@ impl Viewer {
                             Kind::Linear => "",
                             Kind::Crosslink => "XL ",
                             Kind::Loop => "loop ",
+                            Kind::Multi => "multi ",
                         };
                         let text = format!("{tag}{}  {}+  q {:.3}", m.title(), m.charge, m.spectrum_q);
                         let response = ui
                             .selectable_label(self.selected == Some(i), text)
                             .on_hover_text(format!(
-                                "{}\n{} scan {}\nscore {:.2}, spectrum q {:.4}, {} q {:.4}",
+                                "{}\n{}\n{} scan {}\nscore {:.2}, spectrum q {:.4}, {} q {:.4}",
+                                m.title(),
                                 m.proteins,
                                 m.file,
                                 m.scan,
@@ -377,7 +427,7 @@ impl Viewer {
         };
         let m = &results.matches[i];
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(m.title()).strong());
+            ui.label(crate::theme::bold(m.title()));
             let rank = if m.rank > 1 { format!(" · rank {}", m.rank) } else { String::new() };
             ui.label(
                 RichText::new(format!(
@@ -465,7 +515,7 @@ impl Viewer {
         ui.add_space(4.0);
         let mut export = false;
         ui.horizontal_wrapped(|ui| {
-            ui.strong("Export figure");
+            ui.label(crate::theme::bold("Export figure"));
             egui::ComboBox::from_id_salt("viewer_export_format")
                 .selected_text(self.export.format.label())
                 .show_ui(ui, |ui| {
@@ -716,7 +766,7 @@ impl MobiligramView {
         // export
         let mut save = false;
         ui.horizontal_wrapped(|ui| {
-            ui.strong("Export");
+            ui.label(crate::theme::bold("Export"));
             egui::ComboBox::from_id_salt("mobiligram_format")
                 .selected_text(self.format.label())
                 .show_ui(ui, |ui| {
@@ -733,23 +783,19 @@ impl MobiligramView {
             ui.label(RichText::new(text).color(color));
         }
         if save {
-            let source = self.file.clone().unwrap_or_else(|| match files.as_slice() {
-                [one] => one.to_string(),
-                _ => format!("{} files", files.len()),
-            });
+            // the names a search uses: `<MS file>_MG` (also for all files when
+            // there is only one), or `Combined_Mobiligram` for several
+            let file = mobiligram::figure_file(points, self.file.as_deref());
+            let name = mobiligram::figure_name(file.as_deref());
+            let options = mobiligram::MobiligramOptions { file, ..options };
             let options = mobiligram::MobiligramOptions {
-                title: self.title.then(|| format!("Mobiligram · {source} · {} precursors", shown.len())),
+                title: self.title.then(|| mobiligram::title(points, &options)),
                 ..options
             };
             let svg = mobiligram::svg(points, &options);
-            let stem: String = source
-                .trim_end_matches(".d")
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-                .collect();
             let format = self.format;
             if let Some(path) = rfd::FileDialog::new()
-                .set_file_name(format!("mobiligram_{stem}.{}", format.extension()))
+                .set_file_name(format!("{name}.{}", format.extension()))
                 .add_filter(format.label(), &[format.extension()])
                 .save_file()
             {
@@ -1146,7 +1192,7 @@ fn fragment_table(ui: &mut Ui, a: &Annotation) {
             egui::ScrollArea::vertical().id_salt("viewer_fragment_rows").max_height(240.0).show(ui, |ui| {
                 egui::Grid::new("viewer_fragment_grid").striped(true).num_columns(5).show(ui, |ui| {
                     for h in ["ion", "theoretical m/z", "observed m/z", "error (ppm)", "intensity"] {
-                        ui.strong(h);
+                        ui.label(crate::theme::bold(h));
                     }
                     ui.end_row();
                     for p in &a.peaks {
@@ -1199,5 +1245,124 @@ mod test {
         assert_eq!(texts.iter().filter(|(t, c)| t == "A" && *c == stub_color(0)).count(), 2);
         assert_eq!(texts.iter().filter(|(t, c)| t == "S" && *c == stub_color(2)).count(), 2);
         assert!(segments.len() >= 7, "bridge and hooks");
+    }
+
+    /// A results folder with three crosslinks, two with long titles
+    fn long_titles() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sage-gui-divider-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("results.json"), r#"{"mzml_paths": ["a.d"]}"#).unwrap();
+        let mut tsv = String::from(
+            "filename\tscannr\trank\tlabel\tclass\tlink_type\tpeptide_a\tpeptide_b\tlink_a\tlink_b\t\
+             proteins_a\tproteins_b\tcharge\thyperscore\tspectrum_q\tcrosslink_q\trt\n",
+        );
+        for (i, (a, b)) in [
+            ("KVPSPTGEYVKEPEWVLETDGVNLSEVMTVPGIDPTR", "IQYAKDILQKEFLPHITQLEGFESR"),
+            ("TVISGDPNLELDQVGVPKSIAKTLTYPEVVTPYNIDR", "SAGNIVQVFKKAAPSPISHVAEIR"),
+            ("GLEKVSTAAMQR", "TDYHFPNEWKLIR"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            tsv.push_str(&format!(
+                "a.d\t{i}\t1\t1\tTT\tcrosslink\t{a}\t{b}\t1\t5\tsp|P1|A\tsp|P2|B\t4\t{}\t0.001\t0.001\t30\n",
+                100 - i
+            ));
+        }
+        std::fs::write(dir.join("crosslinks.sage.tsv"), tsv).unwrap();
+        dir
+    }
+
+    /// Drag the divider between the match list and the spectrum with the
+    /// pointer, as a user would. `SAGE_GUI_FIGURES` saves before / after images.
+    #[test]
+    fn divider_drags_to_resize_the_list() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let dir = long_titles();
+        let mut viewer = Viewer::default();
+        viewer.open(&dir.display().to_string());
+        let mut installed = false;
+        // 60 frames a second, so two clicks fall within egui's double-click time
+        let mut harness = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_step_dt(1.0 / 60.0).build_ui_state(
+            move |ui, v: &mut Viewer| {
+                // fonts take effect on the frame after they are set
+                if !installed {
+                    crate::theme::install(ui.ctx(), false);
+                    installed = true;
+                    return;
+                }
+                v.ui(ui, "");
+            },
+            viewer,
+        );
+        harness.run_steps(6);
+        let save = |harness: &mut Harness<'_, Viewer>, name: &str| {
+            if let Ok(out) = std::env::var("SAGE_GUI_FIGURES") {
+                std::fs::create_dir_all(&out).unwrap();
+                harness.render().unwrap().save(std::path::Path::new(&out).join(name)).unwrap();
+            }
+        };
+        save(&mut harness, "viewer_divider_before.png");
+        assert_eq!(harness.state().list_width, LIST_WIDTH);
+
+        let drag = |harness: &mut Harness<'_, Viewer>, dx: f32| {
+            let r = harness.get_by_label("Resize the match list").bounding_box().unwrap();
+            let start = egui::pos2(((r.x0 + r.x1) / 2.0) as f32, ((r.y0 + r.y1) / 2.0) as f32);
+            let button = |pressed| egui::Event::PointerButton {
+                pos: if pressed { start } else { start + egui::vec2(dx, 0.0) },
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            harness.input_mut().events.push(egui::Event::PointerMoved(start));
+            harness.run_steps(6);
+            harness.input_mut().events.push(button(true));
+            harness.run_steps(6);
+            for step in 1..=5 {
+                harness.input_mut().events.push(egui::Event::PointerMoved(start + egui::vec2(dx * step as f32 / 5.0, 0.0)));
+                harness.run_steps(6);
+            }
+            harness.input_mut().events.push(button(false));
+            harness.run_steps(6);
+        };
+        // wider by the distance dragged
+        drag(&mut harness, 250.0);
+        let wide = harness.state().list_width;
+        assert!((wide - (LIST_WIDTH + 250.0)).abs() < 2.0, "list width {wide}");
+        save(&mut harness, "viewer_divider_after.png");
+        // never so wide that the spectrum loses its room, never narrower than the minimum
+        drag(&mut harness, 2000.0);
+        assert!(harness.state().list_width <= 1400.0 - MIN_SPECTRUM_WIDTH, "{}", harness.state().list_width);
+        drag(&mut harness, -3000.0);
+        assert_eq!(harness.state().list_width, MIN_LIST_WIDTH);
+        // double-click: back to the default width
+        let r = harness.get_by_label("Resize the match list").bounding_box().unwrap();
+        let at = egui::pos2(((r.x0 + r.x1) / 2.0) as f32, ((r.y0 + r.y1) / 2.0) as f32);
+        harness.input_mut().events.push(egui::Event::PointerMoved(at));
+        harness.run_steps(6);
+        for _ in 0..2 {
+            for pressed in [true, false] {
+                harness.input_mut().events.push(egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+                harness.step();
+            }
+        }
+        harness.run_steps(6);
+        assert_eq!(harness.state().list_width, LIST_WIDTH);
+        // rows stay one line: every match label is as tall as the shortest
+        let heights: Vec<f64> = harness
+            .get_all_by_role(egui::accesskit::Role::Button)
+            .filter(|n| n.label().is_some_and(|l| l.starts_with("XL ")))
+            .filter_map(|n| n.bounding_box())
+            .map(|b| b.y1 - b.y0)
+            .collect();
+        assert_eq!(heights.len(), 3, "{heights:?}");
+        assert!(heights.iter().all(|h| (h - heights[0]).abs() < 0.5), "{heights:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

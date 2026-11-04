@@ -1,6 +1,6 @@
 [package]
 name = "sage-cli"
-version = "0.18.0"
+version = "0.19.0"
 authors = ["Michael Lazear <michaellazear92@gmail.com"]
 edition = "2021"
 rust-version = "1.64"
@@ -19,7 +19,8 @@ name = "sage"
 path = "src/main.rs"
 
 [features]
-default = []
+# GPU support is built in by default; `--no-default-features` leaves it out
+default = ["gpu"]
 # GPU-accelerated crosslink search (wgpu: Vulkan / DX12 / Metal)
 gpu = ["sage-core/gpu"]
 

@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.19.0] - 2026-11-03
+
+### Added
+- Crosslinking: multivalent crosslinks (`"multivalent": 2`–`4`, non-cleavable and MS-cleavable linkers): species held together by two up to that many linkers, with several links between two peptides (`a2b`, `a2a`), chains (`a1b1c`, `a1a1b`) and branches (`a1b,b1c,b1d`) of up to five peptides. Non-cleavable: each peptide is scored with the groups hanging off its residues (fragments tied through a group are not counted) and needs its own linker-carrying ions. MS-cleavable (DSSO, DSBU, cliXlink): every linker breaks, each peptide keeps a stub per link residue and needs its peptide + stubs peaks (doublets, triplets); the arrangement is told by parts freed when a single linker breaks (`b1c` + stub), reported as `topology_peaks`; multivalent species have their own FDR group (each species with a decoy peptide counts as 1 / (2^n − 1) false targets, n = distinct peptides; (TD + DD) / 3 for pairs). `crosslinks.sage.tsv`: `link_type` `multivalent` and new `topology`, `species` and `topology_peaks` columns. The Annotator CSV and the viewer include them (ProForma with `#XL1`, `#XL2`, …); xiVIEW, ProXL, mzIdentML and crosslink LFQ leave them out. `sage-gui`: "search multivalent crosslinks" with the number of linkers, and a warning that the search space is large and meant for small protein sets.
+- `sage-gui`: multivalent crosslinks in the mobiligram, in green (#6FB120).
+- `sage-gui`: a finished search on timsTOF (Bruker `.d`) data writes mobiligrams into a `Mobiligrams` folder inside the results folder, as SVG and PDF (all precursors, white background, titled): one per MS file, named after it with `_MG` (`Bruker.d` → `Bruker_MG.svg`), and, when two or more MS files were searched, `Combined_Mobiligram` with all of them together (a single MS file gets only its `_MG` figure). They are listed with the outputs in the Progress tab, and the viewer's Save… suggests the same names. MS files without ion mobility get none.
+
+### Changed
+- `sage-gui`: number fields are typed in, or stepped with stacked + / − buttons to their right; dragging no longer changes them (the pointer shows a text cursor). Values keep their decimals when stepped (15.9949 + 1 = 16.9949) and show without trailing zeros.
+- `sage-gui`: titles (tabs, section headings, column headers, the viewer heading and match title) are bold (Segoe UI Bold on Windows).
+- `sage-gui`: in the Annotated spectra tab the border between the match list and the spectrum can be dragged to give either side more room (double-click resets it); the list keeps at least 220 px and the spectrum 420 px. Matches stay on one line, long ones ending in "…", shown whole on hover.
+- GPU support is built into `sage` by default (the `gpu` feature of `sage-cli` is a default feature): a plain `cargo build --release -p sage-cli` includes it, and test or other builds no longer replace `sage.exe` with one without it. `--no-default-features` builds without it. Searches still run on the CPU unless the crosslink backend is `gpu` or `auto`.
+
 ## [v0.18.0] - 2026-11-03
 
 ### Added
