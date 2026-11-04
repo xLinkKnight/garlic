@@ -1545,6 +1545,29 @@ pub(crate) mod test {
         Peaks { intensity: vec![100.0; mz.len()], mz, precursor_mz: None, ion_mobility: None }
     }
 
+    /// SILAC peptides carry their labels as UNIMOD accessions (a label on a
+    /// modified residue as a mass), which Annotator's engine resolves: the
+    /// heavy peptide is 8.0142 + 10.0083 Da heavier, and its y ions carry the
+    /// label of the C-terminal R
+    #[test]
+    fn silac_labels_annotate_at_their_masses() {
+        let mass = |p: &str| {
+            PeptidoformIonSet::pro_forma(&rewrite(p, &[], &HashMap::new()), &mzcore::ontology::STATIC_ONTOLOGIES).unwrap().0.formulas()[0]
+                .monoisotopic_mass()
+                .value
+        };
+        let light = mass("PEPTIDEKAR");
+        assert!((mass("PEPTIDEK[UNIMOD:259]AR[UNIMOD:267]") - light - 18.022468).abs() < 1e-3);
+        assert!((mass("PEPTIDEK[UNIMOD:481]AR[UNIMOD:188]") - light - 10.045236).abs() < 1e-3);
+        // acetyl-K, heavy: one combined mass
+        assert!((mass("PEPTIDEK[+50.024764]AR") - light - 50.024764).abs() < 1e-3);
+        // annotated: the heavy y1 (R + 10.0083) is matched
+        let y1 = 175.118952 + 10.008269;
+        let peaks = Peaks { mz: vec![y1], intensity: vec![100.0], precursor_mz: None, ion_mobility: None };
+        let a = annotate(&peaks, "PEPTIDEK[UNIMOD:259]AR[UNIMOD:267]", 2, Model::CidHcd, Tolerance::Ppm(-10.0, 10.0), None).unwrap();
+        assert!(a.peaks[0].labels.iter().any(|l| l.text == "y1"), "{:?}", a.peaks[0].labels);
+    }
+
     #[test]
     fn annotates_linear_peptide() {
         let peaks = peptide_peaks();

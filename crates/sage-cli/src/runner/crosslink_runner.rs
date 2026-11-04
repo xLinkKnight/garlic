@@ -72,11 +72,14 @@ impl Runner {
         parallel: usize,
         parquet: bool,
     ) -> anyhow::Result<telemetry::Telemetry> {
-        let settings = self
+        let mut settings = self
             .parameters
             .crosslink
             .clone()
             .expect("run_crosslink requires crosslink settings");
+        // SILAC labels leave a residue free to link
+        settings.labels = self.database.silac.as_ref().map(|l| l.label_ids()).unwrap_or_default();
+        let silac = self.database.silac.is_some();
         if parquet {
             log::warn!("parquet output is not available for crosslink searches, writing tsv");
         }
@@ -115,7 +118,7 @@ impl Runner {
         let mut reporters = Reporters::new();
         for (chunk_idx, chunk) in self.parameters.mzml_paths.chunks(batch_size).enumerate() {
             let (ms1, msn) = self.read_processed_spectra(chunk, chunk_idx, batch_size);
-            if lfq {
+            if lfq || silac {
                 ms1_spectra.extend(ms1);
             }
             if let Some(isobaric) = &tmt {
@@ -219,6 +222,11 @@ impl Runner {
             let path = self.write_crosslink_lfq(&matches, &areas, &filenames)?;
             self.parameters.output_paths.push(path);
         }
+        if silac {
+            if let Some(path) = self.write_silac_crosslinks(&matches, &settings, &ms1_spectra, &filenames)? {
+                self.parameters.output_paths.push(path);
+            }
+        }
 
         let path = self.make_path("results.json");
         println!("{}", serde_json::to_string_pretty(&self.parameters)?);
@@ -298,6 +306,10 @@ impl Runner {
         .into_iter()
         .map(String::from)
         .collect::<Vec<_>>();
+        let silac = db.silac.is_some();
+        if silac {
+            headers.push("silac_channel".into());
+        }
         if !reporter_headers.is_empty() {
             headers.push("ion_injection_time".into());
             headers.extend(reporter_headers.iter().cloned());
@@ -356,6 +368,13 @@ impl Runner {
                 m.species.as_deref().map(|s| species_text(db, s)).unwrap_or_default(),
                 m.species.as_deref().map(|s| s.topology_peaks.to_string()).unwrap_or_default(),
             ];
+            if silac {
+                let peptides: Vec<_> = match &m.species {
+                    Some(s) => s.peptides.clone(),
+                    None => std::iter::once(m.alpha).chain(m.beta).collect(),
+                };
+                record.push(super::silac_tables::species_channel(db, &peptides));
+            }
             if let Some(reporters) = reporters.filter(|_| !reporter_headers.is_empty()) {
                 // Spectra without reporter ions (e.g. no matching MS3) get empty cells
                 match reporters.get(&(m.file_id, m.spec_id.clone())) {

@@ -588,6 +588,35 @@ impl Tmt {
     }
 }
 
+/// SILAC: no labels, light + heavy, or light + medium + heavy
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Silac {
+    Off,
+    Duplex,
+    Triplex,
+}
+
+impl Silac {
+    pub const ALL: [Silac; 3] = [Silac::Off, Silac::Duplex, Silac::Triplex];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Silac::Off => "Off",
+            Silac::Duplex => "Duplex (light, heavy)",
+            Silac::Triplex => "Triplex (light, medium, heavy)",
+        }
+    }
+}
+
+/// SILAC label presets: (name, residue, mass)
+pub const SILAC_LABELS: [(&str, char, f64); 5] = [
+    ("Lys4 (2H4)", 'K', 4.025107),
+    ("Lys6 (13C6)", 'K', 6.020129),
+    ("Lys8 (13C6 15N2)", 'K', 8.014199),
+    ("Arg6 (13C6)", 'R', 6.020129),
+    ("Arg10 (13C6 15N4)", 'R', 10.008269),
+];
+
 pub const ION_KINDS: [&str; 7] = ["a", "b", "c", "x", "y", "z", "z_radical"];
 
 /// A protease Sage knows by name (`sage_core::enzyme::protease`)
@@ -768,6 +797,12 @@ pub struct Settings {
     pub tmt: Tmt,
     pub tmt_level: u8,
     pub tmt_sn: bool,
+    pub silac: Silac,
+    /// Label masses (K, R) of the medium (triplex) and heavy channels; 0: unlabelled
+    pub silac_medium: (f64, f64),
+    pub silac_heavy: (f64, f64),
+    /// Crosslinks between peptides of different channels
+    pub silac_mixed: bool,
 
     pub crosslink: Crosslink,
 
@@ -834,6 +869,10 @@ impl Default for Settings {
             tmt: Tmt::None,
             tmt_level: 3,
             tmt_sn: false,
+            silac: Silac::Off,
+            silac_medium: (4.025107, 6.020129),
+            silac_heavy: (8.014199, 10.008269),
+            silac_mixed: false,
             crosslink: Crosslink::default(),
             extra: Map::new(),
             extra_database: Map::new(),
@@ -854,7 +893,7 @@ const TOP_KEYS: &[&str] = &[
 const DATABASE_KEYS: &[&str] = &[
     "fasta", "enzyme", "peptide_min_mass", "peptide_max_mass", "ion_kinds", "min_ion_index",
     "static_mods", "variable_mods", "max_variable_mods", "max_combinations", "generate_decoys",
-    "decoy_tag", "bucket_size", "prefilter", "prefilter_chunk_size", "prefilter_low_memory",
+    "decoy_tag", "bucket_size", "prefilter", "prefilter_chunk_size", "prefilter_low_memory", "silac",
 ];
 const ENZYME_KEYS: &[&str] = &[
     "missed_cleavages", "min_len", "max_len", "cleave_at", "restrict", "c_terminal", "enzymes",
@@ -862,6 +901,25 @@ const ENZYME_KEYS: &[&str] = &[
 ];
 const QUANT_KEYS: &[&str] = &["lfq", "tmt", "tmt_settings", "lfq_settings"];
 const LFQ_KEYS: &[&str] = &["ppm_tolerance", "peptide_q_value", "combine_charge_states", "spectral_angle"];
+
+/// The GUI's SILAC settings from `database.silac`: (mode, medium, heavy, mixed)
+fn parse_silac(v: Option<&Value>, d: &Settings) -> (Silac, (f64, f64), (f64, f64), bool) {
+    let Some(silac) = v.and_then(Value::as_object) else {
+        return (Silac::Off, d.silac_medium, d.silac_heavy, false);
+    };
+    let labels = |c: &Value| {
+        let l = c.get("labels");
+        let mass = |r: &str| l.and_then(|l| l.get(r)).and_then(Value::as_f64).unwrap_or(0.0);
+        (mass("K"), mass("R"))
+    };
+    let channels: Vec<&Value> = silac.get("channels").and_then(Value::as_array).map(|a| a.iter().collect()).unwrap_or_default();
+    let mixed = silac.get("mixed_crosslinks").and_then(Value::as_bool).unwrap_or(false);
+    match channels[..] {
+        [heavy] => (Silac::Duplex, d.silac_medium, labels(heavy), mixed),
+        [medium, heavy, ..] => (Silac::Triplex, labels(medium), labels(heavy), mixed),
+        [] => (Silac::Off, d.silac_medium, d.silac_heavy, false),
+    }
+}
 
 fn f64_or(v: Option<&Value>, default: f64) -> f64 {
     v.and_then(Value::as_f64).unwrap_or(default)
@@ -1043,6 +1101,9 @@ impl Settings {
             db.insert("prefilter_chunk_size".into(), json!(self.prefilter_chunk_size));
             db.insert("prefilter_low_memory".into(), json!(self.prefilter_low_memory));
         }
+        if let Some(silac) = self.silac_json() {
+            db.insert("silac".into(), silac);
+        }
 
         let mut quant = self.extra_quant.clone();
         quant.insert("lfq".into(), json!(self.lfq));
@@ -1122,6 +1183,7 @@ impl Settings {
         let ev = |k: &str| enzyme.and_then(|e| e.get(k));
         let lfq_settings = quant.and_then(|q| q.get("lfq_settings")).and_then(Value::as_object);
         let lv = |k: &str| lfq_settings.and_then(|l| l.get(k));
+        let silac = parse_silac(dbv("silac"), &d);
 
         let mut mods = Vec::new();
         if let Some(fixed) = dbv("static_mods").and_then(Value::as_object) {
@@ -1240,6 +1302,10 @@ impl Settings {
                 .map(|x| x as u8)
                 .unwrap_or(d.tmt_level),
             tmt_sn: bool_or(tmt_settings.and_then(|t| t.get("sn")), d.tmt_sn),
+            silac: silac.0,
+            silac_medium: silac.1,
+            silac_heavy: silac.2,
+            silac_mixed: silac.3,
             crosslink: top
                 .get("crosslink")
                 .and_then(Value::as_object)
@@ -1253,10 +1319,49 @@ impl Settings {
         })
     }
 
+    /// `database.silac`: the labelled channels, `None` when off
+    pub fn silac_json(&self) -> Option<Value> {
+        let channel = |name: &str, (k, r): (f64, f64)| {
+            let mut labels = Map::new();
+            for (residue, mass) in [("K", k), ("R", r)] {
+                if mass > 0.0 {
+                    labels.insert(residue.into(), json!(mass));
+                }
+            }
+            json!({ "name": name, "labels": labels })
+        };
+        let channels = match self.silac {
+            Silac::Off => return None,
+            Silac::Duplex => vec![channel("heavy", self.silac_heavy)],
+            Silac::Triplex => vec![channel("medium", self.silac_medium), channel("heavy", self.silac_heavy)],
+        };
+        Some(json!({ "channels": channels, "mixed_crosslinks": self.silac_mixed }))
+    }
+
     /// Problems that stop a search (`errors`) and ones worth a look (`warnings`)
     pub fn check(&self) -> (Vec<String>, Vec<String>) {
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
+        if self.silac != Silac::Off {
+            let mut channels = vec![("heavy", self.silac_heavy)];
+            if self.silac == Silac::Triplex {
+                channels.push(("medium", self.silac_medium));
+                if self.silac_medium == self.silac_heavy {
+                    errors.push("SILAC: the medium and heavy channels have the same labels.".into());
+                }
+            }
+            for (name, (k, r)) in channels {
+                if k <= 0.0 && r <= 0.0 {
+                    errors.push(format!("SILAC: the {name} channel labels neither K nor R."));
+                }
+            }
+            let n = if self.silac == Silac::Triplex { 3 } else { 2 };
+            warnings.push(format!(
+                "SILAC: every peptide is searched in {n} label states, so the search takes about {n} times as long. \
+                 Ratios to light are written to silac.sage.tsv and silac_proteins.sage.tsv{}; they need MS1 spectra.",
+                if self.crosslink.enabled { " (crosslinks: crosslinks.silac.tsv)" } else { "" }
+            ));
+        }
 
         if self.fasta.trim().is_empty() {
             errors.push("Select a FASTA database (Files tab).".into());
@@ -1481,6 +1586,44 @@ mod test {
         let edc = Settings::from_json(&json!({"crosslink": {"reagent": "dmtmm"}})).unwrap();
         assert!(edc.crosslink.two_sites);
         assert_eq!(edc.crosslink.site2.residues, "DE");
+    }
+
+    /// SILAC is written as `database.silac`, read back, accepted by Sage, and
+    /// checked
+    #[test]
+    fn silac_round_trips_and_is_checked() {
+        let mut s = Settings::default();
+        assert!(s.to_json(&[])["database"].get("silac").is_none(), "off: not written");
+        s.silac = Silac::Triplex;
+        s.silac_medium = (4.025107, 6.020129);
+        s.silac_heavy = (8.014199, 10.008269);
+        s.crosslink.enabled = true;
+        s.silac_mixed = true;
+        let v = s.to_json(&[]);
+        assert_eq!(v["database"]["silac"]["channels"][0]["name"], json!("medium"));
+        assert_eq!(v["database"]["silac"]["channels"][1]["labels"]["R"], json!(10.008269));
+        let back = Settings::from_json(&v).unwrap();
+        assert_eq!(back.silac, Silac::Triplex);
+        assert_eq!((back.silac_medium, back.silac_heavy, back.silac_mixed), (s.silac_medium, s.silac_heavy, true));
+        // Sage reads it
+        let core: sage_core::silac::SilacSettings = serde_json::from_value(v["database"]["silac"].clone()).unwrap();
+        assert!(core.validate().is_ok());
+        assert_eq!(core.names(), ["light", "medium", "heavy"]);
+        let (errors, warnings) = s.check();
+        assert!(errors.iter().all(|e| !e.contains("SILAC")), "{errors:?}");
+        assert!(warnings.iter().any(|w| w.contains("3 label states") && w.contains("crosslinks.silac.tsv")));
+        // a channel without labels is an error; so are two identical channels
+        s.silac_heavy = (0.0, 0.0);
+        assert!(s.check().0.iter().any(|e| e.contains("heavy channel labels neither")));
+        s.silac_heavy = s.silac_medium;
+        assert!(s.check().0.iter().any(|e| e.contains("same labels")));
+        // duplex with only heavy lysine
+        s.silac = Silac::Duplex;
+        s.silac_heavy = (8.014199, 0.0);
+        let v = s.to_json(&[]);
+        assert_eq!(v["database"]["silac"]["channels"].as_array().unwrap().len(), 1);
+        assert!(v["database"]["silac"]["channels"][0]["labels"].get("R").is_none());
+        assert_eq!(Settings::from_json(&v).unwrap().silac_heavy, (8.014199, 0.0));
     }
 
     #[test]

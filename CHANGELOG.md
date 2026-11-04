@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.22.0] - 2026-11-04
+
+### Added
+- SILAC, duplex or triplex, in linear and crosslink searches (`database.silac`: labelled channels with a label mass per residue; `sage-gui`: Scoring & output tab → Quantification → SILAC, with Lys4/Lys6/Lys8/Arg6/Arg10 presets). Every peptide is searched light and in each channel with all its labelled residues labelled (no mixed states; 2–3× the search). Labels are modifications (`UNIMOD:259` Lys8, `UNIMOD:267` Arg10, `UNIMOD:188` Lys6/Arg6, `UNIMOD:481` Lys4), so fragments, exports and the viewer carry them; a label on a modified residue is one combined modification. Crosslinks: a labelled lysine still links, and a crosslink (or multivalent species) joins peptides of one channel unless `mixed_crosslinks` is set, in every backend. Quantification: each identified peptide and crosslinked species is traced in MS1 in all channels at once and integrated over one shared peak (identified in one channel, quantified in all): `silac.sage.tsv` (intensities and ratios to light per run), `silac_proteins.sage.tsv` (median ratio of unique peptides) and `crosslinks.silac.tsv`; `results.sage.tsv` and `crosslinks.sage.tsv` get a `silac_channel` column. Tested on synthetic data and on an unlabelled run as a negative control; not yet on a real SILAC sample. See SILAC.md.
+
 ## [v0.21.0] - 2026-11-04
 
 ### Added

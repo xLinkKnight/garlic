@@ -47,6 +47,7 @@ The spectrum annotation in `sage-gui` (ProForma 2.0 peptidoforms including cross
 - [Fragment indexing strategy](https://sage-docs.vercel.app/docs/how_it_works) allows for blazing fast narrow and open searches (> 500 Da precursor tolerance)
 - [Isobaric quantification](https://sage-docs.vercel.app/docs/how_it_works#tmt-based) (MS2/MS3-TMT, or custom reporter ions)
 - [Label-free quantification](https://sage-docs.vercel.app/docs/how_it_works#label-free): consider all charge states & isotopologues *a la* FlashLFQ
+- SILAC (duplex or triplex) in linear and crosslink searches, with MS1 ratios of every channel to light: see [SILAC.md](SILAC.md)
 - Capable of searching for [chimeric/co-fragmenting spectra](https://sage-docs.vercel.app/docs/configuration/additional)
 - Wide-window (dynamic precursor tolerance) search mode - [enables WWA/PRM/DIA searches](https://sage-docs.vercel.app/docs/configuration/tolerance#wide-window-mode)
 - Retention time prediction models fit to each LC/MS run

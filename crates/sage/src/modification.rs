@@ -245,6 +245,8 @@ impl Modification {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModificationError {
     TooMany,
+    /// Invalid `silac` settings
+    Silac(String),
     /// `max_count` only applies to variable modifications
     StaticMaxCount(ModificationSpecificity),
 }
@@ -257,6 +259,7 @@ impl Display for ModificationError {
                 "at most {} distinct modifications are supported",
                 u8::MAX
             ),
+            ModificationError::Silac(message) => write!(f, "{message}"),
             ModificationError::StaticMaxCount(specificity) => write!(
                 f,
                 "static modification {} cannot have a max_count",

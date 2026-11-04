@@ -579,6 +579,10 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                                     }
                                     let mut peptides = chosen.clone();
                                     peptides.push(PeptideIx((start + offset) as u32));
+                                    // SILAC: all peptides from one population of cells
+                                    if !db.same_silac_channel(&peptides) {
+                                        continue;
+                                    }
                                     let masses: Vec<f32> = peptides.iter().map(|&ix| db[ix].monoisotopic).collect();
                                     let mut key: Vec<u32> = peptides.iter().map(|ix| ix.0).collect();
                                     key.sort_unstable();

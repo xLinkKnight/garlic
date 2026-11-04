@@ -14,7 +14,7 @@ mod viewer;
 
 use eframe::egui::{self, Color32, ComboBox, Response, RichText, TextEdit, Ui};
 use runner::{Job, Status, Step};
-use settings::{Backend, ModKind, Modification, Reagent, Settings, TolUnit, Tolerance, Tmt};
+use settings::{Backend, ModKind, Modification, Reagent, Settings, Silac, TolUnit, Tolerance, Tmt};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
@@ -344,7 +344,7 @@ impl SageGui {
             raw_files: self.s.spectra.iter().filter(|f| Settings::is_thermo_raw(f)).count(),
             crosslink: xl.enabled,
             linear: xl.enabled && xl.linear_search,
-            quant: self.s.lfq || self.s.tmt != Tmt::None,
+            quant: self.s.lfq || self.s.tmt != Tmt::None || self.s.silac != Silac::Off,
             gpu_backend: xl.enabled && matches!(xl.backend, Backend::Gpu | Backend::Auto),
             output_dir: out.clone(),
         }));
@@ -1817,7 +1817,8 @@ fn scoring_tab(ui: &mut Ui, s: &mut Settings) {
     heading(ui, "Quantification");
     if s.crosslink.enabled {
         note(ui, "Crosslink search: label-free intensities are written per crosslinked peptide pair to \
-            crosslinks.lfq.tsv; TMT reporter intensities are added as columns of crosslinks.sage.tsv.");
+            crosslinks.lfq.tsv; TMT reporter intensities are added as columns of crosslinks.sage.tsv; \
+            SILAC ratios per crosslinked species go to crosslinks.silac.tsv.");
     }
     grid(ui, "quant", |ui| {
         row(ui, "Label-free (LFQ)", "Extract MS1 peak areas across all runs. Needs MS1 spectra in the files.\n\
@@ -1825,9 +1826,9 @@ fn scoring_tab(ui: &mut Ui, s: &mut Settings) {
             • Crosslink search: per crosslinked peptide pair (link-site isomers can't be told apart in MS1), \
             in crosslinks.lfq.tsv. Runs are aligned on crosslinks identified in several runs.",
             |ui| ui.checkbox(&mut s.lfq, "label-free quantification"));
-        if s.lfq {
+        if s.lfq || s.silac != Silac::Off {
             row(ui, "LFQ q-value cutoff", "Only peptides (or crosslinks, by crosslink q-value) at or below this \
-                q-value are quantified. Default 0.01 (1% FDR).",
+                q-value are quantified, by LFQ and SILAC. Default 0.01 (1% FDR).",
                 |ui| theme::number(ui, &mut s.lfq_q, 0.0..=1.0, 0.01, |d| d.max_decimals(3)));
             row(ui, "MS1 tolerance", "Mass tolerance for tracing precursor isotopes in MS1, in ppm. Default 5; \
                 10 for older or lower-resolution instruments.",
@@ -1860,6 +1861,37 @@ fn scoring_tab(ui: &mut Ui, s: &mut Settings) {
             row(ui, "Signal-to-noise", "Report reporter signal-to-noise instead of intensity (Thermo files with noise data).",
                 |ui| ui.checkbox(&mut s.tmt_sn, "use S/N"));
         }
+        row(ui, "SILAC", "Stable isotope labels in cell culture. Every peptide is searched light and in each \
+            labelled channel, with all of its K and R labelled (no mixed states), so the search takes 2 or 3 times \
+            as long. A labelled lysine still crosslinks.\n\
+            Each identified peptide (and crosslinked species) is traced in MS1 in every channel at once, over one \
+            shared peak, with the MS1 tolerance and spectral angle above: silac.sage.tsv (intensities and ratios \
+            to light per run), silac_proteins.sage.tsv (median ratio of each protein's unique peptides) and \
+            crosslinks.silac.tsv. results.sage.tsv and crosslinks.sage.tsv get a silac_channel column.",
+            |ui| {
+                ComboBox::from_id_salt("silac")
+                    .selected_text(s.silac.label())
+                    .show_ui(ui, |ui| {
+                        for x in Silac::ALL {
+                            ui.selectable_value(&mut s.silac, x, x.label());
+                        }
+                    })
+                    .response
+            });
+        if s.silac == Silac::Triplex {
+            row(ui, "Medium labels", "Label masses of the medium channel on K and R (Da); 0: not labelled.",
+                |ui| silac_labels(ui, "silac_medium", &mut s.silac_medium));
+        }
+        if s.silac != Silac::Off {
+            row(ui, "Heavy labels", "Label masses of the heavy channel on K and R (Da); 0: not labelled.",
+                |ui| silac_labels(ui, "silac_heavy", &mut s.silac_heavy));
+            if s.crosslink.enabled {
+                row(ui, "Mixed crosslinks", "Off (default): a crosslink joins peptides of one channel, since they \
+                    come from the same cells. On: also light-heavy crosslinks, e.g. when lysates were mixed before \
+                    crosslinking.",
+                    |ui| ui.checkbox(&mut s.silac_mixed, "crosslinks between channels"));
+            }
+        }
     });
 
     heading(ui, "Extra output");
@@ -1878,6 +1910,31 @@ fn scoring_tab(ui: &mut Ui, s: &mut Settings) {
             spectrum files.",
             |ui| ui.checkbox(&mut s.write_annotator, "write .annotator.csv files"));
     });
+}
+
+/// K and R label masses of a SILAC channel: a preset or any mass
+fn silac_labels(ui: &mut Ui, id: &str, masses: &mut (f64, f64)) -> egui::Response {
+    ui.horizontal(|ui| {
+        for (residue, mass) in [('K', &mut masses.0), ('R', &mut masses.1)] {
+            ui.label(theme::bold(residue.to_string()));
+            let shown = settings::SILAC_LABELS
+                .iter()
+                .find(|(_, r, m)| *r == residue && (*m - *mass).abs() < 1e-4)
+                .map_or_else(|| if *mass > 0.0 { "custom".to_string() } else { "none".to_string() }, |(n, _, _)| n.to_string());
+            ComboBox::from_id_salt((id, residue))
+                .selected_text(shown)
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    for (name, _, m) in settings::SILAC_LABELS.iter().filter(|(_, r, _)| *r == residue) {
+                        ui.selectable_value(mass, *m, *name);
+                    }
+                    ui.selectable_value(mass, 0.0, "none");
+                });
+            theme::number(ui, mass, 0.0..=50.0, 1.0, |d| d.max_decimals(6).suffix(" Da"));
+            ui.add_space(10.0);
+        }
+    })
+    .response
 }
 
 const VIEW_TIP: &str = "Show the matches of this results folder on the \"Annotated spectra\" tab: \
@@ -2183,6 +2240,7 @@ mod screenshots {
         s.crosslink.enabled = true;
         s.crosslink.multivalent = true;
         s.crosslink.valency = 3;
+        s.silac = Silac::Triplex;
         let tabs: [(&str, fn(&mut Ui, &mut Settings)); 3] =
             [("database", database_tab), ("scoring", scoring_tab), ("crosslinking", crosslink_tab)];
         for (name, tab) in tabs {
@@ -2190,7 +2248,7 @@ mod screenshots {
             // fonts take effect on the frame after they are set: draw from the second
             let mut installed = false;
             let mut harness = Harness::builder()
-                .with_size(egui::vec2(980.0, 1300.0))
+                .with_size(egui::vec2(980.0, 1900.0))
                 .build_ui(move |ui| {
                     if !installed {
                         theme::install(ui.ctx(), false);

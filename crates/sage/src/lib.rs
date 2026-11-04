@@ -17,5 +17,6 @@ pub mod modification;
 pub mod peptide;
 pub mod protein_grouping;
 pub mod scoring;
+pub mod silac;
 pub mod spectrum;
 pub mod tmt;

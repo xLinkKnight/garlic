@@ -634,6 +634,11 @@ K would block every lysine link (Sage warns). Instead:
 Sage then links only the unlabelled form of a lysine while the other lysines of
 the peptide may carry the label.
 
+**SILAC.** With SILAC channels (`database.silac`) a labelled lysine still links,
+a crosslink joins peptides of one channel (unless `mixed_crosslinks`), and
+`crosslinks.silac.tsv` gives each crosslinked species' intensity in every
+channel and its ratios to light per run. See [SILAC.md](SILAC.md).
+
 **Label-free (MS1).** With `"lfq": true` Sage writes `crosslinks.lfq.tsv`, one
 row per crosslinked *species* (peptide pair or loop-linked peptide; link-site
 isomers have the same MS1 signal and are not separated) with its intensity in

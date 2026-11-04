@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
+use std::sync::Arc;
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct EnzymeBuilder {
@@ -191,15 +192,34 @@ pub struct Builder {
     pub prefilter: Option<bool>,
     /// Pre-filter the database with a minimal amount of memory at the cost of speed
     pub prefilter_low_memory: Option<bool>,
+    /// SILAC: labelled channels; every peptide is also searched in each
+    pub silac: Option<crate::silac::SilacSettings>,
 }
 
 impl Builder {
     pub fn make_parameters(self) -> Result<Parameters, ModificationError> {
         let bucket_size = self.bucket_size.unwrap_or(8192).next_power_of_two();
-        let modifications = ResolvedModifications::new(
+        let mut modifications = ResolvedModifications::new(
             &self.static_mods.unwrap_or_default(),
             &self.variable_mods.unwrap_or_default(),
         )?;
+        let labels = match &self.silac {
+            Some(silac) => {
+                silac.validate().map_err(ModificationError::Silac)?;
+                let configured: Vec<(ModificationSpecificity, ModId)> = modifications
+                    .static_mods
+                    .iter()
+                    .copied()
+                    .chain(modifications.variable_mods.iter().map(|&(s, id, _)| (s, id)))
+                    .collect();
+                Some(Arc::new(crate::silac::Labels::register(
+                    silac,
+                    &mut modifications.registry,
+                    &configured,
+                )?))
+            }
+            None => None,
+        };
         Ok(Parameters {
             bucket_size,
             peptide_min_mass: self.peptide_min_mass.unwrap_or(500.0),
@@ -216,6 +236,8 @@ impl Builder {
             prefilter_chunk_size: self.prefilter_chunk_size.unwrap_or(0),
             prefilter: self.prefilter.unwrap_or(false),
             prefilter_low_memory: self.prefilter_low_memory.unwrap_or(true),
+            silac: self.silac,
+            labels,
         })
     }
 
@@ -243,6 +265,12 @@ pub struct Parameters {
     pub prefilter_chunk_size: usize,
     pub prefilter: bool,
     pub prefilter_low_memory: bool,
+    /// SILAC channels (`None`: no labels)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub silac: Option<crate::silac::SilacSettings>,
+    /// The SILAC labels as modification ids
+    #[serde(skip)]
+    pub labels: Option<Arc<crate::silac::Labels>>,
 }
 
 impl Parameters {
@@ -315,6 +343,11 @@ impl Parameters {
                         self.max_combinations,
                     )
                     .into_iter()
+                    // SILAC: each peptide light and in every labelled channel
+                    .flat_map(|peptide| match &self.labels {
+                        Some(labels) => labels.states(peptide),
+                        None => vec![peptide],
+                    })
                     .filter(|peptide| {
                         peptide.monoisotopic >= self.peptide_min_mass
                             && peptide.monoisotopic <= self.peptide_max_mass
@@ -464,6 +497,15 @@ impl Parameters {
             })
             .collect::<Vec<_>>();
 
+        // SILAC: the channel of every peptide, for pairing crosslinks and quantifying
+        let silac_channels = match &self.labels {
+            Some(labels) => target_decoys
+                .par_iter()
+                .map(|p| labels.channel(p).unwrap_or(NO_CHANNEL))
+                .collect(),
+            None => Vec::new(),
+        };
+
         IndexedDatabase {
             peptides: target_decoys,
             fragments,
@@ -473,6 +515,8 @@ impl Parameters {
             generate_decoys: self.generate_decoys,
             modifications: self.modifications.registry,
             decoy_tag: self.decoy_tag,
+            silac: self.labels,
+            silac_channels,
         }
     }
 }
@@ -619,9 +663,42 @@ pub struct IndexedDatabase {
     pub bucket_size: usize,
     pub generate_decoys: bool,
     pub decoy_tag: String,
+    /// SILAC labels, when searched with them
+    pub silac: Option<Arc<crate::silac::Labels>>,
+    /// SILAC channel of each peptide (by index), [`NO_CHANNEL`] for one
+    /// without labelled residues; empty without SILAC
+    pub silac_channels: Vec<u8>,
 }
 
+/// SILAC channel of a peptide without labelled residues
+pub const NO_CHANNEL: u8 = u8::MAX;
+
 impl IndexedDatabase {
+    /// SILAC channel of a peptide: `Some(0)` light, `None` without SILAC or
+    /// labelled residues
+    pub fn silac_channel(&self, ix: PeptideIx) -> Option<u8> {
+        self.silac_channels.get(ix.0 as usize).copied().filter(|&c| c != NO_CHANNEL)
+    }
+
+    /// Can these peptides be crosslinked into one species? Without SILAC, or
+    /// with mixed crosslinks allowed, always; otherwise they share a channel
+    /// (peptides without labelled residues fit any)
+    pub fn same_silac_channel(&self, peptides: &[PeptideIx]) -> bool {
+        if self.silac_channels.is_empty() || self.silac.as_ref().is_some_and(|l| l.mixed_crosslinks) {
+            return true;
+        }
+        let mut channel = None;
+        for &p in peptides {
+            if let Some(c) = self.silac_channel(p) {
+                match channel {
+                    Some(x) if x != c => return false,
+                    _ => channel = Some(c),
+                }
+            }
+        }
+        true
+    }
+
     /// Create a new [`IndexedQuery`] for a specific [`ProcessedSpectrum`]
     ///
     /// All matches returned by the query will be within the specified tolerance
@@ -916,6 +993,8 @@ mod test {
             prefilter: false,
             prefilter_chunk_size: 0,
             prefilter_low_memory: true,
+            silac: None,
+            labels: None,
         };
 
         let peptides = params.digest(&fasta);

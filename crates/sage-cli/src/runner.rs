@@ -30,6 +30,7 @@ mod annotator_export;
 mod crosslink_export;
 mod crosslink_mzid;
 mod crosslink_runner;
+mod silac_tables;
 mod summary_tables;
 
 pub struct Runner {
@@ -371,7 +372,8 @@ impl Runner {
     }
 
     fn requires_ms1(&self) -> bool {
-        self.parameters.quant.lfq
+        // SILAC ratios come from MS1 too
+        self.parameters.quant.lfq || self.database.silac.is_some()
     }
 
     fn process_chunk(
@@ -701,6 +703,12 @@ impl Runner {
         let tables = self.write_summary_tables(&outputs.features, &filenames, areas.as_ref())?;
         self.parameters.output_paths.extend(tables);
 
+        // SILAC: ratios of every channel to light, per peptide and protein
+        if self.database.silac.is_some() {
+            let tables = self.write_silac_linear(&outputs.features, &outputs.ms1, &filenames)?;
+            self.parameters.output_paths.extend(tables);
+        }
+
         // Write percolator input file if requested
         if self.parameters.write_pin {
             self.parameters
@@ -821,6 +829,9 @@ impl Runner {
                 .as_bytes(),
         );
         record.push_field(ryu::Buffer::new().format(feature.ms2_intensity).as_bytes());
+        if self.database.silac.is_some() {
+            record.push_field(silac_tables::channel_name(&self.database, feature.peptide_idx).as_bytes());
+        }
         record
     }
 
@@ -929,6 +940,10 @@ impl Runner {
             "protein_group_q",
             "ms2_intensity",
         ];
+        let mut csv_headers = csv_headers;
+        if self.database.silac.is_some() {
+            csv_headers.push("silac_channel");
+        }
 
         let headers = csv::ByteRecord::from(csv_headers);
 

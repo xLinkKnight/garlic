@@ -346,6 +346,10 @@ pub struct CrosslinkSettings {
     /// strong peptide with a barely matched partner, passes as a crosslink.
     #[serde(default = "default_linked_peaks")]
     pub min_linked_peaks: u16,
+    /// SILAC label modifications (set from the database, not configured): a
+    /// labelled residue is still free to react, unlike a modified one
+    #[serde(skip)]
+    pub labels: Vec<crate::modification::ModId>,
 }
 
 impl Default for CrosslinkSettings {
@@ -368,6 +372,7 @@ impl Default for CrosslinkSettings {
             chain_survivors: default_chain_survivors(),
             linear_search: default_linear_search(),
             min_linked_peaks: default_linked_peaks(),
+            labels: Vec::new(),
         }
     }
 }
@@ -577,7 +582,9 @@ impl CrosslinkSettings {
         let n = peptide.sequence.len();
         let mut sites = Vec::new();
         for (i, aa) in peptide.sequence.iter().enumerate() {
-            if !residues.contains(aa) || peptide.modifications[i].is_some() {
+            // a modified residue is blocked; a SILAC label is only isotopes
+            let blocked = peptide.modifications[i].is_some_and(|m| !self.labels.contains(&m));
+            if !residues.contains(aa) || blocked {
                 continue;
             }
             if i + 1 == n
@@ -1263,6 +1270,10 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                         .enumerate()
                     {
                         let partner = PeptideIx((start + offset) as u32);
+                        // SILAC: both peptides from one population of cells
+                        if !db.same_silac_channel(&[seed, partner]) {
+                            continue;
+                        }
                         let key = (seed.0.min(partner.0), seed.0.max(partner.0));
                         if !seen.insert(key) {
                             continue;
@@ -1501,7 +1512,7 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
 
                 for (_, i, j) in candidates {
                     let (ix_a, ix_b) = (survivors[i].peptide, survivors[j].peptide);
-                    if !seen.insert((ix_a, ix_b)) {
+                    if !db.same_silac_channel(&[PeptideIx(ix_a), PeptideIx(ix_b)]) || !seen.insert((ix_a, ix_b)) {
                         continue;
                     }
                     let (a, b) = (&db.peptides[ix_a as usize], &db.peptides[ix_b as usize]);
@@ -1848,6 +1859,9 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                     for &(ix_a, end_a, site_a, tally_a, score_a) in &side_a {
                         for &(ix_b, end_b, site_b, tally_b, score_b) in &side_b {
                             if ends == 2 && end_a == end_b {
+                                continue;
+                            }
+                            if !db.same_silac_channel(&[PeptideIx(ix_a), PeptideIx(ix_b)]) {
                                 continue;
                             }
                             let pair = (ix_a, site_a, tally_a, score_a, ix_b, site_b, tally_b, score_b);
@@ -3438,6 +3452,80 @@ mod test {
         let mut ions = chain_ions(a, &db.modifications, &kinds, Link::Single { site: sa, shift: b.monoisotopic + DSS });
         ions.extend(chain_ions(b, &db.modifications, &kinds, Link::Single { site: sb, shift: a.monoisotopic + DSS }));
         spectrum(a.monoisotopic + b.monoisotopic + DSS, 3, &ions)
+    }
+
+    /// SILAC duplex: the pair fixture's peptides in both states, over the
+    /// distractors; the crosslink settings know the labels
+    fn silac_fixture(mixed: bool) -> (IndexedDatabase, CrosslinkSettings, Peptide, Peptide, Peptide, Peptide) {
+        let params = Builder {
+            fasta: Some("unused.fasta".into()),
+            silac: Some(crate::silac::SilacSettings {
+                channels: vec![crate::silac::SilacChannel {
+                    name: "heavy".into(),
+                    labels: [("K".to_string(), 8.014199), ("R".to_string(), 10.008269)].into(),
+                }],
+                mixed_crosslinks: mixed,
+            }),
+            ..Default::default()
+        }
+        .make_parameters()
+        .unwrap();
+        let labels = params.labels.clone().unwrap();
+        let a = peptide("GLEKVSTAAMQR", "PROT_A", Position::Internal);
+        let b = peptide("TDYHFPNEWKLIR", "PROT_B", Position::Internal);
+        let mut targets = distractors(400);
+        targets.push(a.clone());
+        targets.push(b.clone());
+        let mut all = Vec::new();
+        for t in targets {
+            for state in labels.states(t) {
+                all.push(state.reverse());
+                all.push(state);
+            }
+        }
+        Parameters::reorder_peptides(&mut all);
+        let db = params.build_from_peptides(all);
+        let heavy = |p: &Peptide| labels.states(p.clone()).pop().unwrap();
+        let (ha, hb) = (heavy(&a), heavy(&b));
+        let cfg = CrosslinkSettings { labels: labels.label_ids(), ..Default::default() };
+        (db, cfg, a, b, ha, hb)
+    }
+
+    /// A heavy lysine still reacts: a heavy-heavy crosslink is found, linked
+    /// through the labelled K of each peptide
+    #[test]
+    fn silac_heavy_lysines_link() {
+        let (db, cfg, _, _, ha, hb) = silac_fixture(false);
+        assert_eq!(cfg.link_sites(&ha), vec![3], "the heavy K is a link site, the C-terminal R is not");
+        let sc = scorer(&db);
+        let query = pair_spectrum(&db, &ha, &hb, 3, 9);
+        for kernel in [None, Some(kernel_for(&db, &cfg))] {
+            let xl = CrosslinkScorer::new(&sc, &cfg).with_kernel(kernel.as_ref().map(|k| k as &dyn ChainKernel));
+            let hits = xl.score(&query);
+            assert_eq!(hits.len(), 1, "{hits:?}");
+            let m = &hits[0];
+            assert_eq!((db.silac_channel(m.alpha), m.beta.and_then(|b| db.silac_channel(b))), (Some(1), Some(1)));
+            assert_eq!(pair_set(&db, m), vec![("GLEKVSTAAMQR".to_string(), 3), ("TDYHFPNEWKLIR".to_string(), 9)]);
+        }
+    }
+
+    /// A crosslink pairs peptides of one channel: light A with heavy B is not
+    /// a candidate, unless mixed crosslinks are allowed
+    #[test]
+    fn silac_pairs_share_a_channel() {
+        for mixed in [false, true] {
+            let (db, cfg, a, _, _, hb) = silac_fixture(mixed);
+            let light_a = db.peptides.iter().find(|p| !p.decoy && p.sequence.as_ref() == a.sequence.as_ref() && db.silac.as_ref().unwrap().channel(p) == Some(0)).unwrap().clone();
+            let sc = scorer(&db);
+            let xl = CrosslinkScorer::new(&sc, &cfg);
+            let hits = xl.score(&pair_spectrum(&db, &light_a, &hb, 3, 9));
+            let mixed_pair = hits.iter().any(|m| {
+                let channels = (db.silac_channel(m.alpha), m.beta.and_then(|b| db.silac_channel(b)));
+                pair_set(&db, m).len() == 2 && channels.0 != channels.1
+            });
+            assert_eq!(mixed_pair, mixed, "mixed {mixed}: {hits:?}");
+            assert!(db.same_silac_channel(&[]) && (mixed || !hits.iter().any(|m| m.beta.is_some() && !db.same_silac_channel(&[m.alpha, m.beta.unwrap()]))));
+        }
     }
 
     #[test]
