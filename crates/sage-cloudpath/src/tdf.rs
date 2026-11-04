@@ -144,6 +144,17 @@ impl TdfReader {
         Ok(spectra)
     }
 
+    /// Only the MS2 spectra with these ids (see [`TdfSpectra::read`])
+    pub fn read_ids(
+        &self,
+        path_name: impl AsRef<Path>,
+        file_id: usize,
+        config: BrukerProcessingConfig,
+        ids: &[usize],
+    ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError> {
+        Ok(TdfSpectra::open(path_name, file_id, config)?.read(ids))
+    }
+
     fn read_ms1_spectra(
         &self,
         path_name: impl AsRef<Path>,
@@ -266,6 +277,69 @@ impl TdfReader {
             intensity: spectrum.intensities().iter().map(|&x| x as f32).collect(),
             mobility: None,
         })
+    }
+}
+
+/// A Bruker run opened to read MS2 spectra by id, without decoding the
+/// rest of the run. Each spectrum is read exactly as [`TdfReader::parse`]
+/// reads it: the bulk read also gets every spectrum on its own, by index.
+pub struct TdfSpectra {
+    reader: SpectrumReader,
+    file_id: usize,
+}
+
+impl TdfSpectra {
+    pub fn open(
+        path_name: impl AsRef<Path>,
+        file_id: usize,
+        config: BrukerProcessingConfig,
+    ) -> Result<Self, timsrust::TimsRustError> {
+        let path = timsrust::TimsTofPath::new(path_name.as_ref().to_string_lossy().as_ref())?;
+        let reader = SpectrumReader::build()
+            .with_path(path)
+            .with_config(config.ms2.into())
+            .finalize()?;
+        Ok(TdfSpectra { reader, file_id })
+    }
+
+    /// The spectra with these ids (Sage's spectrum ids: the TDF precursor
+    /// ids); ids that are not in the run are left out
+    pub fn read(&self, ids: &[usize]) -> Vec<RawSpectrum> {
+        let n = self.reader.len();
+        // DDA precursor ids run 1, 2, ...: spectrum `id` is at index id - 1
+        let direct: Vec<Result<RawSpectrum, usize>> = ids
+            .par_iter()
+            .map(|&id| {
+                id.checked_sub(1)
+                    .filter(|&i| i < n)
+                    .and_then(|i| self.reader.get(i).ok())
+                    .filter(|s| s.index() == id)
+                    .and_then(|s| TdfReader::parse_spectrum(self.file_id, &s))
+                    .ok_or(id)
+            })
+            .collect();
+        let mut spectra = Vec::with_capacity(ids.len());
+        let mut missing = std::collections::HashSet::new();
+        for r in direct {
+            match r {
+                Ok(s) => spectra.push(s),
+                Err(id) => {
+                    missing.insert(id);
+                }
+            }
+        }
+        // ids numbered otherwise (or not in the run): look through the whole run
+        if !missing.is_empty() {
+            spectra.extend(
+                self.reader
+                    .par_iter()
+                    .filter_map(|s| s.ok())
+                    .filter(|s| missing.contains(&s.index()))
+                    .filter_map(|s| TdfReader::parse_spectrum(self.file_id, &s))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        spectra
     }
 }
 

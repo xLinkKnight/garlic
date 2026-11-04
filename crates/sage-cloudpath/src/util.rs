@@ -72,6 +72,35 @@ pub fn read_spectra(
     }
 }
 
+/// Only the spectra of one file with these ids (Sage's spectrum ids), as
+/// [`read_spectra`] reads them. Bruker data is read spectrum by spectrum,
+/// without decoding the rest of the run; other formats are read whole and
+/// filtered.
+pub fn read_spectra_with_ids(
+    url: &Url,
+    file_id: usize,
+    sn: Option<u8>,
+    bruker_processor: BrukerProcessingConfig,
+    ids: &std::collections::HashSet<String>,
+) -> Result<Vec<RawSpectrum>, Error> {
+    if FileFormat::from(url.as_ref()) == FileFormat::TDF {
+        let numbers: Vec<usize> = ids.iter().filter_map(|id| id.parse().ok()).collect();
+        if numbers.len() == ids.len() {
+            if url.scheme() != "file" {
+                return Err(Error::InvalidUri);
+            }
+            let path = url.to_file_path().map_err(|_| Error::InvalidUri)?;
+            return crate::tdf::TdfReader
+                .read_ids(&path, file_id, bruker_processor, &numbers)
+                .map_err(Error::TDF);
+        }
+    }
+    Ok(read_spectra(url, file_id, sn, bruker_processor, false)?
+        .into_iter()
+        .filter(|s| ids.contains(&s.id))
+        .collect())
+}
+
 pub fn read_mzml(
     url: &Url,
     file_id: usize,

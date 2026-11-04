@@ -6,7 +6,7 @@
 //! units are 150 per inch, so 1050 wide.
 
 use super::model::{Annotation, Kind, Link, PeakView, Series, StubIonKind};
-use super::{label_text, series_color, stub_color, UNMATCHED};
+use super::{bridge_end_stubs, label_text, peptide_stub_sets, series_color, species, stub_color, UNMATCHED};
 use eframe::egui::Color32;
 use std::fmt::Write;
 use std::path::Path;
@@ -296,9 +296,9 @@ fn peptide_svg(out: &mut String, a: &Annotation, peptide: usize, x: f64, top: f6
                 .filter(|s| match s.kind {
                     StubIonKind::NTerm(j) => n_term && j == i,
                     StubIonKind::CTerm(j) => !n_term && j == i,
-                    StubIonKind::Peptide => false,
+                    StubIonKind::Peptide | StubIonKind::Part { .. } => false,
                 })
-                .map(|s| s.stub)
+                .flat_map(|s| s.stubs.iter().copied())
                 .collect();
             stubs.sort_unstable();
             stubs.dedup();
@@ -340,6 +340,9 @@ fn coverage_svg(out: &mut String, a: &Annotation, y: f64) -> f64 {
             let _ = write!(out, r#"<text x="{:.1}" y="{:.1}" font-family="{FONT}" font-size="12" text-anchor="middle">{}</text>"#, (xa + xb) / 2.0, yb + 14.0, esc(&link.linker));
             yb + 22.0
         }
+        Some(link) if link.kind == Kind::Multi && a.coverage.len() >= 2 && !link.links.is_empty() => {
+            species_svg(out, a, link, x0, y + pad)
+        }
         _ => {
             let mut top = y + pad;
             for k in 0..a.coverage.len() {
@@ -374,24 +377,115 @@ fn bridge_svg(out: &mut String, a: &Annotation, link: &Link, x: f64, y_top: f64,
             .collect();
         stubs.sort_unstable();
         stubs.dedup();
-        let mut cx = x + 12.0;
-        for stub in stubs {
-            let color = hex(stub_color(stub));
-            let (tip, base) = if up { (-5.0, 4.0) } else { (5.0, -4.0) };
+        stubs_svg(out, link, &stubs, x + 12.0, cy, up);
+    }
+}
+
+/// Filled triangle with its tip up or down (toward the peptide carrying the stub)
+fn triangle_svg(out: &mut String, cx: f64, cy: f64, up: bool, color: &str) {
+    let (tip, base) = if up { (-5.0, 4.0) } else { (5.0, -4.0) };
+    let _ = write!(
+        out,
+        r#"<polygon points="{cx:.1},{:.1} {:.1},{:.1} {:.1},{:.1}" fill="{color}"/>"#,
+        cy + tip,
+        cx - 5.0,
+        cy + base,
+        cx + 5.0,
+        cy + base
+    );
+}
+
+/// A triangle and the name of each stub, left to right from `x`
+fn stubs_svg(out: &mut String, link: &Link, stubs: &[usize], x: f64, cy: f64, up: bool) {
+    let mut cx = x;
+    for &stub in stubs {
+        let color = hex(stub_color(stub));
+        triangle_svg(out, cx, cy, up, &color);
+        let name = &link.stubs[stub].name;
+        let _ = write!(out, r#"<text x="{:.1}" y="{:.1}" font-family="{FONT}" font-size="12" fill="{color}">{}</text>"#, cx + 8.0, cy + 4.0, esc(name));
+        cx += 8.0 + name.chars().count() as f64 * 7.0 + 10.0;
+    }
+}
+
+/// A multivalent species, as in the viewer: peptides as rows, a bridge per
+/// link (`XLn`), the stubs found where each linker broke, and after a
+/// peptide with two or more links its peptide + stubs peaks. Returns the
+/// bottom.
+fn species_svg(out: &mut String, a: &Annotation, link: &Link, x0: f64, y: f64) -> f64 {
+    const GAP: f64 = 52.0;
+    const LANE: f64 = 12.0;
+    let pad = 12.0;
+    let lengths: Vec<usize> = a.coverage.iter().map(|c| c.residues.len()).collect();
+    let l = species::layout(&lengths, &link.links);
+    let row_h = CELL_H + 2.0 * pad;
+    let top = |row: usize| y + row as f64 * (row_h + GAP);
+    let x_of = |row: usize, residue: usize| x0 + CELL_W * (l.column(row, residue) as f64 + 0.5);
+    let cells_end = x0 + CELL_W * l.cells as f64;
+    let lanes_w = if l.lanes > 0 { 14.0 + LANE * l.lanes as f64 } else { 0.0 };
+    for (row, &k) in l.rows.iter().enumerate() {
+        let t = top(row);
+        let _ = write!(
+            out,
+            r#"<text x="24" y="{:.1}" font-family="{FONT}" font-size="13">peptide {}</text>"#,
+            t + CELL_H / 2.0 + 5.0,
+            k + 1
+        );
+        peptide_svg(out, a, k, x0 + CELL_W * l.offsets[row] as f64, t, &link.ends_of(k));
+        let mut x = cells_end + lanes_w + 14.0;
+        for set in peptide_stub_sets(a, link, k) {
+            for &stub in &set {
+                triangle_svg(out, x + 5.0, t + CELL_H / 2.0, true, &hex(stub_color(stub)));
+                x += 11.0;
+            }
+            let names = set.iter().map(|&j| link.stubs[j].name.as_str()).collect::<Vec<_>>().join("+");
             let _ = write!(
                 out,
-                r#"<polygon points="{cx:.1},{:.1} {:.1},{:.1} {:.1},{:.1}" fill="{color}"/>"#,
-                cy + tip,
-                cx - 5.0,
-                cy + base,
-                cx + 5.0,
-                cy + base
+                r##"<text x="{:.1}" y="{:.1}" font-family="{FONT}" font-size="12" fill="#666666">{}</text>"##,
+                x + 2.0,
+                t + CELL_H / 2.0 + 4.0,
+                esc(&names)
             );
-            let name = &link.stubs[stub].name;
-            let _ = write!(out, r#"<text x="{:.1}" y="{:.1}" font-family="{FONT}" font-size="12" fill="{color}">{}</text>"#, cx + 8.0, cy + 4.0, esc(name));
-            cx += 8.0 + name.chars().count() as f64 * 7.0 + 10.0;
+            x += 2.0 + names.chars().count() as f64 * 7.0 + 12.0;
         }
     }
+    for b in &l.bridges {
+        let (xu, yu) = (x_of(b.upper.0, b.upper.1), top(b.upper.0) + CELL_H - 2.0);
+        let (xl, yl) = (x_of(b.lower.0, b.lower.1), top(b.lower.0) + 2.0);
+        let name = format!("XL{}", b.link + 1);
+        let (x_upper_end, x_lower_end) = match b.lane {
+            None => {
+                let _ = write!(out, r##"<line x1="{xu:.1}" y1="{yu:.1}" x2="{xl:.1}" y2="{yl:.1}" stroke="#888888" stroke-width="2.5"/>"##);
+                let _ = write!(
+                    out,
+                    r#"<text x="{:.1}" y="{:.1}" font-family="{FONT}" font-size="12" text-anchor="end">{name}</text>"#,
+                    (xu + xl) / 2.0 - 9.0,
+                    (yu + yl) / 2.0 + 4.0
+                );
+                let at = |yy: f64| xu + (xl - xu) * (yy - yu) / (yl - yu);
+                (at(yu + 13.0), at(yl - 13.0))
+            }
+            Some(lane) => {
+                let x_lane = cells_end + 14.0 + LANE * lane as f64;
+                let y1 = top(b.upper.0) + CELL_H + pad + GAP / 2.0 + 4.0 * lane as f64;
+                let y2 = top(b.lower.0) - pad - GAP / 2.0 - 4.0 * lane as f64;
+                let _ = write!(
+                    out,
+                    r##"<path d="M{xu:.1},{yu:.1} V{y1:.1} H{x_lane:.1} V{y2:.1} H{xl:.1} V{yl:.1}" fill="none" stroke="#888888" stroke-width="2.5"/>"##
+                );
+                let _ = write!(
+                    out,
+                    r#"<text x="{:.1}" y="{:.1}" font-family="{FONT}" font-size="12" text-anchor="middle">{name}</text>"#,
+                    (xu + x_lane) / 2.0,
+                    y1 - 4.0
+                );
+                (xu, xl)
+            }
+        };
+        for ((row, _), x, cy, up) in [(b.upper, x_upper_end, yu + 13.0, true), (b.lower, x_lower_end, yl - 13.0, false)] {
+            stubs_svg(out, link, &bridge_end_stubs(a, link, b.link, l.rows[row]), x + 12.0, cy, up);
+        }
+    }
+    top(l.rows.len() - 1) + CELL_H + pad
 }
 
 fn legend_svg(out: &mut String, a: &Annotation, y: f64) -> f64 {
@@ -409,7 +503,7 @@ fn legend_svg(out: &mut String, a: &Annotation, y: f64) -> f64 {
     }
     if let Some(link) = &a.link {
         for (j, stub) in link.stubs.iter().enumerate() {
-            if a.stub_ions.iter().any(|s| s.stub == j) {
+            if a.stub_ions.iter().any(|s| s.stubs.contains(&j)) {
                 items.push((stub_color(j), format!("{} {} ({:+.3})", stub.name, stub.description, stub.mass)));
             }
         }
@@ -446,10 +540,23 @@ pub fn export(svg: &str, format: Format, dpi: u32, background: bool, path: &Path
     .map_err(|e| e.to_string())
 }
 
+/// The system fonts, loaded once: loading them takes a good part of a
+/// second, which every figure (each mobiligram of a search) would pay again
+fn system_fonts() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
+    static FONTS: std::sync::OnceLock<std::sync::Arc<resvg::usvg::fontdb::Database>> = std::sync::OnceLock::new();
+    FONTS
+        .get_or_init(|| {
+            let mut fonts = resvg::usvg::fontdb::Database::new();
+            fonts.load_system_fonts();
+            std::sync::Arc::new(fonts)
+        })
+        .clone()
+}
+
 /// The SVG parsed for rendering, with the system fonts
 fn parse(svg: &str) -> Result<(resvg::usvg::Tree, f32), String> {
     let mut options = resvg::usvg::Options::default();
-    options.fontdb_mut().load_system_fonts();
+    options.fontdb = system_fonts();
     let tree = resvg::usvg::Tree::from_str(svg, &options).map_err(|e| e.to_string())?;
     Ok((tree, options.dpi))
 }
@@ -532,6 +639,19 @@ mod test {
         // transparent figure: the corner pixel is see-through, opaque otherwise
         assert_eq!(rasterize(&without, 150).unwrap().get_pixel(0, 0)[3], 0);
         assert_eq!(image.get_pixel(0, 0).0, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn multivalent_figure_holds_every_link_and_its_stubs() {
+        let (_, a) = super::super::model::test::cleaved_multi();
+        let figure = svg(&a, &options(true));
+        for text in [">XL1</text>", ">XL2</text>", ">peptide 3</text>", ">A+S</text>", ">S+S</text>"] {
+            assert!(figure.contains(text), "{text}");
+        }
+        // as in the viewer: 5 triangles on the bridges, 4 after peptide 2
+        assert_eq!(figure.matches("<polygon").count(), 9);
+        assert!(figure.contains("y17+A+S"));
+        assert!(rasterize(&figure, 150).is_ok());
     }
 
     #[test]

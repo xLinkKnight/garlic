@@ -2,30 +2,33 @@
 //! picked, its spectrum annotated by Annotator's engine (see [`model`]).
 
 pub mod figure;
+pub mod loader;
 pub mod mobiligram;
 pub mod model;
+pub mod species;
 
 use eframe::egui::{self, Color32, RichText, Ui};
 use egui_plot::{Bar, BarChart, Plot, PlotPoint, Text};
 use model::{annotate, Annotation, Kind, Model, Peaks, Results, Series, SpectrumKey, StubIonKind};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::mpsc::{channel, Receiver};
+use std::path::PathBuf;
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Arc;
-
-/// Messages from the thread that reads spectra
-enum Loaded {
-    Progress(String),
-    Done(Result<HashMap<SpectrumKey, Peaks>, String>),
-}
 
 pub struct Viewer {
     pub folder: String,
     results: Option<Arc<Results>>,
     message: Option<(bool, String)>,
     spectra: HashMap<SpectrumKey, Peaks>,
-    loading: Option<Receiver<Loaded>>,
-    loading_text: String,
+    /// The results folder being read (in the background)
+    opening: Option<Receiver<Result<Results, String>>>,
+    /// Reads spectra in the background: the match picked, then the rows in view
+    loader: Option<loader::Loader>,
+    /// Spectra asked for (each once), and those not in their file
+    requested: HashSet<SpectrumKey>,
+    not_found: HashSet<SpectrumKey>,
+    /// The spectrum file being read
+    reading: Option<String>,
     show_linear: bool,
     show_crosslinks: bool,
     targets_only: bool,
@@ -60,8 +63,11 @@ impl Default for Viewer {
             results: None,
             message: None,
             spectra: HashMap::new(),
-            loading: None,
-            loading_text: String::new(),
+            opening: None,
+            loader: None,
+            requested: HashSet::new(),
+            not_found: HashSet::new(),
+            reading: None,
             show_linear: true,
             show_crosslinks: true,
             targets_only: true,
@@ -116,85 +122,102 @@ fn stub_color(stub: usize) -> Color32 {
 const UNMATCHED: Color32 = Color32::from_rgb(175, 175, 175);
 
 impl Viewer {
-    /// Load the results in `folder` and start reading the spectra of the
-    /// matches that pass the filters
+    /// Read the results in `folder` (in the background); spectra are read
+    /// as matches are picked
     pub fn open(&mut self, folder: &str) {
         self.folder = folder.to_string();
         self.results = None;
         self.spectra.clear();
-        self.loading = None;
+        self.loader = None;
+        self.requested.clear();
+        self.not_found.clear();
+        self.reading = None;
         self.selected = None;
         self.annotation = None;
         self.annotated = None;
         self.filter_key.clear();
         self.mobiligram.points = None;
         self.mobiligram.file = None;
-        match Results::load(Path::new(folder)) {
-            Ok(results) => {
-                let (linear, crosslinks) = results.matches.iter().fold((0, 0), |(l, x), m| match m.kind {
-                    Kind::Linear => (l + 1, x),
-                    _ => (l, x + 1),
-                });
-                self.message = Some((false, format!("{linear} linear and {crosslinks} crosslink matches")));
-                // Annotator's CID model includes MS-cleavable linker (DSSO / DSBU) stub ions
-                self.model = Model::CidHcd;
-                self.results = Some(Arc::new(results));
-                self.refilter();
-                self.read_shown_spectra();
-            }
-            Err(e) => self.message = Some((true, e)),
-        }
+        self.message = Some((false, "reading the results…".into()));
+        let (tx, rx) = channel();
+        let path = PathBuf::from(folder);
+        let _ = std::thread::Builder::new().name("results".into()).spawn(move || {
+            let _ = tx.send(Results::load(&path));
+        });
+        self.opening = Some(rx);
     }
 
-    /// Read (in the background) the spectra of the shown matches not read yet
-    fn read_shown_spectra(&mut self) {
-        let Some(results) = self.results.clone() else { return };
-        let wanted: HashSet<SpectrumKey> = self
-            .shown
-            .iter()
-            .map(|&i| results.matches[i].key())
-            .filter(|k| !self.spectra.contains_key(k))
+    /// The results are read: list the matches, start the spectrum reader
+    /// and show the best match
+    fn loaded(&mut self, results: Results, ctx: &egui::Context) {
+        let (linear, crosslinks) = results.matches.iter().fold((0, 0), |(l, x), m| match m.kind {
+            Kind::Linear => (l + 1, x),
+            _ => (l, x + 1),
+        });
+        self.message = Some((false, format!("{linear} linear and {crosslinks} crosslink matches")));
+        // Annotator's CID model includes MS-cleavable linker (DSSO / DSBU) stub ions
+        self.model = Model::CidHcd;
+        let results = Arc::new(results);
+        self.loader = Some(loader::Loader::start(results.clone(), ctx.clone()));
+        self.results = Some(results);
+        self.refilter();
+        self.selected = self.shown.first().copied();
+    }
+
+    /// Ask for a spectrum, unless it was asked for already: `now` for the
+    /// match picked, otherwise after it (rows in view)
+    fn request(&mut self, keys: Vec<SpectrumKey>, now: bool) {
+        let Some(loader) = &self.loader else { return };
+        let keys: Vec<SpectrumKey> = keys
+            .into_iter()
+            .filter(|k| !self.spectra.contains_key(k) && self.requested.insert(k.clone()))
             .collect();
-        if wanted.is_empty() {
+        if keys.is_empty() {
             return;
         }
-        let (tx, rx) = channel();
-        self.loading = Some(rx);
-        self.loading_text = format!("reading {} spectra", wanted.len());
-        std::thread::spawn(move || {
-            let progress = |msg: String| {
-                let _ = tx.send(Loaded::Progress(msg));
-            };
-            let result = results.read_spectra(&wanted, &progress);
-            let _ = tx.send(Loaded::Done(result));
-        });
+        if now {
+            keys.into_iter().for_each(|k| loader.send(loader::Request::Now(k)));
+        } else {
+            loader.send(loader::Request::Soon(keys));
+        }
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
-        let Some(rx) = &self.loading else { return };
-        let mut done = false;
-        while let Ok(msg) = rx.try_recv() {
-            match msg {
-                Loaded::Progress(text) => self.loading_text = text,
-                Loaded::Done(Ok(spectra)) => {
-                    self.spectra.extend(spectra);
-                    self.annotated = None;
-                    // start with the best match
-                    if self.selected.is_none() {
-                        self.selected = self.shown.first().copied();
+        if let Some(rx) = &self.opening {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.opening = None;
+                    match result {
+                        Ok(results) => self.loaded(results, ctx),
+                        Err(e) => self.message = Some((true, e)),
                     }
-                    done = true;
                 }
-                Loaded::Done(Err(e)) => {
-                    self.message = Some((true, e));
-                    done = true;
+                Err(TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(50)),
+                Err(TryRecvError::Disconnected) => {
+                    self.opening = None;
+                    self.message = Some((true, "could not read the results".into()));
                 }
             }
         }
-        if done {
-            self.loading = None;
-        } else {
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        let Some(loader) = &self.loader else { return };
+        while let Ok(event) = loader.events.try_recv() {
+            match event {
+                loader::Event::Spectra(spectra) => self.spectra.extend(spectra),
+                loader::Event::NotFound(keys) => self.not_found.extend(keys),
+                loader::Event::Failed(e) => self.message = Some((true, e)),
+                loader::Event::Busy(file) => self.reading = file,
+            }
+        }
+    }
+
+    /// Wait for [`Viewer::open`] to finish (tests)
+    #[cfg(test)]
+    fn wait_until_open(&mut self) {
+        if let Some(rx) = self.opening.take() {
+            match rx.recv().unwrap() {
+                Ok(results) => self.loaded(results, &egui::Context::default()),
+                Err(e) => self.message = Some((true, e)),
+            }
         }
     }
 
@@ -230,6 +253,10 @@ impl Viewer {
             .map(|(i, _)| i)
             .collect();
         shown.sort_by(|&a, &b| results.matches[b].score.total_cmp(&results.matches[a].score));
+        // files read whole (mzML, MGF) keep the spectra of every shown match
+        if let Some(loader) = &self.loader {
+            loader.send(loader::Request::Shown(shown.iter().map(|&i| results.matches[i].key()).collect()));
+        }
         self.shown = shown;
     }
 
@@ -278,7 +305,12 @@ impl Viewer {
         });
         if let Some((error, text)) = &self.message {
             let color = if *error { Color32::from_rgb(210, 60, 60) } else { ui.visuals().weak_text_color() };
-            ui.label(RichText::new(text).color(color));
+            ui.horizontal(|ui| {
+                if self.opening.is_some() {
+                    ui.spinner();
+                }
+                ui.label(RichText::new(text).color(color));
+            });
         }
         let Some(results) = self.results.clone() else { return };
 
@@ -294,16 +326,15 @@ impl Viewer {
             ui.add(egui::TextEdit::singleline(&mut self.search).desired_width(160.0).hint_text("peptide, protein, scan"));
             self.refilter();
             ui.label(RichText::new(format!("{} shown", self.shown.len())).weak());
-            let missing = self
-                .shown
-                .iter()
-                .filter(|&&i| !self.spectra.contains_key(&results.matches[i].key()))
-                .count();
-            if self.loading.is_some() {
+            // spectra are read as matches are picked or come into view
+            if let Some(file) = &self.reading {
                 ui.spinner();
-                ui.label(&self.loading_text);
-            } else if missing > 0 && ui.button(format!("Read {missing} more spectra")).clicked() {
-                self.read_shown_spectra();
+                ui.label(RichText::new(format!("reading spectra from {file}")).weak());
+            } else if !self.spectra.is_empty() {
+                ui.label(RichText::new(format!("{} spectra read", self.spectra.len())).weak()).on_hover_text(
+                    "Spectra are read as you pick matches or scroll to them: timsTOF spectra one by one \
+                     (as the search read them), mzML / MGF files whole, once.",
+                );
             }
             ui.separator();
             let has_mobility = results.matches.iter().any(|m| m.ion_mobility.is_some());
@@ -380,6 +411,7 @@ impl Viewer {
         let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
         let list = egui::Layout::top_down(egui::Align::LEFT);
         let width = self.list_width;
+        let mut in_view: Vec<SpectrumKey> = Vec::new();
         ui.allocate_ui_with_layout(egui::vec2(width, LIST_HEIGHT), list, |ui| {
             ui.set_width(width);
             // one line per match (rows must be of equal height): long titles end in "…",
@@ -392,6 +424,7 @@ impl Viewer {
                 .show_rows(ui, row_height, self.shown.len(), |ui, rows| {
                     for &i in &self.shown[rows] {
                         let m = &results.matches[i];
+                        in_view.push(m.key());
                         let tag = match m.kind {
                             Kind::Linear => "",
                             Kind::Crosslink => "XL ",
@@ -418,6 +451,11 @@ impl Viewer {
                     }
                 });
         });
+        // the spectra of the rows in view, after the one picked
+        if let Some(i) = self.selected {
+            self.request(vec![results.matches[i].key()], true);
+        }
+        self.request(in_view, false);
     }
 
     fn spectrum_view(&mut self, ui: &mut Ui, results: &Results) {
@@ -466,10 +504,22 @@ impl Viewer {
 
         let key = m.key();
         let Some(peaks) = self.spectra.get(&key) else {
-            if self.loading.is_some() {
-                ui.label(RichText::new("Reading the spectrum…").weak());
+            if self.not_found.contains(&key) {
+                ui.label(
+                    RichText::new(format!("Spectrum {} is not in {} (was the file changed after the search?).", m.scan, m.file))
+                        .color(Color32::from_rgb(210, 60, 60)),
+                );
             } else {
-                ui.label(RichText::new("Spectrum not read yet: use \"Read more spectra\" above.").weak());
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    // the first spectrum of a run waits for the run to be opened
+                    let text = if !self.spectra.keys().any(|(f, _)| f == &m.file) {
+                        format!("Opening {} (about a second for a timsTOF run)…", m.file)
+                    } else {
+                        "Reading the spectrum…".to_string()
+                    };
+                    ui.label(RichText::new(text).weak());
+                });
             }
             return;
         };
@@ -839,7 +889,8 @@ fn tolerance_text(t: sage_core::mass::Tolerance) -> String {
 
 /// Peak label as shown: `y7`, or `2:b5` for the second peptide of a crosslink
 fn label_text(a: &Annotation, label: &model::IonLabel) -> String {
-    if a.coverage.len() > 1 {
+    // parts of a multivalent species (`{2,3}+A`) name their peptides
+    if a.coverage.len() > 1 && !label.text.starts_with('{') {
         format!("{}:{}", label.peptide + 1, label.text)
     } else {
         label.text.clone()
@@ -964,9 +1015,9 @@ fn draw_peptide(painter: &egui::Painter, origin: egui::Pos2, a: &Annotation, pep
                 .filter(|s| match s.kind {
                     StubIonKind::NTerm(j) => n_term && j == i,
                     StubIonKind::CTerm(j) => !n_term && j == i,
-                    StubIonKind::Peptide => false,
+                    StubIonKind::Peptide | StubIonKind::Part { .. } => false,
                 })
-                .map(|s| s.stub)
+                .flat_map(|s| s.stubs.iter().copied())
                 .collect();
             stubs.sort_unstable();
             stubs.dedup();
@@ -994,37 +1045,45 @@ fn backbone_text(a: &Annotation, peptide: usize) -> String {
     format!("{seen} of {} positions with a backbone ion", c.residues.len())
 }
 
-/// The stub ions found, per peptide, for the tooltip of the map
+/// The stub ions found, per peptide and stubs carried, for the tooltip of
+/// the map; then the parts of a multivalent species freed by one linker
 fn stub_summary(a: &Annotation, link: &model::Link) -> String {
+    let ion_text = |s: &model::StubIon| {
+        let observed = a.peaks[s.peak].mz;
+        let ppm = (observed - s.theoretical_mz) / s.theoretical_mz * 1e6;
+        format!("{} {observed:.4} ({ppm:+.1} ppm)", s.text)
+    };
     let mut lines = Vec::new();
     for peptide in 0..a.coverage.len() {
-        for (j, stub) in link.stubs.iter().enumerate() {
-            let ions: Vec<String> = a
-                .stub_ions
-                .iter()
-                .filter(|s| s.peptide == peptide && s.stub == j)
-                .map(|s| {
-                    let observed = a.peaks[s.peak].mz;
-                    let ppm = (observed - s.theoretical_mz) / s.theoretical_mz * 1e6;
-                    format!("{} {observed:.4} ({ppm:+.1} ppm)", s.text)
-                })
-                .collect();
-            if !ions.is_empty() {
-                lines.push(format!(
-                    "peptide {} + {} ({}, {:+.4} Da): {}",
-                    peptide + 1,
-                    stub.name,
-                    stub.description,
-                    stub.mass,
-                    ions.join(", ")
-                ));
+        let mut groups: Vec<(&Vec<usize>, Vec<String>)> = Vec::new();
+        for s in a.stub_ions.iter().filter(|s| s.peptide == peptide && !matches!(s.kind, StubIonKind::Part { .. })) {
+            match groups.iter_mut().find(|(stubs, _)| *stubs == &s.stubs) {
+                Some((_, ions)) => ions.push(ion_text(s)),
+                None => groups.push((&s.stubs, vec![ion_text(s)])),
             }
+        }
+        groups.sort_by(|x, y| x.0.cmp(y.0));
+        for (stubs, ions) in groups {
+            let what = match stubs.as_slice() {
+                [j] => {
+                    let stub = &link.stubs[*j];
+                    format!("{} ({}, {:+.4} Da)", stub.name, stub.description, stub.mass)
+                }
+                many => many.iter().map(|&j| link.stubs[j].name.as_str()).collect::<Vec<_>>().join("+"),
+            };
+            lines.push(format!("peptide {} + {what}: {}", peptide + 1, ions.join(", ")));
+        }
+    }
+    for s in &a.stub_ions {
+        if let StubIonKind::Part { link: e, .. } = s.kind {
+            lines.push(format!("XL{} broken, the rest held together: {}", e + 1, ion_text(s)));
         }
     }
     if lines.is_empty() {
         "No stub ions found in this spectrum.".into()
     } else {
-        lines.join("\n")
+        lines.join("
+")
     }
 }
 
@@ -1037,6 +1096,9 @@ fn coverage_view(ui: &mut Ui, a: &Annotation) {
     match &a.link {
         Some(link) if link.kind == Kind::Crosslink && a.coverage.len() == 2 => crosslink_map(ui, a, link),
         Some(link) if link.kind == Kind::Loop && a.coverage.len() == 1 => loop_map(ui, a, link),
+        Some(link) if link.kind == Kind::Multi && a.coverage.len() >= 2 && !link.links.is_empty() => {
+            species_map(ui, a, link)
+        }
         _ => {
             for k in 0..a.coverage.len() {
                 ui.horizontal(|ui| {
@@ -1122,6 +1184,157 @@ fn crosslink_map(ui: &mut Ui, a: &Annotation, link: &model::Link) {
     }
 }
 
+/// Multivalent species: the stubs found at the `peptide` end of link `e`:
+/// the parts freed when only that linker broke, and a peptide with no other
+/// link with its stub (its doublet)
+pub(super) fn bridge_end_stubs(a: &Annotation, link: &model::Link, e: usize, peptide: usize) -> Vec<usize> {
+    let single = link.ends_of(peptide).len() == 1;
+    let mut stubs: Vec<usize> = a
+        .stub_ions
+        .iter()
+        .filter(|s| s.peptide == peptide)
+        .filter(|s| match s.kind {
+            StubIonKind::Part { link, .. } => link as usize == e,
+            StubIonKind::Peptide => single,
+            _ => false,
+        })
+        .map(|s| s.stub)
+        .collect();
+    stubs.sort_unstable();
+    stubs.dedup();
+    stubs
+}
+
+/// Multivalent species: the stub sets found on a peptide with two or more
+/// link residues, freed whole (its triplet peaks)
+pub(super) fn peptide_stub_sets(a: &Annotation, link: &model::Link, peptide: usize) -> Vec<Vec<usize>> {
+    if link.ends_of(peptide).len() < 2 {
+        return Vec::new();
+    }
+    let mut sets: Vec<Vec<usize>> = a
+        .stub_ions
+        .iter()
+        .filter(|s| s.peptide == peptide && s.kind == StubIonKind::Peptide)
+        .map(|s| s.stubs.clone())
+        .collect();
+    sets.sort();
+    sets.dedup();
+    sets
+}
+
+/// Height of the gap between two peptide rows (the bridges)
+const GAP: f32 = 54.0;
+/// Spacing of the lanes of bridges between rows that are not neighbours
+const LANE: f32 = 12.0;
+
+/// A multivalent species: its peptides as rows, each link residue shaded
+/// and joined to its partner by a bridge (`XLn`, as `#XLn` in the ProForma).
+/// MS-cleavable linkers: on each bridge, a triangle per stub found where
+/// that linker broke (pointing at the side carrying it), after a peptide
+/// with two or more links its peptide + stubs peaks, and around the residues
+/// the stub-carrying fragment ions as nested hooks.
+fn species_map(ui: &mut Ui, a: &Annotation, link: &model::Link) {
+    let lengths: Vec<usize> = a.coverage.iter().map(|c| c.residues.len()).collect();
+    let l = species::layout(&lengths, &link.links);
+    let rows = l.rows.len() as f32;
+    let row_h = CELL.y + 2.0 * PAD;
+    let lanes_w = if l.lanes > 0 { 14.0 + LANE * l.lanes as f32 } else { 0.0 };
+    let size = egui::vec2(LABEL_W + CELL.x * l.cells as f32 + lanes_w + 380.0, rows * row_h + (rows - 1.0) * GAP);
+    ui.label(
+        RichText::new(format!(
+            "{} {} linkers: XL1–XL{} as #XL1… in the ProForma above",
+            link.links.len(),
+            link.linker,
+            link.links.len()
+        ))
+        .weak()
+        .small(),
+    );
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter_at(rect.expand(4.0));
+    let text_color = ui.visuals().text_color();
+    let weak = ui.visuals().weak_text_color();
+    let small = egui::FontId::proportional(12.0);
+
+    let x0 = rect.left() + LABEL_W;
+    let top = |row: usize| rect.top() + PAD + row as f32 * (row_h + GAP);
+    let x_of = |row: usize, residue: usize| x0 + CELL.x * (l.column(row, residue) as f32 + 0.5);
+    let cells_end = x0 + CELL.x * l.cells as f32;
+    let text_x = cells_end + lanes_w + 14.0;
+    for (row, &k) in l.rows.iter().enumerate() {
+        let y = top(row);
+        painter.text(
+            egui::pos2(rect.left(), y + CELL.y / 2.0),
+            egui::Align2::LEFT_CENTER,
+            format!("peptide {}", k + 1),
+            egui::FontId::proportional(14.0),
+            text_color,
+        );
+        let origin = egui::pos2(x0 + CELL.x * l.offsets[row] as f32, y);
+        draw_peptide(&painter, origin, a, k, &link.ends_of(k), text_color);
+        // a peptide with two or more links, freed whole with its stubs
+        let mut x = text_x;
+        for set in peptide_stub_sets(a, link, k) {
+            for &stub in &set {
+                triangle(&painter, egui::pos2(x + 5.0, y + CELL.y / 2.0), true, stub_color(stub));
+                x += 11.0;
+            }
+            let names = set.iter().map(|&j| link.stubs[j].name.as_str()).collect::<Vec<_>>().join("+");
+            let r = painter.text(egui::pos2(x + 2.0, y + CELL.y / 2.0), egui::Align2::LEFT_CENTER, names, small.clone(), weak);
+            x = r.right() + 12.0;
+        }
+        painter.text(egui::pos2(x, y + CELL.y / 2.0), egui::Align2::LEFT_CENTER, backbone_text(a, k), small.clone(), weak);
+    }
+
+    let stroke = egui::Stroke::new(3.0_f32, weak);
+    for b in &l.bridges {
+        let (xu, yu) = (x_of(b.upper.0, b.upper.1), top(b.upper.0) + CELL.y - 2.0);
+        let (xl, yl) = (x_of(b.lower.0, b.lower.1), top(b.lower.0) + 2.0);
+        let name = format!("XL{}", b.link + 1);
+        // where the bridge is near each end
+        let (x_upper_end, x_lower_end) = match b.lane {
+            None => {
+                painter.line_segment([egui::pos2(xu, yu), egui::pos2(xl, yl)], stroke);
+                let mid = egui::pos2((xu + xl) / 2.0, (yu + yl) / 2.0);
+                painter.text(mid - egui::vec2(9.0, 0.0), egui::Align2::RIGHT_CENTER, &name, egui::FontId::proportional(13.0), text_color);
+                let at = |y: f32| xu + (xl - xu) * (y - yu) / (yl - yu);
+                (at(yu + 13.0), at(yl - 13.0))
+            }
+            Some(lane) => {
+                // down into the gap, along a lane right of the rows, up into the gap above
+                let x_lane = cells_end + 14.0 + LANE * lane as f32;
+                let y1 = top(b.upper.0) + CELL.y + PAD + GAP / 2.0 + 4.0 * lane as f32;
+                let y2 = top(b.lower.0) - PAD - GAP / 2.0 - 4.0 * lane as f32;
+                let points = [(xu, yu), (xu, y1), (x_lane, y1), (x_lane, y2), (xl, y2), (xl, yl)];
+                for w in points.windows(2) {
+                    painter.line_segment([egui::pos2(w[0].0, w[0].1), egui::pos2(w[1].0, w[1].1)], stroke);
+                }
+                painter.text(
+                    egui::pos2((xu + x_lane) / 2.0, y1 - 3.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    &name,
+                    egui::FontId::proportional(13.0),
+                    text_color,
+                );
+                (xu, xl)
+            }
+        };
+        // the stubs found where this linker broke, at each end
+        for ((row, _), x, y, up) in [(b.upper, x_upper_end, yu + 13.0, true), (b.lower, x_lower_end, yl - 13.0, false)] {
+            let mut x = x + 12.0;
+            for stub in bridge_end_stubs(a, link, b.link, l.rows[row]) {
+                let color = stub_color(stub);
+                triangle(&painter, egui::pos2(x, y), up, color);
+                let r = painter.text(egui::pos2(x + 8.0, y), egui::Align2::LEFT_CENTER, &link.stubs[stub].name, small.clone(), color);
+                x = r.right() + 12.0;
+            }
+        }
+    }
+    if !link.stubs.is_empty() {
+        response.on_hover_text(stub_summary(a, link));
+    }
+}
+
 /// One peptide with a bracket under it joining its two linked residues
 fn loop_map(ui: &mut Ui, a: &Annotation, link: &model::Link) {
     let (i0, i1) = (link.sites[0].1.min(link.sites[1].1), link.sites[0].1.max(link.sites[1].1));
@@ -1171,7 +1384,7 @@ fn legend(ui: &mut Ui, a: &Annotation) {
                 ui.separator();
                 ui.label("stubs:");
                 for (j, stub) in link.stubs.iter().enumerate() {
-                    let found = a.stub_ions.iter().filter(|s| s.stub == j).count();
+                    let found = a.stub_ions.iter().filter(|s| s.stubs.contains(&j)).count();
                     let text = format!("■ {} {} {:+.3}", stub.name, stub.description, stub.mass);
                     let label = if found > 0 {
                         RichText::new(text).color(stub_color(j))
@@ -1213,6 +1426,7 @@ fn fragment_table(ui: &mut Ui, a: &Annotation) {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::path::Path;
 
     /// Lay out the coverage map of a cleaved DSSO crosslink headlessly and
     /// look at what it draws
@@ -1245,6 +1459,113 @@ mod test {
         assert_eq!(texts.iter().filter(|(t, c)| t == "A" && *c == stub_color(0)).count(), 2);
         assert_eq!(texts.iter().filter(|(t, c)| t == "S" && *c == stub_color(2)).count(), 2);
         assert!(segments.len() >= 7, "bridge and hooks");
+    }
+
+    /// The map of a cleaved DSSO `a1b1c` species: both links drawn and
+    /// labelled, the stubs where each linker broke, the triplet peaks of the
+    /// middle peptide and its stub-carrying y ions as hooks
+    #[test]
+    fn species_map_draws_every_link_and_its_stubs() {
+        let (_, a) = model::test::cleaved_multi();
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| coverage_view(ui, &a));
+        });
+        let (mut triangles, mut segments, mut texts) = (Vec::new(), Vec::new(), Vec::new());
+        for clipped in &output.shapes {
+            match &clipped.shape {
+                egui::Shape::Path(path) if path.closed && path.points.len() == 3 => triangles.push(path.fill),
+                egui::Shape::LineSegment { stroke, .. } => segments.push(stroke.color),
+                egui::Shape::Text(text) => texts.push(text.galley.text().to_string()),
+                _ => {}
+            }
+        }
+        for t in ["peptide 1", "peptide 2", "peptide 3", "XL1", "XL2", "A+S", "S+S"] {
+            assert!(texts.iter().any(|x| x == t), "{t} in {texts:?}");
+        }
+        // XL1: peptide 1 + A, + S and {2,3} + A; XL2: {1,2} + S and peptide 3 + A;
+        // after peptide 2: A+S and S+S
+        assert_eq!(triangles.len(), 9, "{triangles:?}");
+        // y8+S (K19) and y17+A+S (K10 and K19): S hooks at two residues, an A hook at one
+        assert_eq!(segments.iter().filter(|c| **c == stub_color(2)).count(), 4);
+        assert_eq!(segments.iter().filter(|c| **c == stub_color(0)).count(), 2);
+    }
+
+    /// Timings on a real results folder (`SAGE_GUI_RESULTS=<folder>`): the
+    /// mobiligrams written after a search (into a copy of the folder), and
+    /// the viewer from "Load" to the first spectrum shown. `SAGE_GUI_FIGURES`
+    /// saves a render of a multivalent species.
+    #[test]
+    #[ignore]
+    fn real_folder_timing() {
+        use egui_kittest::Harness;
+        use std::time::Instant;
+        let folder = std::env::var("SAGE_GUI_RESULTS").expect("set SAGE_GUI_RESULTS");
+        let copy = std::env::temp_dir().join(format!("sage-gui-timing-{}", std::process::id()));
+        std::fs::create_dir_all(&copy).unwrap();
+        for name in ["results.json", "results.sage.tsv", "crosslinks.sage.tsv"] {
+            let _ = std::fs::copy(Path::new(&folder).join(name), copy.join(name));
+        }
+        let t = Instant::now();
+        let written = mobiligram::write_figures(&copy).unwrap();
+        println!("mobiligrams: {} files in {:.2?}", written.len(), t.elapsed());
+        std::fs::remove_dir_all(&copy).unwrap();
+
+        let mut viewer = Viewer::default();
+        let t = Instant::now();
+        viewer.open(&folder);
+        viewer.wait_until_open();
+        println!("results read in {:.2?}: {} shown", t.elapsed(), viewer.shown.len());
+        let results = viewer.results.clone().unwrap();
+        // the best multivalent species, picked as a user would
+        let multi = viewer.shown.iter().copied().find(|&i| results.matches[i].kind == Kind::Multi);
+        viewer.selected = multi.or(viewer.selected);
+        let mut installed = false;
+        let mut harness = Harness::builder().with_size(egui::vec2(1500.0, 1500.0)).build_ui_state(
+            move |ui, v: &mut Viewer| {
+                if !installed {
+                    crate::theme::install(ui.ctx(), false);
+                    installed = true;
+                    return;
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| v.ui(ui, ""));
+            },
+            viewer,
+        );
+        let t = Instant::now();
+        let key = results.matches[harness.state().selected.unwrap()].key();
+        while !harness.state().spectra.contains_key(&key) && t.elapsed().as_secs() < 60 {
+            harness.step();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        println!("first spectrum ({} scan {}) shown after {:.2?}", key.0, key.1, t.elapsed());
+        // another spectrum of the same run, now open
+        let other = harness
+            .state()
+            .shown
+            .iter()
+            .map(|&i| results.matches[i].key())
+            .find(|k| k.0 == key.0 && !harness.state().spectra.contains_key(k));
+        if let Some(other) = other {
+            let i = harness.state().shown.iter().copied().find(|&i| results.matches[i].key() == other).unwrap();
+            harness.state_mut().selected = Some(i);
+            let t = Instant::now();
+            while !harness.state().spectra.contains_key(&other) && t.elapsed().as_secs() < 60 {
+                harness.step();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            println!("next spectrum of the run shown after {:.2?}", t.elapsed());
+            harness.state_mut().selected = multi;
+        }
+        harness.run_steps(4);
+        let state = harness.state();
+        if let Some(Ok(a)) = &state.annotation {
+            println!("{}: {} stub ions: {:?}", a.proforma, a.stub_ions.len(), a.stub_ions.iter().map(|s| &s.text).collect::<Vec<_>>());
+        }
+        if let Ok(out) = std::env::var("SAGE_GUI_FIGURES") {
+            std::fs::create_dir_all(&out).unwrap();
+            harness.render().unwrap().save(Path::new(&out).join("viewer_multivalent.png")).unwrap();
+        }
     }
 
     /// A results folder with three crosslinks, two with long titles
@@ -1282,6 +1603,7 @@ mod test {
         let dir = long_titles();
         let mut viewer = Viewer::default();
         viewer.open(&dir.display().to_string());
+        viewer.wait_until_open();
         let mut installed = false;
         // 60 frames a second, so two clicks fall within egui's double-click time
         let mut harness = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_step_dt(1.0 / 60.0).build_ui_state(

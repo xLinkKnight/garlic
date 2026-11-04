@@ -432,18 +432,41 @@ pub fn write_figures(folder: &Path) -> Result<Vec<PathBuf>, String> {
     let dir = folder.join(FOLDER);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let combined = (files.len() > 1).then_some(None);
-    let figures = files.iter().map(|f| Some(f.to_string())).chain(combined);
-    let mut written = Vec::new();
-    for file in figures {
-        let name = figure_name(file.as_deref());
-        let mut opts = MobiligramOptions { background: true, title: None, unidentified: true, file };
-        opts.title = Some(title(&points, &opts));
-        let svg = svg(&points, &opts);
-        for format in [figure::Format::Svg, figure::Format::Pdf] {
-            let path = dir.join(format!("{name}.{}", format.extension()));
-            figure::export(&svg, format, 300, true, &path)?;
-            written.push(path);
+    let figures: Vec<Option<String>> = files.iter().map(|f| Some(f.to_string())).chain(combined).collect();
+    // a few figures at a time, each on its own thread
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 8);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..threads.min(figures.len()) {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(file) = figures.get(i) else { break };
+                let written = write_figure(&points, file.clone(), &dir);
+                done.lock().unwrap().push((i, written));
+            });
         }
+    });
+    let mut done = done.into_inner().unwrap();
+    done.sort_by_key(|(i, _)| *i);
+    let mut written = Vec::new();
+    for (_, paths) in done {
+        written.extend(paths?);
+    }
+    Ok(written)
+}
+
+/// One mobiligram (`file`, or all MS files) as SVG and PDF in `dir`
+fn write_figure(points: &[Point], file: Option<String>, dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let name = figure_name(file.as_deref());
+    let mut opts = MobiligramOptions { background: true, title: None, unidentified: true, file };
+    opts.title = Some(title(points, &opts));
+    let svg = svg(points, &opts);
+    let mut written = Vec::new();
+    for format in [figure::Format::Svg, figure::Format::Pdf] {
+        let path = dir.join(format!("{name}.{}", format.extension()));
+        figure::export(&svg, format, 300, true, &path)?;
+        written.push(path);
     }
     Ok(written)
 }

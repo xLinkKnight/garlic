@@ -21,6 +21,9 @@ use std::path::{Path, PathBuf};
 /// Start-up frames used to measure the tabs: two per tab
 const FIT_STEPS: usize = 2 * Tab::ALL.len();
 
+/// The project on GitHub (the link next to the light/dark switch)
+const REPO_URL: &str = "https://github.com/xLinkKnight/garlic";
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -95,6 +98,8 @@ struct SageGui {
     unimod: unimod::Lookup,
     /// Steps, metrics and errors of the current or last search
     tracker: Option<progress::Tracker>,
+    /// The mobiligrams of the last search, being written in the background
+    figures: Option<std::sync::mpsc::Receiver<Result<Vec<PathBuf>, String>>>,
     /// CPU / RAM / GPU / vRAM utilisation, shown on the Progress tab
     usage: usage::Monitor,
     dark: bool,
@@ -136,6 +141,7 @@ impl SageGui {
             last_saved: None,
             unimod: Default::default(),
             tracker: None,
+            figures: None,
             usage: usage::Monitor::start(system::gpus()),
             dark: false,
             fit_step: 0,
@@ -343,42 +349,47 @@ impl SageGui {
             output_dir: out.clone(),
         }));
         self.job = Some(Job::start(steps, ctx.clone()));
+        self.figures = None;
         self.tab = Tab::Progress;
     }
 
     /// Feed new log lines to the tracker, and close it when the job ends
-    fn follow_job(&mut self) {
+    fn follow_job(&mut self, ctx: &egui::Context) {
+        // the mobiligrams written in the background: listed with the search's outputs
+        if let (Some(rx), Some(tracker)) = (&self.figures, &mut self.tracker) {
+            match rx.try_recv() {
+                Ok(Ok(written)) => {
+                    for path in written {
+                        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        tracker.outputs.push((path, size));
+                    }
+                    self.figures = None;
+                }
+                Ok(Err(e)) => {
+                    tracker.warnings.push(format!("mobiligram not written: {e}"));
+                    self.figures = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.figures = None,
+            }
+        }
         let (Some(job), Some(tracker)) = (&self.job, &mut self.tracker) else { return };
         let log = job.log.lock().unwrap().clone();
         tracker.update(&log, job.total.load(std::sync::atomic::Ordering::Relaxed));
         match job.status() {
             Status::Running(_) => {}
             Status::Finished if tracker.state != progress::State::Finished => {
-                // timsTOF data: the run's mobiligram next to the results
-                let mut log = log;
-                let out = tracker.plan.output_dir.clone();
-                let written = match viewer::mobiligram::write_figures(&out) {
-                    Ok(written) => written,
-                    Err(e) => {
-                        log.push(format!("mobiligram not written: {e}"));
-                        Vec::new()
-                    }
-                };
-                if !written.is_empty() {
-                    let names: Vec<String> =
-                        written.iter().filter_map(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
-                    log.push(format!(
-                        "wrote {} to {}\\ (precursor m/z against ion mobility)",
-                        names.join(", "),
-                        viewer::mobiligram::FOLDER
-                    ));
-                }
                 tracker.finish(progress::State::Finished, None, &log);
-                // listed with the search's outputs
-                for path in written {
-                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    tracker.outputs.push((path, size));
-                }
+                // timsTOF data: the mobiligrams next to the results, written in
+                // the background so the window stays responsive
+                let out = tracker.plan.output_dir.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let ctx = ctx.clone();
+                let _ = std::thread::Builder::new().name("mobiligrams".into()).spawn(move || {
+                    let _ = tx.send(viewer::mobiligram::write_figures(&out));
+                    ctx.request_repaint();
+                });
+                self.figures = Some(rx);
             }
             Status::Finished => {}
             Status::Cancelled => tracker.finish(progress::State::Cancelled, None, &log),
@@ -436,7 +447,7 @@ impl SageGui {
 impl eframe::App for SageGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_dropped_files(ctx);
-        self.follow_job();
+        self.follow_job(ctx);
         if ctx.input(|i| i.viewport().close_requested()) {
             if let Some(job) = &self.job {
                 job.cancel();
@@ -483,6 +494,9 @@ impl eframe::App for SageGui {
                     if theme::theme_switch(ui, &mut self.dark) {
                         theme::set_dark(ctx, self.dark);
                     }
+                    // right to left: left of the theme switch
+                    ui.add_space(12.0);
+                    theme::github_link(ui, REPO_URL);
                 });
             });
             ui.add_space(2.0);
@@ -1106,6 +1120,18 @@ impl SageGui {
                         }
                         ui.end_row();
                     }
+                });
+            }
+            if self.figures.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        RichText::new(format!(
+                            "writing the mobiligrams to {}\\ (precursor m/z against ion mobility)…",
+                            viewer::mobiligram::FOLDER
+                        ))
+                        .color(muted),
+                    );
                 });
             }
             let out = t.plan.output_dir.clone();

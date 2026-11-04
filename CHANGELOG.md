@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.20.0] - 2026-11-04
+
+### Added
+- `sage-gui`: the GitHub mark with the program's version (e.g. v0.20.0) next to the light/dark switch, a link to the project on GitHub (https://github.com/xLinkKnight/garlic); it takes the theme's text colour.
+- `sage-gui`: the Annotated spectra map of multivalent crosslinks shows every link: each peptide as a row with its link residues shaded, a bridge per link labelled `XL1`, `XL2`, … as in the ProForma (linked peptides stacked next to each other where possible; a link skipping a row runs along a lane). MS-cleavable linkers (DSSO, DSBU, cliXlink): the stub ions of the cleaved species as the search scores them: each peptide's peptide + stubs peaks (doublets; `P+A+S` triplets with two links), fragment ions with one stub per link residue held (`y17+A+S²+`, hooks in each stub's colour), and the parts held together when only one linker broke (`{2,3}+A`), as triangles on that linker's bridge. Also in exported figures.
+
+### Changed
+- `sage-gui`: the Annotated spectra tab no longer waits for whole runs. It used to read every spectrum of every searched file, one file after another, before showing any (about 7.5 s per timsTOF run, minutes for a 21-run search). Spectra are now read in the background as needed, the picked match first: timsTOF spectra one by one by their id (0.4 ms each, after about a second to open a run; identical peaks to the whole-run read), mzML / MGF files whole once each. Results load in the background as well.
+- `sage-gui`: the mobiligrams of a finished search are written in the background (the report shows at once, the files are listed when ready), several at a time, with the system fonts loaded once instead of for every PDF.
+
 ## [v0.19.0] - 2026-11-03
 
 ### Added

@@ -157,6 +157,56 @@ mod test {
         assert_eq!(plain_number(0.0125, 3), "0.013");
         assert_eq!(plain_number(2.0, 0), "2");
     }
+
+    /// The GitHub mark draws (an outline with the cat's face cut out, not a
+    /// blank or filled square), sits left of the theme switch, and opens the
+    /// project. `SAGE_GUI_FIGURES` saves light and dark renders.
+    #[test]
+    fn github_link_shows_the_mark_and_opens_the_project() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let tree = resvg::usvg::Tree::from_str(GITHUB_MARK, &resvg::usvg::Options::default()).unwrap();
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(48, 48).unwrap();
+        resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(3.0, 3.0), &mut pixmap.as_mut());
+        let covered = pixmap.pixels().iter().filter(|p| p.alpha() > 128).count() as f32 / (48.0 * 48.0);
+        assert!((0.4..0.75).contains(&covered), "mark covers {covered}");
+        // the face is cut out of the disc: the centre is see-through
+        assert_eq!(pixmap.pixel(24, 24).unwrap().alpha(), 0);
+
+        for dark in [false, true] {
+            let mut installed = false;
+            let mut harness = Harness::builder().with_size(vec2(260.0, 40.0)).build_ui(move |ui| {
+                if !installed {
+                    install(ui.ctx(), dark);
+                    installed = true;
+                    return;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut d = dark;
+                    theme_switch(ui, &mut d);
+                    ui.add_space(12.0);
+                    github_link(ui, "https://github.com/xLinkKnight/garlic");
+                });
+            });
+            harness.run();
+            if let Ok(out) = std::env::var("SAGE_GUI_FIGURES") {
+                std::fs::create_dir_all(&out).unwrap();
+                let name = if dark { "github_link_dark.png" } else { "github_link_light.png" };
+                harness.render().unwrap().save(std::path::Path::new(&out).join(name)).unwrap();
+            }
+            let label = format!("v{}", env!("CARGO_PKG_VERSION"));
+            harness.get_by_label(&label).click();
+            let mut opened = Vec::new();
+            for _ in 0..4 {
+                harness.step();
+                for command in &harness.output().platform_output.commands {
+                    if let egui::OutputCommand::OpenUrl(u) = command {
+                        opened.push((u.url.clone(), u.new_tab));
+                    }
+                }
+            }
+            assert_eq!(opened, [("https://github.com/xLinkKnight/garlic".to_string(), true)], "dark {dark}");
+        }
+    }
 }
 
 const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
@@ -326,6 +376,45 @@ pub fn tone_button(ui: &Ui, text: &str, tone: Tone) -> Button<'static> {
         .fill(fill)
         .stroke(line(stroke))
         .min_size(vec2(84.0, 26.0))
+}
+
+/// The GitHub mark (Octicons `mark-github`, MIT licence), 16 × 16, white
+const GITHUB_MARK: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16"><path fill="#ffffff" d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></svg>"##;
+
+/// The GitHub mark as a texture, rendered once (white, so a tint gives it
+/// the theme's text colour)
+fn github_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let id = egui::Id::new("github-mark-texture");
+    if let Some(texture) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return texture;
+    }
+    // drawn at 3× for sharp edges on high-resolution screens
+    let px = 48u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(px, px).expect("icon size");
+    if let Ok(tree) = resvg::usvg::Tree::from_str(GITHUB_MARK, &resvg::usvg::Options::default()) {
+        let scale = px as f32 / 16.0;
+        resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    }
+    let image = egui::ColorImage::from_rgba_premultiplied([px as usize, px as usize], pixmap.data());
+    let texture = ctx.load_texture("github-mark", image, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|d| d.insert_temp(id, texture.clone()));
+    texture
+}
+
+/// The GitHub mark with the program's version to its right, a link to the
+/// project on GitHub; mark and text take the theme's text colour
+pub fn github_link(ui: &mut Ui, url: &str) -> Response {
+    let texture = github_texture(ui.ctx());
+    let color = ui.visuals().text_color();
+    let mark = egui::Image::new(&texture).fit_to_exact_size(vec2(16.0, 16.0)).tint(color);
+    let response = ui
+        .add(Button::image_and_text(mark, format!("v{}", env!("CARGO_PKG_VERSION"))).frame(false))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(format!("garlic on GitHub: {url}"));
+    if response.clicked() {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+    }
+    response
 }
 
 /// ☀ [switch] 🌙 light/dark toggle; returns true when flipped

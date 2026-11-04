@@ -255,7 +255,8 @@ columns describe the whole species:
   peptides' doublet and triplet peaks.
 
 The Annotator CSV writes them as ProForma with one label per link (`#XL1`,
-`#XL2`, …), and the viewer annotates them with every peptide in the map. They
+`#XL2`, …), and the viewer annotates them with every peptide and link in the
+map, and the stub ions of cleaved linkers (see Annotated spectra). They
 are left out of the xiVIEW, ProXL and mzIdentML files, which describe pairs
 only, and out of crosslink LFQ. The mobiligram shows them in green (#6FB120).
 
@@ -480,6 +481,24 @@ generates and matches its fragments. Nothing else needs to be installed.
 
   On the DSSO Pol II run, both peptides showed peptide + stub ions in 39 of 40
   crosslink spectra (9 of 40 with the same peptidoforms on other spectra).
+* Multivalent species: every peptide is a row, its link residues shaded, and
+  each link a bridge labelled `XL1`, `XL2`, … as in the ProForma (rows are
+  ordered so that linked peptides are neighbours where possible; a link that
+  skips a row runs along a lane right of the rows). MS-cleavable linkers, as
+  the search scores them: once every linker broke each peptide keeps one stub
+  per link residue, so
+  * a peptide with one link shows its peptide + stub peaks as triangles at its
+    end of that bridge, and one with two or more links its peptide + stubs
+    peaks (`P+A+S`, the triplets) after its row;
+  * fragment ions carry one stub per link residue they hold (`y8+S`,
+    `y17+A+S²+`), drawn as hooks in each stub's colour;
+  * the parts still held together when only one linker broke (`{2,3}+A` from
+    `a1b1c`), which show which peptides were linked to which, are triangles at
+    that end of that bridge.
+
+  Hover the map for every stub ion. With an asymmetric linker (cliXlink)
+  either arm's stubs are looked for at every end, as the species does not
+  record which way round each linker sits.
 * The header gives charge, scan, score, q-value, retention time, mass and mass
   error, the precursor m/z and, for timsTOF (Bruker `.d`) data, the precursor's
   ion mobility 1/K0 (V·s/cm²).
@@ -517,6 +536,14 @@ generates and matches its fragments. Nothing else needs to be installed.
   searched: mzML, MGF and, for Bruker `.d`, the precursor's spectrum merged over
   all its frames. The matches' peptidoforms are written as for the Annotator
   files below.
+* Spectra are read in the background as they are needed: the match picked
+  first, then the rows in view of runs already open. Bruker `.d` spectra are
+  read one by one by their id, the same way the whole-run read gets each of
+  them (identical peaks), so a spectrum shows within milliseconds; the first
+  one picked from a run waits about a second while the run is opened. mzML and MGF files have no
+  index by spectrum id: each is read whole once, keeping the spectra of every
+  match shown, the picked match's file first. The results folder itself is
+  read in the background too.
 
 On the DSSO Pol II timsTOF run, the annotated ions carry 31% of the intensity of
 the matched spectra of linear PSMs and 18 to 22% for crosslinks, against 6 to 9%

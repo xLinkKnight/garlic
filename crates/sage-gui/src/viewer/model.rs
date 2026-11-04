@@ -206,8 +206,22 @@ impl Results {
         let site = |s: usize| s.saturating_sub(1);
         let settings = self.crosslink.clone().unwrap_or_default();
         let sites = match m.kind {
-            // multivalent species are non-cleavable: no stubs, peptides stacked in the map
-            Kind::Linear | Kind::Multi => return None,
+            Kind::Linear => return None,
+            Kind::Multi => {
+                // every link of the species; MS-cleavable linkers: each peptide
+                // alone, its ions with a stub on each link residue they hold
+                let (peptides, links) = parse_species(&m.species);
+                return Some(Link {
+                    kind: Kind::Multi,
+                    sites: links.iter().flat_map(|&(a, sa, b, sb)| [(a, sa), (b, sb)]).collect(),
+                    links,
+                    linker: linker_name(&settings),
+                    linker_mass: settings.linker_mass() as f64,
+                    stubs: stubs_of(&settings),
+                    stub_peptides: Vec::new(),
+                    peptides: peptides.iter().map(|p| rewrite(p, &[], &self.mod_masses)).collect(),
+                });
+            }
             Kind::Crosslink => vec![(0, site(m.sites.0)), (1, site(m.sites.1))],
             Kind::Loop => vec![(0, site(m.sites.0)), (0, site(m.sites.1))],
         };
@@ -227,10 +241,13 @@ impl Results {
             .collect();
         Some(Link {
             kind: m.kind,
+            links: vec![(sites[0].0, sites[0].1, sites[1].0, sites[1].1)],
             sites,
             linker: linker_name(&settings),
+            linker_mass: settings.linker_mass() as f64,
             stubs,
             stub_peptides,
+            peptides: Vec::new(),
         })
     }
 
@@ -280,37 +297,85 @@ impl Results {
     }
 
     /// Read the spectra of `wanted` from their files, as Sage read them.
-    /// `progress` gets a message per file.
+    /// `progress` gets a message per file. (The viewer reads them in the
+    /// background, see [`super::loader`].)
+    #[cfg(test)]
     pub fn read_spectra(
         &self,
         wanted: &HashSet<SpectrumKey>,
         progress: &dyn Fn(String),
     ) -> Result<HashMap<SpectrumKey, Peaks>, String> {
-        let mut by_file: HashMap<&str, HashSet<&str>> = HashMap::new();
+        let mut by_file: HashMap<&str, HashSet<String>> = HashMap::new();
         for (file, scan) in wanted {
-            by_file.entry(file.as_str()).or_default().insert(scan.as_str());
+            by_file.entry(file.as_str()).or_default().insert(scan.clone());
         }
         let mut out = HashMap::new();
         for (file, ids) in by_file {
-            let url = self
-                .files
-                .get(file)
-                .ok_or_else(|| format!("{file} is not among the searched files in results.json"))?;
             progress(format!("reading {file} ({} spectra wanted)", ids.len()));
-            let spectra = sage_cloudpath::util::read_spectra(url, 0, None, self.bruker, false)
-                .map_err(|e| format!("{file}: {e}"))?;
-            for s in spectra.into_iter().filter(|s| ids.contains(s.id.as_str())) {
-                let precursor = s.precursors.first();
-                let peaks = Peaks {
-                    mz: s.mz.iter().map(|&x| x as f64).collect(),
-                    intensity: s.intensity,
-                    precursor_mz: precursor.map(|p| p.mz as f64),
-                    ion_mobility: precursor.and_then(|p| p.inverse_ion_mobility),
-                };
-                out.insert((file.to_string(), s.id), peaks);
+            let source = self.open_file(file)?;
+            for (id, peaks) in source.read(&ids).map_err(|e| format!("{file}: {e}"))? {
+                out.insert((file.to_string(), id), peaks);
             }
         }
         Ok(out)
+    }
+
+    /// Open a searched spectrum file to read spectra from it
+    pub fn open_file(&self, file: &str) -> Result<SpectrumFile, String> {
+        let url = self
+            .files
+            .get(file)
+            .ok_or_else(|| format!("{file} is not among the searched files in results.json"))?;
+        let bruker = sage_cloudpath::util::FileFormat::from(url.as_str()) == sage_cloudpath::util::FileFormat::TDF;
+        if bruker && url.scheme() == "file" {
+            let path = url.to_file_path().map_err(|_| format!("{file}: not a local path"))?;
+            let run = sage_cloudpath::tdf::TdfSpectra::open(&path, 0, self.bruker).map_err(|e| format!("{file}: {e}"))?;
+            return Ok(SpectrumFile::Bruker(run));
+        }
+        Ok(SpectrumFile::Whole(url.clone(), self.bruker))
+    }
+
+    /// Is `file` read whole (mzML, MGF), not spectrum by spectrum (Bruker)?
+    pub fn read_whole(&self, file: &str) -> bool {
+        self.files
+            .get(file)
+            .is_none_or(|url| sage_cloudpath::util::FileFormat::from(url.as_str()) != sage_cloudpath::util::FileFormat::TDF)
+    }
+}
+
+/// A spectrum file opened for reading the spectra of matches
+pub enum SpectrumFile {
+    /// Bruker .d: each spectrum read on its own, by its id, exactly as the
+    /// search read it, without decoding the rest of the run
+    Bruker(sage_cloudpath::tdf::TdfSpectra),
+    /// mzML, MGF: read whole (they have no index of spectra by id)
+    Whole(Url, BrukerProcessingConfig),
+}
+
+impl SpectrumFile {
+    /// The spectra with these ids (Sage's spectrum ids), as `(id, peaks)`
+    pub fn read(&self, ids: &HashSet<String>) -> Result<Vec<(String, Peaks)>, String> {
+        let spectra = match self {
+            SpectrumFile::Bruker(run) => {
+                let numbers: Vec<usize> = ids.iter().filter_map(|id| id.parse().ok()).collect();
+                run.read(&numbers)
+            }
+            SpectrumFile::Whole(url, bruker) => sage_cloudpath::util::read_spectra_with_ids(url, 0, None, *bruker, ids)
+                .map_err(|e| e.to_string())?,
+        };
+        Ok(spectra
+            .into_iter()
+            .map(|s| {
+                let precursor = s.precursors.first();
+                let peaks = Peaks {
+                    mz: s.mz.iter().map(|&x| x as f64).collect(),
+                    precursor_mz: precursor.map(|p| p.mz as f64),
+                    ion_mobility: precursor.and_then(|p| p.inverse_ion_mobility),
+                    intensity: s.intensity,
+                };
+                (s.id, peaks)
+            })
+            .collect())
     }
 }
 
@@ -327,15 +392,33 @@ pub struct Stub {
 #[derive(Clone, Debug)]
 pub struct Link {
     pub kind: Kind,
-    /// (peptide, 0-based residue) of both ends; a loop-link has both on peptide 0
+    /// (peptide, 0-based residue) of both ends; a loop-link has both on
+    /// peptide 0; a multivalent species lists both ends of every link
     pub sites: Vec<(usize, usize)>,
+    /// Every link as `(peptide, residue, peptide, residue)`, 0-based: one for
+    /// a crosslink or loop-link, two or more for a multivalent species
+    /// (link n is `#XLn` in the ProForma)
+    pub links: Vec<(usize, usize, usize, usize)>,
     /// Display name of the linker (`DSSO`)
     pub linker: String,
+    /// Mass of the whole linker (Da)
+    pub linker_mass: f64,
     /// Stubs of an MS-cleavable linker (both arms), empty otherwise
     pub stubs: Vec<Stub>,
     /// Peptide → stub → ProForma of the peptide alone with that stub on its
-    /// linked residue
+    /// linked residue (crosslinks and loop-links)
     pub stub_peptides: Vec<Vec<String>>,
+    /// Multivalent species: each peptide alone, as ProForma
+    pub peptides: Vec<String>,
+}
+
+impl Link {
+    /// The link residues of `peptide`, in sequence order
+    pub fn ends_of(&self, peptide: usize) -> Vec<usize> {
+        let mut ends: Vec<usize> = self.sites.iter().filter(|s| s.0 == peptide).map(|s| s.1).collect();
+        ends.sort_unstable();
+        ends
+    }
 }
 
 fn linker_name(settings: &CrosslinkSettings) -> String {
@@ -661,20 +744,29 @@ pub struct IonLabel {
 /// Where a stub-carrying ion lies on its peptide
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StubIonKind {
-    /// The whole peptide with the stub (the doublet peaks)
+    /// The whole peptide with the stub (the doublet peaks); in a multivalent
+    /// species, with a stub on each of its link residues (triplets with two)
     Peptide,
     /// N-terminal (a/b/c) ion ending after this residue, holding the linked one
     NTerm(usize),
     /// C-terminal (x/y/z) ion starting at this residue, holding the linked one
     CTerm(usize),
+    /// Multivalent species: the peptides (bit per peptide) still held
+    /// together after only link `link` broke, with its stub on the end of
+    /// [`StubIon::peptide`] (`{2,3}+A` from `a1b1c`). These show which
+    /// peptides were linked to which.
+    Part { link: u8, peptides: u8 },
 }
 
 /// An ion with a linker stub found in the spectrum
 #[derive(Clone, Debug)]
 pub struct StubIon {
     pub peptide: usize,
-    /// Index into [`Link::stubs`]
+    /// Index into [`Link::stubs`] (the first of [`StubIon::stubs`])
     pub stub: usize,
+    /// Every stub it carries, sorted: one, or in a multivalent species one
+    /// per link residue it holds (`y9+A+S`)
+    pub stubs: Vec<usize>,
     pub kind: StubIonKind,
     pub charge: u8,
     pub theoretical_mz: f64,
@@ -793,7 +885,7 @@ fn find_stub_ions(views: &mut [PeakView], link: &Link, charge: u8, model: Model,
                     format!("P+{}", stub.name)
                 };
                 add_stub_label(views, peak, mz, k, j, &text);
-                found.push(StubIon { peptide: k, stub: j, kind: StubIonKind::Peptide, charge: z, theoretical_mz: mz, peak, text });
+                found.push(StubIon { peptide: k, stub: j, stubs: vec![j], kind: StubIonKind::Peptide, charge: z, theoretical_mz: mz, peak, text });
             }
             for f in fragments.iter().filter(|f| f.neutral_loss.is_empty()) {
                 // N-terminal ion `bN` holds residues 0..N, C-terminal `yN` n-N..n.
@@ -830,7 +922,209 @@ fn find_stub_ions(views: &mut [PeakView], link: &Link, charge: u8, model: Model,
                 };
                 let text = format!("{ion}+{}{charge_text}", link.stubs[j].name);
                 add_stub_label(views, peak, mz, k, j, &text);
-                found.push(StubIon { peptide: k, stub: j, kind, charge: z, theoretical_mz: mz, peak, text });
+                found.push(StubIon { peptide: k, stub: j, stubs: vec![j], kind, charge: z, theoretical_mz: mz, peak, text });
+            }
+        }
+    }
+    found
+}
+
+const PROTON: f64 = 1.007_276_466_6;
+
+/// `²+` for charge 2, nothing for 1
+fn charge_text(z: u8) -> String {
+    if z > 1 {
+        format!("{}+", superscript(z as usize))
+    } else {
+        String::new()
+    }
+}
+
+/// Every choice of `k` stubs out of `n` kinds, repeats allowed, sorted
+/// (`A+A`, `A+S`, `S+S`...)
+fn stub_choices(n: usize, k: usize) -> Vec<Vec<usize>> {
+    fn walk(n: usize, k: usize, from: usize, current: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+        if current.len() == k {
+            out.push(current.clone());
+            return;
+        }
+        for j in from..n {
+            current.push(j);
+            walk(n, k, j, current, out);
+            current.pop();
+        }
+    }
+    let mut out = Vec::new();
+    walk(n, k, 0, &mut Vec::new(), &mut out);
+    out
+}
+
+/// The peptides joined to `start` by the links other than `skip`
+fn joined(start: usize, links: &[(usize, usize, usize, usize)], skip: usize) -> Vec<usize> {
+    let mut side = vec![start];
+    let mut grow = true;
+    while grow {
+        grow = false;
+        for (_, &(a, _, b, _)) in links.iter().enumerate().filter(|(e, _)| *e != skip) {
+            for (from, to) in [(a, b), (b, a)] {
+                if side.contains(&from) && !side.contains(&to) {
+                    side.push(to);
+                    grow = true;
+                }
+            }
+        }
+    }
+    side
+}
+
+/// Stub ions of a multivalent species whose MS-cleavable linkers broke, as
+/// the search scores them. Once every linker is broken each peptide is free
+/// and keeps one stub on each of its link residues: the whole peptide with
+/// its stubs (doublets, or triplets with two links), and its backbone ions
+/// with one stub per link residue they hold. Parts held together by the
+/// other linkers when only one broke (`b1c` + stub from `a1b1c`) show which
+/// peptides were linked to which. Asymmetric linkers: either arm's stubs on
+/// any end (the species does not say which way round each linker sits).
+fn find_multi_stub_ions(views: &mut [PeakView], link: &Link, charge: u8, model: Model, tolerance: Tolerance) -> Vec<StubIon> {
+    let mut found: Vec<StubIon> = Vec::new();
+    // each piece holds at least one charge less than the species
+    let max_charge = charge.saturating_sub(1).max(1);
+    let names = |stubs: &[usize]| stubs.iter().map(|&j| link.stubs[j].name.as_str()).collect::<Vec<_>>().join("+");
+    let added = |stubs: &[usize]| stubs.iter().map(|&j| link.stubs[j].mass).sum::<f64>();
+    let mut masses: Vec<Option<f64>> = Vec::new();
+    for (x, proforma) in link.peptides.iter().enumerate() {
+        let Ok((ions, _)) = PeptidoformIonSet::pro_forma(proforma, &mzcore::ontology::STATIC_ONTOLOGIES) else {
+            masses.push(None);
+            continue;
+        };
+        let mass = ions.formulas().first().map(|f| f.monoisotopic_mass().value);
+        masses.push(mass);
+        let ends = link.ends_of(x);
+        if ends.is_empty() {
+            continue;
+        }
+        let n = ions
+            .peptidoform_ions()
+            .first()
+            .and_then(|i| i.peptidoforms().first())
+            .map_or(0, |p| p.len());
+
+        // the whole peptide, a stub on each link residue
+        if let Some(mass) = mass {
+            for stubs in stub_choices(link.stubs.len(), ends.len()) {
+                for z in 1..=max_charge {
+                    let mz = (mass + added(&stubs) + z as f64 * PROTON) / z as f64;
+                    let Some(peak) = find_peak(views, mz, tolerance) else { continue };
+                    let text = format!("P+{}{}", names(&stubs), charge_text(z));
+                    add_stub_label(views, peak, mz, x, stubs[0], &text);
+                    found.push(StubIon {
+                        peptide: x,
+                        stub: stubs[0],
+                        stubs: stubs.clone(),
+                        kind: StubIonKind::Peptide,
+                        charge: z,
+                        theoretical_mz: mz,
+                        peak,
+                        text,
+                    });
+                }
+            }
+        }
+
+        // backbone ions holding link residues: a stub on each one held
+        let fragments = ions.generate_theoretical_fragments::<OutputMolecularFormula>(
+            Charge::new::<mzcore::system::e>(max_charge as isize),
+            model.model(),
+        );
+        for f in fragments.iter().filter(|f| f.neutral_loss.is_empty()) {
+            // `bN` holds residues 0..N, `yN` n-N..n
+            let (kind, held) = match &f.ion {
+                FragmentType::a(p, _) | FragmentType::b(p, _) | FragmentType::c(p, _) => (
+                    StubIonKind::NTerm(p.series_number.saturating_sub(1)),
+                    ends.iter().filter(|&&r| r < p.series_number).count(),
+                ),
+                FragmentType::x(p, _) | FragmentType::y(p, _) | FragmentType::z(p, _) if p.series_number <= n => (
+                    StubIonKind::CTerm(n - p.series_number),
+                    ends.iter().filter(|&&r| r >= n - p.series_number).count(),
+                ),
+                _ => continue,
+            };
+            if held == 0 {
+                continue;
+            }
+            let Some(base) = f.mz(MassMode::Monoisotopic).map(|m| m.value) else { continue };
+            let z = f.charge.value.unsigned_abs().max(1) as u8;
+            // `y6²+` → `y6+A+S²+`: the stubs before the charge
+            let text = fragment_text(f);
+            let (ion, charge_part) = match text.find(|c: char| "⁰¹²³⁴⁵⁶⁷⁸⁹".contains(c)) {
+                Some(i) => (text[..i].to_string(), text[i..].to_string()),
+                None => (text.clone(), String::new()),
+            };
+            for stubs in stub_choices(link.stubs.len(), held) {
+                let mz = base + added(&stubs) / z as f64;
+                let Some(peak) = find_peak(views, mz, tolerance) else { continue };
+                if found.iter().any(|s| s.peptide == x && s.kind == kind && s.charge == z && s.stubs == stubs) {
+                    continue;
+                }
+                let text = format!("{ion}+{}{charge_part}", names(&stubs));
+                add_stub_label(views, peak, mz, x, stubs[0], &text);
+                found.push(StubIon {
+                    peptide: x,
+                    stub: stubs[0],
+                    stubs: stubs.clone(),
+                    kind,
+                    charge: z,
+                    theoretical_mz: mz,
+                    peak,
+                    text,
+                });
+            }
+        }
+    }
+
+    // parts freed when only one linker broke: link e holds two parts together
+    // when nothing else does; a part of two or more peptides keeps the
+    // linkers inside it and gets one stub where e was
+    let peptides = link.peptides.len();
+    if masses.iter().all(Option::is_some) && peptides <= 8 {
+        for (e, &(a, _, b, _)) in link.links.iter().enumerate() {
+            let side = joined(a, &link.links, e);
+            if side.contains(&b) {
+                continue;
+            }
+            for end in [a, b] {
+                let part: Vec<usize> = (0..peptides).filter(|v| side.contains(v) == side.contains(&end)).collect();
+                if part.len() < 2 {
+                    // one peptide on its own: its peptide + stub peaks, above
+                    continue;
+                }
+                let inner = link
+                    .links
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, l)| i != e && part.contains(&l.0) && part.contains(&l.2))
+                    .count();
+                let mass = part.iter().filter_map(|&v| masses[v]).sum::<f64>() + link.linker_mass * inner as f64;
+                let mask = part.iter().fold(0u8, |m, &v| m | (1 << v));
+                let members = part.iter().map(|v| (v + 1).to_string()).collect::<Vec<_>>().join(",");
+                for (j, stub) in link.stubs.iter().enumerate() {
+                    for z in 1..=max_charge {
+                        let mz = (mass + stub.mass + z as f64 * PROTON) / z as f64;
+                        let Some(peak) = find_peak(views, mz, tolerance) else { continue };
+                        let text = format!("{{{members}}}+{}{}", stub.name, charge_text(z));
+                        add_stub_label(views, peak, mz, end, j, &text);
+                        found.push(StubIon {
+                            peptide: end,
+                            stub: j,
+                            stubs: vec![j],
+                            kind: StubIonKind::Part { link: e as u8, peptides: mask },
+                            charge: z,
+                            theoretical_mz: mz,
+                            peak,
+                            text,
+                        });
+                    }
+                }
             }
         }
     }
@@ -962,6 +1256,9 @@ pub fn annotate(
     views.sort_by(|a, b| a.mz.total_cmp(&b.mz));
 
     let stub_ions = match link {
+        Some(link) if !link.stubs.is_empty() && link.kind == Kind::Multi => {
+            find_multi_stub_ions(&mut views, link, charge, model, tolerance)
+        }
         Some(link) if !link.stubs.is_empty() => find_stub_ions(&mut views, link, charge, model, tolerance),
         _ => Vec::new(),
     };
@@ -1077,7 +1374,16 @@ pub(crate) mod test {
             .iter()
             .map(|(p, s)| stubs.iter().map(|st| rewrite(p, &[(*s, format!("{:+}", st.mass))], &none)).collect())
             .collect();
-        Link { kind: Kind::Crosslink, sites, linker: "DSSO".into(), stubs, stub_peptides }
+        Link {
+            kind: Kind::Crosslink,
+            links: vec![(0, 3, 1, 9)],
+            sites,
+            linker: "DSSO".into(),
+            linker_mass: 158.0038,
+            stubs,
+            stub_peptides,
+            peptides: Vec::new(),
+        }
     }
 
     /// A multivalent chain from `crosslinks.sage.tsv`: read, written as
@@ -1127,10 +1433,129 @@ pub(crate) mod test {
             proforma,
             "GLEK[XLMOD:02001#XL1]VSTAAMQR//AEFGHDSTWK[#XL1]LMNPQSTVK[XLMOD:02001#XL2]GYEDFAR//TDYHFPNEWK[#XL2]LIR"
         );
-        assert!(results.link(&m).is_none());
+        // DSS: the links, no stubs
+        let link = results.link(&m).unwrap();
+        assert_eq!(link.links, [(0, 3, 1, 9), (1, 18, 2, 9)]);
+        assert_eq!(link.ends_of(1), [9, 18]);
+        assert!(link.stubs.is_empty());
         let peaks = Peaks { mz: vec![300.0, 500.0, 700.0], intensity: vec![10.0; 3], precursor_mz: None, ion_mobility: None };
-        let a = annotate(&peaks, &proforma, 4, Model::CidHcd, Tolerance::Ppm(-10.0, 10.0), None).unwrap();
+        let a = annotate(&peaks, &proforma, 4, Model::CidHcd, Tolerance::Ppm(-10.0, 10.0), Some(&link)).unwrap();
         assert_eq!(a.coverage.len(), 3);
+        assert!(a.stub_ions.is_empty());
+    }
+
+    pub(crate) const MULTI_SPECIES: &str =
+        "[1] GLEKVSTAAMQR [2] AEFGHDSTWKLMNPQSTVKGYEDFAR [3] TDYHFPNEWKLIR | 1:K4-2:K10; 2:K19-3:K10";
+
+    /// A DSSO `a1b1c` species (peptide 2 holds both links) after its linkers
+    /// broke: peptide 1 + A / S (doublet), peptide 2 + A+S and S+S (triplet,
+    /// 2+), peptide 3 + A; y8 of peptide 2 with S (on K19 only) and y17 with
+    /// A+S (both link residues, 2+); and the parts freed when one linker
+    /// broke: {2,3} + A (XL1) and {1,2} + S (XL2), both 2+
+    pub(crate) fn cleaved_multi() -> (Link, Annotation) {
+        let settings = CrosslinkSettings { reagent: Some(sage_core::crosslink::Reagent::Dsso), ..Default::default() };
+        let results = Results {
+            matches: Vec::new(),
+            files: HashMap::new(),
+            bruker: Default::default(),
+            crosslink: Some(settings.clone()),
+            fragment_tol: Tolerance::Ppm(-10.0, 10.0),
+            mod_masses: HashMap::new(),
+        };
+        let (peptides, _) = parse_species(MULTI_SPECIES);
+        let m = Match {
+            kind: Kind::Multi,
+            file: "a.d".into(),
+            scan: "1".into(),
+            charge: 4,
+            peptide: peptides[0].clone(),
+            partner: peptides[1].clone(),
+            sites: (4, 10),
+            proteins: String::new(),
+            score: 50.0,
+            spectrum_q: 0.0,
+            q: 0.0,
+            target: true,
+            rank: 1,
+            expmass: 0.0,
+            calcmass: 0.0,
+            rt: 10.0,
+            ion_mobility: None,
+            intra_protein: false,
+            topology: "a1b1c".into(),
+            species: MULTI_SPECIES.into(),
+        };
+        let link = results.link(&m).unwrap();
+        let stub = |name: &str| link.stubs.iter().find(|s| s.name == name).unwrap().mass;
+        let mass = |p: &str| {
+            PeptidoformIonSet::pro_forma(p, &mzcore::ontology::STATIC_ONTOLOGIES).unwrap().0.formulas()[0]
+                .monoisotopic_mass()
+                .value
+        };
+        let mz = |mass: f64, z: f64| (mass + z * PROTON) / z;
+        let (m1, m2, m3) = (mass(&peptides[0]), mass(&peptides[1]), mass(&peptides[2]));
+        let linker = settings.linker_mass() as f64;
+        let y = |number: usize, z: isize| {
+            PeptidoformIonSet::pro_forma(&peptides[1], &mzcore::ontology::STATIC_ONTOLOGIES)
+                .unwrap()
+                .0
+                .generate_theoretical_fragments::<OutputMolecularFormula>(Charge::new::<mzcore::system::e>(2), FragmentationModel::cid())
+                .into_iter()
+                .find(|f| {
+                    f.neutral_loss.is_empty()
+                        && f.charge.value == z
+                        && matches!(&f.ion, FragmentType::y(p, _) if p.series_number == number)
+                })
+                .and_then(|f| f.mz(MassMode::Monoisotopic))
+                .unwrap()
+                .value
+        };
+        let mut peaks = vec![
+            mz(m1 + stub("A"), 1.0),
+            mz(m1 + stub("S"), 1.0),
+            mz(m2 + stub("A") + stub("S"), 2.0),
+            mz(m2 + 2.0 * stub("S"), 2.0),
+            mz(m3 + stub("A"), 1.0),
+            y(8, 1) + stub("S"),
+            y(17, 2) + (stub("A") + stub("S")) / 2.0,
+            mz(m2 + m3 + linker + stub("A"), 2.0),
+            mz(m1 + m2 + linker + stub("S"), 2.0),
+        ];
+        peaks.sort_by(f64::total_cmp);
+        let peaks = Peaks { intensity: vec![50.0; peaks.len()], mz: peaks, precursor_mz: None, ion_mobility: None };
+        let a = annotate(&peaks, &results.proforma(&m), 4, Model::CidHcd, Tolerance::Ppm(-10.0, 10.0), Some(&link)).unwrap();
+        (link, a)
+    }
+
+    #[test]
+    fn multivalent_stub_ions_of_a_cleaved_species() {
+        let (link, a) = cleaved_multi();
+        assert_eq!(link.kind, Kind::Multi);
+        let names = |stubs: &[usize]| stubs.iter().map(|&j| link.stubs[j].name.clone()).collect::<Vec<_>>().join("+");
+        let found: HashSet<(usize, String, String)> = a
+            .stub_ions
+            .iter()
+            .map(|s| (s.peptide, format!("{:?}", s.kind), names(&s.stubs)))
+            .collect();
+        let has = |peptide: usize, kind: StubIonKind, stubs: &str| {
+            found.contains(&(peptide, format!("{kind:?}"), stubs.to_string()))
+        };
+        // doublets of the peptides with one link, triplet peaks of the one with two
+        assert!(has(0, StubIonKind::Peptide, "A") && has(0, StubIonKind::Peptide, "S"), "{found:?}");
+        assert!(has(1, StubIonKind::Peptide, "A+S") && has(1, StubIonKind::Peptide, "S+S"), "{found:?}");
+        assert!(has(2, StubIonKind::Peptide, "A"), "{found:?}");
+        // y8 holds K19 only (one stub), y17 holds K10 and K19 (two)
+        assert!(has(1, StubIonKind::CTerm(18), "S"), "{found:?}");
+        assert!(has(1, StubIonKind::CTerm(9), "A+S"), "{found:?}");
+        // the parts freed when one linker broke
+        assert!(has(1, StubIonKind::Part { link: 0, peptides: 0b110 }, "A"), "{found:?}");
+        assert!(has(1, StubIonKind::Part { link: 1, peptides: 0b011 }, "S"), "{found:?}");
+        // the labels say it all
+        let labels: Vec<&str> = a.peaks.iter().map(|p| p.labels[0].text.as_str()).collect();
+        for expected in ["P+A+S²+", "P+S+S²+", "y8+S", "y17+A+S²+", "{2,3}+A²+", "{1,2}+S²+"] {
+            assert!(labels.contains(&expected), "{expected} in {labels:?}");
+        }
+        assert!(a.peaks.iter().all(|p| matches!(p.labels[0].series, Series::Stub(_))), "{labels:?}");
     }
 
     /// An opened DSSO loop-link (NEKIQQKLQNER, K3–K7): ring ions carry the stub
@@ -1145,7 +1570,16 @@ pub(crate) mod test {
             .iter()
             .map(|&s| stubs.iter().map(|st| rewrite(peptide, &[(s, format!("{:+}", st.mass))], &none)).collect())
             .collect();
-        let link = Link { kind: Kind::Loop, sites: vec![(0, first), (0, second)], linker: "DSSO".into(), stubs, stub_peptides };
+        let link = Link {
+            kind: Kind::Loop,
+            sites: vec![(0, first), (0, second)],
+            links: vec![(0, first, 0, second)],
+            linker: "DSSO".into(),
+            linker_mass: 158.0038,
+            stubs,
+            stub_peptides,
+            peptides: Vec::new(),
+        };
 
         // b4 with the alkene on K3 and y7 with the sulfenic acid on K7 (ring ions),
         // and y9 with the alkene on K7 (it holds K3 too: not a ring ion of K7 alone)
@@ -1270,6 +1704,68 @@ pub(crate) mod test {
 #[cfg(test)]
 mod real_data {
     use super::*;
+
+    /// Bruker spectra read by id are the ones the whole-run read gives, peak
+    /// for peak: `SAGE_GUI_RESULTS=<folder>` (a search of timsTOF data)
+    #[test]
+    #[ignore]
+    fn spectra_read_by_id_are_the_whole_run_spectra() {
+        let folder = std::env::var("SAGE_GUI_RESULTS").expect("set SAGE_GUI_RESULTS");
+        let results = Results::load(Path::new(&folder)).unwrap();
+        let file = results.matches.iter().find(|m| m.target && m.spectrum_q <= 0.01).unwrap().file.clone();
+        let ids: HashSet<String> = results
+            .matches
+            .iter()
+            .filter(|m| m.file == file && m.target && m.spectrum_q <= 0.01)
+            .map(|m| m.scan.clone())
+            .collect();
+        let t = std::time::Instant::now();
+        let source = results.open_file(&file).unwrap();
+        assert!(matches!(source, SpectrumFile::Bruker(_)));
+        let opened = t.elapsed();
+        let by_id: HashMap<String, Peaks> = source.read(&ids).unwrap().into_iter().collect();
+        let by_id_time = t.elapsed();
+        let one: HashSet<String> = ids.iter().take(1).cloned().collect();
+        let t1 = std::time::Instant::now();
+        let single = source.read(&one).unwrap();
+        println!(
+            "{file}: opened in {opened:.2?}, {} spectra by id in {by_id_time:.2?}, one spectrum in {:.2?}",
+            by_id.len(),
+            t1.elapsed()
+        );
+        assert_eq!(single.len(), 1);
+
+        let url = &results.files[&file];
+        let t = std::time::Instant::now();
+        let whole: HashMap<String, Peaks> = sage_cloudpath::util::read_spectra(url, 0, None, results.bruker, false)
+            .unwrap()
+            .into_iter()
+            .filter(|s| ids.contains(&s.id))
+            .map(|s| {
+                let precursor = s.precursors.first();
+                let peaks = Peaks {
+                    mz: s.mz.iter().map(|&x| x as f64).collect(),
+                    precursor_mz: precursor.map(|p| p.mz as f64),
+                    ion_mobility: precursor.and_then(|p| p.inverse_ion_mobility),
+                    intensity: s.intensity,
+                };
+                (s.id, peaks)
+            })
+            .collect();
+        println!("whole run read in {:.2?}", t.elapsed());
+        assert_eq!(by_id.len(), ids.len(), "every spectrum found by its id");
+        assert_eq!(whole.len(), by_id.len());
+        let mut peaks = 0;
+        for (id, p) in &whole {
+            let q = &by_id[id];
+            assert_eq!(p.mz, q.mz, "spectrum {id}: m/z");
+            assert_eq!(p.intensity, q.intensity, "spectrum {id}: intensities");
+            assert_eq!(p.precursor_mz, q.precursor_mz);
+            assert_eq!(p.ion_mobility, q.ion_mobility);
+            peaks += p.mz.len();
+        }
+        println!("{} spectra identical, {:.0} peaks per spectrum", whole.len(), peaks as f64 / whole.len() as f64);
+    }
 
     #[test]
     #[ignore]
