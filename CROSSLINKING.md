@@ -434,7 +434,9 @@ to `crosslinks.sage.tsv`:
   * Spectra are referenced as in the table below (xiVIEW column); upload the
     mzML/MGF files and the FASTA with it. It is not written when there are no
     matches (mzIdentML needs at least one identification).
-* **`crosslinks_xiView.csv`** for [xiVIEW](https://github.com/colin-combe/CLMS-UI),
+* **`crosslinks_xiView.csv`** for [xiVIEW](https://github.com/colin-combe/CLMS-UI)
+  (to upload to a xiVIEW server; to view results on this computer, see
+  [xiVIEW on this computer](#xiview-on-this-computer)),
   in the CSV layout its importer reads (`PepSeq1`, `PepPos1`, `LinkPos1`,
   `Protein1`, `Decoy1`, ... `PeakListFileName`, `ScanId`). Upload it with the
   FASTA (and, to see annotated spectra, the mzML files: `ScanId` is the mzML
@@ -477,6 +479,86 @@ the search.
 These references were checked against the viewers' own readers: pyteomics
 `get_by_id` / MGF index lookup as xiVIEW's importer uses them, and JRAP's scan
 numbering from ProXL's importer.
+
+## xiVIEW on this computer
+
+`sage-gui` runs [xiVIEW](https://github.com/Rappsilber-Laboratory/xiview) (the
+Rappsilber lab's crosslink viewer) on this computer with garlic's results: **Open
+in xiVIEW** (bottom bar, Progress tab, Annotated spectra tab) or
+`sage-gui --xiview <results folder>` opens it in your web browser. Nothing is
+uploaded and no database or Python is needed.
+
+* sage-gui serves the xiVIEW web app (the `xiview` folder next to sage-gui.exe)
+  on `127.0.0.1` while it is open, and answers xiVIEW's data requests itself from
+  the results folder, in the form of the PRIDE crosslinking API that xiVIEW
+  normally reads (matches, peptides, proteins, search settings).
+* All of xiVIEW works: network (xiNET), matrix, circular, alignment, 3D structure
+  (load a PDB file or fetch one), distance histograms, filters, selection
+  tables, exports and the annotated spectra (xiSPEC), including **View Spectra
+  Only**. UniProt features and PDB structures are downloaded when those views
+  use them; the rest works offline.
+* **FDR: garlic's.** xiVIEW gets the target crosslinks within garlic's crosslink
+  FDR (crosslink q-value; 1% by default, 5% or 10% chosen next to the button),
+  all shown as passing ("Stored validation"). Decoys are not sent, so xiVIEW's
+  own decoy-based "In-browser FDR" is not used. Scores: `garlic:hyperscore`
+  (the default) and `garlic:q-value`.
+* Loop-links are shown on their peptide (in the spectrum viewer, the link as a
+  bracket).
+* **Multivalent crosslinks:**
+  * Network, circle (and matrix, 3D) views: each link of a species is a
+    crosslink between its residues (a homodimer's same-residue links as
+    homomultimer links), drawn **dash-dotted**. garlic loads link metadata with
+    the data: `Multivalent` (the topology, `a2a`, `a1b1a`) and `Multivalent
+    species` (the species by its links, e.g. `a1b1a: RPO21 K695–RPB3 K161 +
+    RPO21 K695–RPB3 K165`, the same on every link of it). Both are link colour
+    schemes: **colour by "Multivalent species"** to give each species its own
+    colour (other links grey); they are also shown with the links and can be
+    filtered on.
+  * Spectrum viewer: every link of a species opens the whole species, every
+    peptide a row (peptides 3 and 4 in gold and grey) lined up at its linked
+    residues, every link a line (the link of the selected match first). Fragments
+    are named by the peptides they carry through the links: `b4+P`, `b14+2P`
+    (two more peptides), `P+P+A` (two peptides still joined after one linker
+    broke, with the stub). The precursor counts one linker per link.
+* Proteins are named by gene (from the FASTA) and looked up in UniProt by their
+  accession; decoys are `DECOY_<accession>`.
+* **Annotated spectra:** the fragments come from Annotator's engine as in
+  garlic's Annotated spectra tab, and MS-cleavable linker stub ions (`P+A`,
+  `y6+S`, `b26+T+S`) from garlic's own stub search; they are converted to the
+  format xiSPEC reads, with the isotope peaks of each matched ion grouped. In a
+  sample of 49 spectra from the Pol II DSSO runs (crosslinks, loop-links and
+  multivalent species), every peak garlic's viewer explains (a/b/y, precursor
+  and stub ions) was annotated in xiSPEC too (xiSPEC also marks their isotope
+  peaks). Changing xiSPEC's settings
+  (tolerance, ion types, modifications) re-annotates the spectrum locally.
+* Spectra are read as Sage read them (timsTOF `.d` included, by spectrum id):
+  timsTOF runs are opened in the background and kept open, mzML / MGF files read
+  once, so a spectrum opens in a fraction of a second. **Keep sage-gui open**
+  while you use xiVIEW: it serves the data and spectra; if it was closed, a
+  spectrum click says so (open the results again with Open in xiVIEW).
+* **Credit and citation.** xiVIEW, with xiNET and xiSPEC, is the work of the
+  [Rappsilber Laboratory](https://www.rappsilberlab.org/) (Colin Combe, Martin
+  Graham, Lars Kolbowski, Lutz Fischer, Juri Rappsilber): please cite xiVIEW
+  (Combe et al., *J. Mol. Biol.* 2024, doi:10.1016/j.jmb.2024.168656), and
+  xiSPEC (Kolbowski et al., *Nucleic Acids Res.* 2018, doi:10.1093/nar/gky353)
+  and xiNET (Combe et al., *Mol. Cell. Proteomics* 2015,
+  doi:10.1074/mcp.O114.042259) when you use them. Repositories:
+  [xiview](https://github.com/Rappsilber-Laboratory/xiview) (GPL-3.0),
+  [xiview-server](https://github.com/Rappsilber-Laboratory/xiview-server)
+  (Apache-2.0); the data API garlic answers is the PRIDE Crosslinking
+  Resource's, [crosslinking-api](https://github.com/PRIDE-Archive/crosslinking-api)
+  (PRIDE team, EMBL-EBI, and the Rappsilber Laboratory; data model from
+  [mzidentml-reader](https://github.com/PRIDE-Archive/mzidentml-reader)), and the
+  annotation format xiSPEC reads is
+  [xiAnnotator](https://github.com/Rappsilber-Laboratory/xiAnnotator)'s. See the
+  README's Citation and Acknowledgments.
+* xiVIEW (GPL-3.0) stays a separate program served to the browser; it is built
+  from source at a pinned commit by `xiview/build_xiview.py`, with the changes
+  listed in `xiview/source_fixes.py`: the spectrum viewer's settings (their
+  re-annotation was dropped) and loop-links (their spectrum did not open), and
+  the multivalent display above (any number of peptides and links in the
+  spectrum viewer, garlic's link metadata, dash-dotted links). See the
+  `SOURCE.md` in the `xiview` folder.
 
 ## Annotated spectra
 

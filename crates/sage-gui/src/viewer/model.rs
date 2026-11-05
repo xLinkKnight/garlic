@@ -284,6 +284,33 @@ impl Results {
         })
     }
 
+    /// A protein of the search's FASTA (or crosslink databases) by accession
+    pub fn protein(&self, accession: &str) -> Option<&Protein> {
+        self.proteins.get(accession)
+    }
+
+    /// Every protein of the search's FASTA, by accession
+    pub fn proteins(&self) -> impl Iterator<Item = (&String, &Protein)> {
+        self.proteins.iter()
+    }
+
+    /// Prefix of decoy protein accessions (`rev_`)
+    pub fn decoy_tag(&self) -> &str {
+        &self.decoy_tag
+    }
+
+    /// Crosslink searches: the linker chemistry
+    pub fn crosslink_settings(&self) -> Option<&CrosslinkSettings> {
+        self.crosslink.as_ref()
+    }
+
+    /// The searched spectrum files: name and where Sage read it
+    pub fn spectrum_files(&self) -> Vec<(String, String)> {
+        let mut files: Vec<(String, String)> = self.files.iter().map(|(n, u)| (n.clone(), u.to_string())).collect();
+        files.sort();
+        files
+    }
+
     /// The label of each peptide of a match in the peptide map: its protein
     /// (gene and name, from the FASTA) and the positions of its link residues
     /// in the protein. The proteins are the ones Sage listed for the peptide;

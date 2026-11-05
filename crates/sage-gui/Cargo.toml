@@ -1,6 +1,6 @@
 [package]
 name = "sage-gui"
-version = "0.23.0"
+version = "1.0.0"
 edition = "2021"
 description = "Desktop front-end for editing Sage search settings and running searches"
 license = "MIT"
@@ -29,6 +29,11 @@ resvg = { version = "0.45", default-features = false, features = ["text", "syste
 # PDF export of figures (shares usvg 0.45 with resvg)
 svg2pdf = { version = "0.13", default-features = false, features = ["text"] }
 image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
+# Local xiVIEW: a small HTTP server on 127.0.0.1 serving the xiVIEW web app
+# and garlic's results in the form of its data API
+tiny_http = "0.12"
+# ...opened in the default web browser (the one registered for http)
+webbrowser = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

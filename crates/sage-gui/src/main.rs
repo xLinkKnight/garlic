@@ -11,6 +11,7 @@ mod usage;
 mod theme;
 mod unimod;
 mod viewer;
+mod xiview;
 
 use eframe::egui::{self, Color32, ComboBox, Response, RichText, TextEdit, Ui};
 use runner::{Job, Status, Step};
@@ -37,11 +38,13 @@ fn main() -> eframe::Result {
             .with_min_inner_size([720.0, 480.0]),
         ..Default::default()
     };
-    // `sage-gui --view <results folder>` opens the annotated spectra of a search
+    // `sage-gui --view <results folder>` opens the annotated spectra of a search,
+    // `sage-gui --xiview <results folder>` its crosslinks in xiVIEW (web browser)
     let mut args = std::env::args().skip(1);
-    let view = match args.next().as_deref() {
-        Some("--view") => args.next(),
-        _ => None,
+    let (view, xiview) = match args.next().as_deref() {
+        Some("--view") => (args.next(), None),
+        Some("--xiview") => (None, args.next()),
+        _ => (None, None),
     };
     eframe::run_native(
         "Sage search",
@@ -50,6 +53,9 @@ fn main() -> eframe::Result {
             let mut app = SageGui::new(&cc.egui_ctx);
             if let Some(folder) = view {
                 app.view_spectra(Path::new(&folder));
+            }
+            if let Some(folder) = xiview {
+                app.open_xiview(Path::new(&folder));
             }
             Ok(Box::new(app))
         }),
@@ -118,6 +124,16 @@ struct SageGui {
     probed_sage: String,
     /// The "Annotated spectra" tab
     viewer: viewer::Viewer,
+    /// The local xiVIEW server, started on first use
+    xiview: Option<std::sync::Arc<xiview::server::Server>>,
+    /// garlic's crosslink FDR at which xiVIEW gets the crosslinks
+    xiview_fdr: xiview::data::Fdr,
+    /// A results folder being loaded for xiVIEW
+    xiview_loading: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// The last xiVIEW message: (error?, text)
+    xiview_message: Option<(bool, String)>,
+    /// The last xiVIEW page opened, to open again
+    xiview_page: Option<String>,
 }
 
 /// Where the GUI remembers its last settings and tool paths between runs
@@ -153,6 +169,11 @@ impl SageGui {
             gpu_probe: None,
             probed_sage: String::new(),
             viewer: Default::default(),
+            xiview: None,
+            xiview_fdr: Default::default(),
+            xiview_loading: None,
+            xiview_message: None,
+            xiview_page: None,
         };
         if let Some(state) = state_path()
             .and_then(|p| std::fs::read_to_string(p).ok())
@@ -250,6 +271,117 @@ impl SageGui {
     fn view_spectra(&mut self, out: &Path) {
         self.viewer.open(&out.display().to_string());
         self.tab = Tab::Viewer;
+    }
+
+    /// Show the crosslinks of a results folder in xiVIEW, in the web browser:
+    /// the local server is started on first use and the folder loaded into
+    /// it in the background (see `poll_xiview`)
+    fn open_xiview(&mut self, folder: &Path) {
+        if self.xiview_loading.is_some() {
+            return;
+        }
+        let Some(root) = xiview::server::app_folder() else {
+            self.xiview_message = Some((
+                true,
+                "xiVIEW is not installed: the xiview folder that comes with sage-gui.exe is missing next to it.".into(),
+            ));
+            return;
+        };
+        if self.xiview.is_none() {
+            match xiview::server::Server::start(root) {
+                Ok(server) => self.xiview = Some(std::sync::Arc::new(server)),
+                Err(e) => {
+                    self.xiview_message = Some((true, e));
+                    return;
+                }
+            }
+        }
+        let Some(server) = self.xiview.clone() else { return };
+        let fdr = self.xiview_fdr;
+        if let Some(name) = server.has(folder, fdr) {
+            let url = server.url(&name);
+            self.show_xiview(&name, url);
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let folder_path = folder.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(server.add(&folder_path, fdr));
+        });
+        self.xiview_loading = Some(rx);
+        self.xiview_message = Some((false, format!("xiVIEW: loading {}…", folder.display())));
+    }
+
+    /// A results folder loaded for xiVIEW: open its page
+    fn poll_xiview(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.xiview_loading else { return };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.xiview_loading = None;
+                match (result, self.xiview.clone()) {
+                    (Ok(name), Some(server)) => self.show_xiview(&name, server.url(&name)),
+                    (Err(e), _) => self.xiview_message = Some((true, format!("xiVIEW: {e}"))),
+                    (Ok(_), None) => self.xiview_message = Some((true, "xiVIEW: the server stopped".into())),
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.xiview_loading = None,
+        }
+    }
+
+    /// Open a results folder's xiVIEW page in the default web browser
+    fn show_xiview(&mut self, name: &str, url: String) {
+        self.xiview_message = Some(match open_url(&url) {
+            Ok(()) => (false, format!("xiVIEW: {name} opened in your web browser (keep sage-gui open while you use it)")),
+            Err(e) => (true, format!("xiVIEW: your web browser did not open ({e}): open the page with the link")),
+        });
+        self.xiview_page = Some(url);
+    }
+
+    /// The last xiVIEW message and a link to its page (to open it again)
+    fn xiview_status(&self, ui: &mut Ui) {
+        if let Some((error, text)) = &self.xiview_message {
+            let color = if *error { Color32::from_rgb(210, 60, 60) } else { theme::muted(ui) };
+            ui.label(RichText::new(text).color(color).small());
+        }
+        if let (Some(url), None) = (&self.xiview_page, &self.xiview_loading) {
+            ui.hyperlink_to(RichText::new("open the xiVIEW page").small(), url)
+                .on_hover_text(format!("{url}\nThe page works while sage-gui is open."));
+        }
+    }
+
+    /// "Open in xiVIEW" with the choice of crosslinks, and its last message
+    fn xiview_controls(&mut self, ui: &mut Ui, folder: &Path) {
+        let ready = folder.join("crosslinks.sage.tsv").is_file() && self.xiview_loading.is_none();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(ready, egui::Button::new("Open in xiVIEW"))
+                .on_hover_text(XIVIEW_TIP)
+                .on_disabled_hover_text("Needs a crosslink search's results (crosslinks.sage.tsv).")
+                .clicked()
+            {
+                self.open_xiview(folder);
+            }
+            use xiview::data::Fdr;
+            let label = |f: Fdr| format!("crosslinks at garlic's {} FDR", f.percent());
+            ComboBox::from_id_salt("xiview_fdr")
+                .selected_text(label(self.xiview_fdr))
+                .width(230.0)
+                .show_ui(ui, |ui| {
+                    for f in Fdr::LEVELS {
+                        ui.selectable_value(&mut self.xiview_fdr, f, label(f));
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "xiVIEW gets the target crosslinks within garlic's crosslink FDR (crosslink q-value), \
+                     shown as passing; xiVIEW's own decoy-based FDR is not used.",
+                );
+            if self.xiview_loading.is_some() {
+                ui.spinner();
+            }
+        });
+        ui.horizontal(|ui| self.xiview_status(ui));
     }
 
     /// Check the settings, write the configuration into the output folder
@@ -455,6 +587,7 @@ impl eframe::App for SageGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_dropped_files(ctx);
         self.follow_job(ctx);
+        self.poll_xiview(ctx);
         if ctx.input(|i| i.viewport().close_requested()) {
             if let Some(job) = &self.job {
                 job.cancel();
@@ -572,6 +705,22 @@ impl eframe::App for SageGui {
                 {
                     self.view_spectra(Path::new(&out));
                 }
+                if ui
+                    .add_enabled(
+                        !running && self.xiview_loading.is_none() && Path::new(&out).join("crosslinks.sage.tsv").is_file(),
+                        egui::Button::new("Open in xiVIEW"),
+                    )
+                    .on_hover_text(XIVIEW_TIP)
+                    .clicked()
+                {
+                    self.open_xiview(Path::new(&out));
+                }
+                if self.xiview_loading.is_some() {
+                    ui.spinner();
+                }
+                if self.tab != Tab::Viewer {
+                    self.xiview_status(ui);
+                }
                 if let Some(job) = &self.job {
                     let (text, color) = match job.status() {
                         Status::Running(step) => (format!("Running: {step}"), Color32::from_rgb(70, 130, 220)),
@@ -651,7 +800,19 @@ impl eframe::App for SageGui {
                     Tab::Scoring => scoring_tab(ui, &mut self.s),
                     Tab::Crosslink => crosslink_tab(ui, &mut self.s),
                     Tab::Progress => self.progress_tab(ui),
-                    Tab::Viewer => self.viewer.ui(ui, &self.s.output_directory),
+                    Tab::Viewer => {
+                        // the folder shown, else the output folder
+                        let folder = if self.viewer.folder.trim().is_empty() {
+                            self.s.output_directory.clone()
+                        } else {
+                            self.viewer.folder.clone()
+                        };
+                        if Path::new(&folder).join("crosslinks.sage.tsv").is_file() {
+                            self.xiview_controls(ui, Path::new(&folder));
+                            ui.add_space(4.0);
+                        }
+                        self.viewer.ui(ui, &self.s.output_directory)
+                    }
                 });
             });
             if measuring {
@@ -1046,6 +1207,8 @@ impl SageGui {
         let muted = theme::muted(ui);
         // Results folder to open in Annotator, once the tracker is no longer borrowed
         let mut annotate: Option<PathBuf> = None;
+        let mut xiview_open: Option<PathBuf> = None;
+        let xiview_ready = self.xiview_loading.is_none();
         let running = t.state == progress::State::Running;
         // keep clear of the scroll bar on the right
         ui.set_max_width(ui.available_width() - 20.0);
@@ -1224,6 +1387,11 @@ impl SageGui {
                 if ui.button("View spectra").on_hover_text(VIEW_TIP).clicked() {
                     annotate = Some(PathBuf::from(&out));
                 }
+                if Path::new(&out).join("crosslinks.sage.tsv").is_file()
+                    && ui.add_enabled(xiview_ready, egui::Button::new("Open in xiVIEW")).on_hover_text(XIVIEW_TIP).clicked()
+                {
+                    xiview_open = Some(PathBuf::from(&out));
+                }
             });
         }
 
@@ -1240,6 +1408,9 @@ impl SageGui {
 
         if let Some(out) = annotate {
             self.view_spectra(&out);
+        }
+        if let Some(out) = xiview_open {
+            self.open_xiview(&out);
         }
     }
 
@@ -2181,6 +2352,28 @@ fn silac_labels(ui: &mut Ui, id: &str, masses: &mut (f64, f64)) -> egui::Respons
     .response
 }
 
+const XIVIEW_TIP: &str = "Show the crosslinks of this results folder in xiVIEW (network, matrix, circular \
+    and 3D structure views, filters, FDR and annotated spectra), in your web browser. xiVIEW runs on this \
+    computer: sage-gui serves it and the results on 127.0.0.1 while it is open. UniProt features and PDB \
+    structures are downloaded when you use those views.\n\n\
+    xiVIEW, xiNET and xiSPEC: Rappsilber Laboratory (rappsilberlab.org). Please cite xiVIEW (Combe et al., \
+    J. Mol. Biol. 2024, doi:10.1016/j.jmb.2024.168656), xiSPEC (Kolbowski et al., Nucleic Acids Res. 2018) and \
+    xiNET (Combe et al., Mol. Cell. Proteomics 2015) when you use them; see the README.";
+
+/// Open a web page in the default web browser: the browser registered for
+/// http (Windows: Settings > Apps > Default apps), started with the page;
+/// if that fails, the system's URL handler
+fn open_url(url: &str) -> Result<(), String> {
+    let Err(e) = webbrowser::open(url) else { return Ok(()) };
+    #[cfg(windows)]
+    let fallback = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn();
+    #[cfg(target_os = "macos")]
+    let fallback = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let fallback = std::process::Command::new("xdg-open").arg(url).spawn();
+    fallback.map(|_| ()).map_err(|f| format!("{e}; {f}"))
+}
+
 const VIEW_TIP: &str = "Show the matches of this results folder on the \"Annotated spectra\" tab: \
     each spectrum annotated with Annotator's engine (built in), linear and crosslinked.";
 
@@ -2594,5 +2787,37 @@ mod screenshots {
         assert!(harness.query_by_label("sp|P16370|RPB3_YEAST").is_some(), "the list opens");
         assert!(harness.query_by_label("sp|P34087|RPB7_YEAST").is_some());
         let _ = std::fs::remove_file(&fasta);
+    }
+
+    /// "Open in xiVIEW" with the choice of crosslinks, for a folder with
+    /// crosslinks; without the xiVIEW files it says so instead of opening
+    #[test]
+    fn open_in_xiview_controls() {
+        use egui_kittest::kittest::Queryable;
+        let folder = std::env::temp_dir().join(format!("sage_gui_xiview_{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("crosslinks.sage.tsv"), "psm_id\n").unwrap();
+        let path = folder.clone();
+        let mut app: Option<SageGui> = None;
+        let mut harness = Harness::builder().with_size(egui::vec2(900.0, 200.0)).build_ui(move |ui| {
+            let Some(app) = app.as_mut() else {
+                theme::install(ui.ctx(), false);
+                app = Some(SageGui::new(ui.ctx()));
+                return;
+            };
+            app.xiview_controls(ui, &path);
+        });
+        harness.run();
+        assert!(harness.query_by_label("Open in xiVIEW").is_some());
+        // (the test binary has no xiview folder next to it: nothing is opened)
+        if xiview::server::app_folder().is_none() {
+            harness.get_by_label("Open in xiVIEW").click();
+            harness.run();
+            assert!(
+                harness.query_by_label_contains("xiVIEW is not installed").is_some(),
+                "a missing xiview folder is reported"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&folder);
     }
 }

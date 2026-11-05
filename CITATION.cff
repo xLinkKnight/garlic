@@ -53,3 +53,96 @@ references:
     year: 2025
     doi: 10.1021/acs.analchem.5c02832
     notes: "Annotator (https://github.com/snijderlab/annotator); its engine (mzcore / mzannotate) draws the annotated spectra in sage-gui."
+  - type: article
+    title: "xiVIEW: Visualisation of Crosslinking Mass Spectrometry Data"
+    authors:
+      - family-names: Combe
+        given-names: Colin W.
+      - family-names: Graham
+        given-names: Martin
+        orcid: https://orcid.org/0000-0002-7882-4881
+      - family-names: Kolbowski
+        given-names: Lars
+        orcid: https://orcid.org/0000-0001-6819-6570
+      - family-names: Fischer
+        given-names: Lutz
+      - family-names: Rappsilber
+        given-names: Juri
+        orcid: https://orcid.org/0000-0001-5999-1310
+    journal: Journal of Molecular Biology
+    volume: 436
+    issue: 17
+    start: 168656
+    year: 2024
+    doi: 10.1016/j.jmb.2024.168656
+    notes: "xiVIEW (https://github.com/Rappsilber-Laboratory/xiview, Rappsilber Laboratory), run locally by sage-gui (Open in xiVIEW)."
+  - type: article
+    title: "xiSPEC: web-based visualization, analysis and sharing of proteomics data"
+    authors:
+      - family-names: Kolbowski
+        given-names: Lars
+        orcid: https://orcid.org/0000-0001-6819-6570
+      - family-names: Combe
+        given-names: Colin
+      - family-names: Rappsilber
+        given-names: Juri
+    journal: Nucleic Acids Research
+    volume: 46
+    issue: W1
+    start: W473
+    end: W478
+    year: 2018
+    doi: 10.1093/nar/gky353
+    notes: "xiSPEC, the spectrum viewer in xiVIEW."
+  - type: article
+    title: "xiNET: Cross-link Network Maps With Residue Resolution"
+    authors:
+      - family-names: Combe
+        given-names: Colin W.
+      - family-names: Fischer
+        given-names: Lutz
+      - family-names: Rappsilber
+        given-names: Juri
+    journal: Molecular & Cellular Proteomics
+    volume: 14
+    issue: 4
+    start: 1137
+    end: 1147
+    year: 2015
+    doi: 10.1074/mcp.O114.042259
+    notes: "xiNET, the network view in xiVIEW."
+  - type: article
+    title: "The PRIDE database at 20 years: 2025 update"
+    authors:
+      - family-names: Perez-Riverol
+        given-names: Yasset
+        orcid: https://orcid.org/0000-0001-6579-6941
+      - family-names: Bandla
+        given-names: Chakradhar
+      - family-names: Kundu
+        given-names: Deepti J.
+      - family-names: Kamatchinathan
+        given-names: Selvakumar
+      - family-names: Bai
+        given-names: Jingwen
+      - family-names: Hewapathirana
+        given-names: Suresh
+      - family-names: John
+        given-names: Nithu Sara
+      - family-names: Prakash
+        given-names: Ananth
+      - family-names: Walzer
+        given-names: Mathias
+      - family-names: Wang
+        given-names: Shengbo
+      - family-names: Vizcaíno
+        given-names: Juan Antonio
+        orcid: https://orcid.org/0000-0002-3905-4335
+    journal: Nucleic Acids Research
+    volume: 53
+    issue: D1
+    start: D543
+    end: D553
+    year: 2025
+    doi: 10.1093/nar/gkae1011
+    notes: "PRIDE; garlic's local xiVIEW server answers the data API of the PRIDE Crosslinking Resource (https://github.com/PRIDE-Archive/crosslinking-api)."

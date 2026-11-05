@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.0.0] - 2026-11-05
+
+### Added
+- `sage-gui`: xiVIEW on this computer. **Open in xiVIEW** (bottom bar, Progress tab, Annotated spectra tab) and `sage-gui --xiview <results folder>` show a crosslink search's results in [xiVIEW](https://github.com/Rappsilber-Laboratory/xiview) in the web browser, with nothing uploaded and no database: sage-gui serves the xiVIEW web app (the `xiview` folder next to sage-gui.exe) on 127.0.0.1 and answers xiVIEW's data API (the PRIDE crosslinking API's `get_xiview_*` endpoints) from the results folder. Crosslinks within garlic's crosslink FDR (1%, 5% or 10%; xiVIEW's own decoy FDR is not used); proteins by gene name. Multivalent crosslinks: each link a crosslink, drawn dash-dotted in the network and circle views, with link metadata (`Multivalent`, `Multivalent species`; colour by species), and the whole species in the spectrum viewer (every peptide and link; fragments named by the peptides they carry, `b14+2P`). Annotated spectra for xiVIEW's spectrum viewer (xiSPEC) from Annotator's engine and garlic's MS-cleavable stub ions, converted to xiSPEC's format; xiSPEC's settings re-annotate locally. Spectra read as Sage read them (timsTOF runs kept open: a spectrum opens in a fraction of a second); a spectrum that cannot be fetched (sage-gui closed) or annotated says so. xiVIEW, xiNET and xiSPEC are the work of the Rappsilber Laboratory: README (Citation, Acknowledgments) and CITATION.cff cite them (Combe et al. 2024, Kolbowski et al. 2018, Combe et al. 2015), the repositories (xiview, xiview-server, crosslinking-api and mzidentml-reader with the PRIDE team at EMBL-EBI, xiAnnotator) and PRIDE (Perez-Riverol et al. 2025). `xiview/build_xiview.py` builds xiVIEW (GPL-3.0) from source at a pinned commit with the changes in `xiview/source_fixes.py` (multivalent display; the spectrum settings' request id; loop-link spectra, which did not open). See CROSSLINKING.md.
+
 ## [v0.23.0] - 2026-11-04
 
 ### Added
