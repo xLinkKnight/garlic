@@ -244,9 +244,12 @@ impl Input {
         // avoid to later panic if these parameters are not set (but doesn't check if files exist)
 
         ensure!(
-            input.database.fasta.is_some(),
-            "`database.fasta` must be set. For more information try '--help'"
+            input.database.fasta.is_some() || input.database.crosslink_databases.is_some(),
+            "`database.fasta` (or `database.crosslink_databases`) must be set. For more information try '--help'"
         );
+        if input.database.crosslink_databases.is_some() && input.database.fasta.is_some() {
+            log::warn!("`database.crosslink_databases` is set: `database.fasta` is ignored");
+        }
         ensure!(
             input
                 .mzml_paths

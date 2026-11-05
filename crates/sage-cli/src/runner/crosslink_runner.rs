@@ -36,6 +36,18 @@ fn link_type(kind: LinkKind) -> &'static str {
     }
 }
 
+/// `database_a` / `database_b` columns: `1`, `2`, or `1+2` for a peptide of
+/// proteins in both crosslink databases
+fn database_name(group: u8) -> &'static str {
+    use sage_core::database::{DATABASE_1, DATABASE_2};
+    match (group & DATABASE_1 != 0, group & DATABASE_2 != 0) {
+        (true, true) => "1+2",
+        (true, false) => "1",
+        (false, true) => "2",
+        (false, false) => "",
+    }
+}
+
 /// `topology` column: `a1b` (two peptides), `a1a` (two copies of one
 /// peptide), `loop`, or a multivalent species' shape (`a2b`, `a1b1c`, …)
 fn topology(m: &CrosslinkMatch) -> String {
@@ -77,8 +89,8 @@ impl Runner {
             .crosslink
             .clone()
             .expect("run_crosslink requires crosslink settings");
-        // SILAC labels leave a residue free to link
-        settings.labels = self.database.silac.as_ref().map(|l| l.label_ids()).unwrap_or_default();
+        // isotope labels (SILAC, uniformly labelled proteins) leave a residue free to link
+        settings.labels = self.database.isotope_mods();
         let silac = self.database.silac.is_some();
         if parquet {
             log::warn!("parquet output is not available for crosslink searches, writing tsv");
@@ -310,6 +322,17 @@ impl Runner {
         if silac {
             headers.push("silac_channel".into());
         }
+        let labelled = db.protein_labels.is_some();
+        if labelled {
+            headers.push("isotope_label_a".into());
+            headers.push("isotope_label_b".into());
+        }
+        // two crosslink databases: which one each peptide is from
+        let two_databases = db.two_databases();
+        if two_databases {
+            headers.push("database_a".into());
+            headers.push("database_b".into());
+        }
         if !reporter_headers.is_empty() {
             headers.push("ion_injection_time".into());
             headers.extend(reporter_headers.iter().cloned());
@@ -375,6 +398,20 @@ impl Runner {
                 };
                 record.push(super::silac_tables::species_channel(db, &peptides));
             }
+            if labelled {
+                let name = |ix: Option<sage_core::database::PeptideIx>| {
+                    ix.and_then(|ix| db.isotope_label(ix)).map_or("", |l| l.name()).to_string()
+                };
+                record.push(name(Some(m.alpha)));
+                record.push(name(m.beta));
+            }
+            if two_databases {
+                let group = |ix: Option<sage_core::database::PeptideIx>| {
+                    ix.and_then(|ix| db.database_group(ix)).map(database_name).unwrap_or_default().to_string()
+                };
+                record.push(group(Some(m.alpha)));
+                record.push(group(m.beta));
+            }
             if let Some(reporters) = reporters.filter(|_| !reporter_headers.is_empty()) {
                 // Spectra without reporter ions (e.g. no matching MS3) get empty cells
                 match reporters.get(&(m.file_id, m.spec_id.clone())) {
@@ -404,12 +441,7 @@ impl Runner {
     ) -> anyhow::Result<()> {
         use super::crosslink_export::{proxl_xml, xiview_csv, ExportContext, SpectrumFile};
         // Protein sequences locate each peptide in its protein
-        let fasta_url = sage_cloudpath::to_url(&self.parameters.database.fasta)?;
-        let fasta = sage_cloudpath::util::read_fasta(
-            &fasta_url,
-            &self.parameters.database.decoy_tag,
-            self.parameters.database.generate_decoys,
-        )?;
+        let fasta = super::read_protein_databases(&mut self.parameters.database.clone())?;
         let wanted: std::collections::HashSet<&str> = matches
             .iter()
             .flat_map(|m| std::iter::once(m.alpha).chain(m.beta))
@@ -421,9 +453,20 @@ impl Runner {
             .filter(|(acc, _)| wanted.contains(acc.as_ref()))
             .map(|(acc, seq)| (acc.to_string(), seq.clone()))
             .collect();
-        let fasta_name = sage_cloudpath::filename(&fasta_url)
-            .unwrap_or(&self.parameters.database.fasta)
-            .to_string();
+        // the FASTA file, or both crosslink databases
+        let fasta_name = self
+            .parameters
+            .database
+            .fasta_files()
+            .into_iter()
+            .map(|path| {
+                sage_cloudpath::to_url(path)
+                    .ok()
+                    .and_then(|url| sage_cloudpath::filename(&url).map(String::from))
+                    .unwrap_or_else(|| path.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(" + ");
 
         // How the viewers find each match's spectrum; spectrum positions are
         // read again only where ids alone are not enough (MGF, mzML without scan=)

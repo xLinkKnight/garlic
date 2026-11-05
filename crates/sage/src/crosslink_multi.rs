@@ -587,6 +587,15 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                                     let mut key: Vec<u32> = peptides.iter().map(|ix| ix.0).collect();
                                     key.sort_unstable();
                                     for edges in &shapes {
+                                        // two databases: at least one link joins
+                                        // a peptide of each (others may stay within one)
+                                        if db.two_databases()
+                                            && !edges.iter().any(|&(i, j)| {
+                                                i != j && db.cross_database(peptides[i as usize], peptides[j as usize])
+                                            })
+                                        {
+                                            continue;
+                                        }
                                         if !seen.insert((key.clone(), edges.clone())) {
                                             continue;
                                         }

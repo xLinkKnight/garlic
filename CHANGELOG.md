@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.23.0] - 2026-11-04
+
+### Added
+- Two-database crosslink searches, for complex crosslink searches (`database.crosslink_databases` with `database_1` and `database_2`, replacing `fasta`; `sage-gui`: Files tab → Two-database crosslink search, which greys out the FASTA field). Linear peptides are searched in both files as one database; crosslinks only between a Database 1 and a Database 2 protein (cpu, reflect, gpu and MS-cleavable searches), so pairs within one database are never scored or counted in the FDR. Loop-links are not searched; a multivalent species needs at least one link between the databases. A peptide of proteins in both files counts as either; decoys follow their target. `crosslinks.sage.tsv` gets `database_a` / `database_b` columns (`1`, `2`, `1+2`). The viewer, exports and labelled-protein list read both files. See CROSSLINKING.md.
+- Uniformly isotope-labelled proteins (`database.labelled_proteins`; `sage-gui`: Database & enzyme tab → Isotope-labelled proteins: the chosen proteins, and a searchable list of the FASTA's proteins, closed at first): chosen proteins, expressed in ¹⁵N, ¹³C or ¹³C¹⁵N media, are searched labelled in linear and crosslink searches. Every residue carries its carbon and/or nitrogen atoms' mass shift, added after the fixed and variable modifications, so labels do not count towards `max_variable_mods` and a residue keeps its modifications (a modification's own atoms stay light; deamidation and pyro-Glu from Q lose a ¹⁵N). `include_unlabelled` (default on) also searches them unlabelled. Peptides shared with other proteins are searched both ways, each credited to its proteins. A labelled residue still crosslinks, and crosslinks between labelled and unlabelled proteins are found. `results.sage.tsv` gets an `isotope_label` column, `crosslinks.sage.tsv` `isotope_label_a` / `isotope_label_b`. Combines with SILAC.
+
 ## [v0.22.0] - 2026-11-04
 
 ### Added

@@ -10,6 +10,7 @@ pub mod fdr;
 pub mod heap;
 pub mod ion_series;
 pub mod isotopes;
+pub mod labelled;
 pub mod lfq;
 pub mod mass;
 pub mod ml;

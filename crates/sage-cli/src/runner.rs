@@ -94,22 +94,38 @@ impl FromIterator<RawSpectrum> for RawSpectrumAccumulator {
     }
 }
 
+/// One FASTA file of the search
+fn read_fasta_file(path: &str, decoy_tag: &str, generate_decoys: bool) -> anyhow::Result<Fasta> {
+    let url = sage_cloudpath::to_url(path)?;
+    sage_cloudpath::util::read_fasta(&url, decoy_tag, generate_decoys)
+        .with_context(|| format!("Failed to build database from `{path}`"))
+}
+
+/// The proteins searched: `database.fasta`, or the two crosslink databases
+/// as one (remembering which database each protein is in)
+pub fn read_protein_databases(db: &mut Parameters) -> anyhow::Result<Fasta> {
+    let (tag, generate) = (db.decoy_tag.clone(), db.generate_decoys);
+    match db.crosslink_databases.clone() {
+        Some(two) => {
+            let first = read_fasta_file(&two.database_1, &tag, generate)?;
+            let second = read_fasta_file(&two.database_2, &tag, generate)?;
+            info!(
+                "two crosslink databases: {} proteins in database 1, {} in database 2; \
+                 crosslinks only between them",
+                first.targets.len(),
+                second.targets.len()
+            );
+            Ok(db.merge_databases(first, second))
+        }
+        None => read_fasta_file(&db.fasta, &tag, generate),
+    }
+}
+
 impl Runner {
     pub fn new(parameters: Search, parallel: usize) -> anyhow::Result<Self> {
         let mut parameters = parameters.clone();
         let start = Instant::now();
-        let fasta_url = sage_cloudpath::to_url(&parameters.database.fasta)?;
-        let fasta = sage_cloudpath::util::read_fasta(
-            &fasta_url,
-            &parameters.database.decoy_tag,
-            parameters.database.generate_decoys,
-        )
-        .with_context(|| {
-            format!(
-                "Failed to build database from `{}`",
-                parameters.database.fasta
-            )
-        })?;
+        let fasta = read_protein_databases(&mut parameters.database)?;
 
         let database = match parameters.database.prefilter {
             false => parameters.database.clone().build(fasta),
@@ -832,6 +848,10 @@ impl Runner {
         if self.database.silac.is_some() {
             record.push_field(silac_tables::channel_name(&self.database, feature.peptide_idx).as_bytes());
         }
+        if self.database.protein_labels.is_some() {
+            let label = self.database.isotope_label(feature.peptide_idx);
+            record.push_field(label.map_or("", |l| l.name()).as_bytes());
+        }
         record
     }
 
@@ -943,6 +963,9 @@ impl Runner {
         let mut csv_headers = csv_headers;
         if self.database.silac.is_some() {
             csv_headers.push("silac_channel");
+        }
+        if self.database.protein_labels.is_some() {
+            csv_headers.push("isotope_label");
         }
 
         let headers = csv::ByteRecord::from(csv_headers);

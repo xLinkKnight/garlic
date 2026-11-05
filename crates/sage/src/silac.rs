@@ -190,6 +190,11 @@ impl Labels {
         ids
     }
 
+    /// Combined modifications of a label with one of `bases`
+    pub fn combined_with(&self, bases: &[ModId]) -> Vec<ModId> {
+        self.combined.iter().filter(|((_, _, base), _)| bases.contains(base)).map(|(_, &id)| id).collect()
+    }
+
     /// `peptide` (light) and the peptide in each channel that labels any of
     /// its residues, every labelled residue carrying the label
     pub fn states(&self, peptide: Peptide) -> Vec<Peptide> {

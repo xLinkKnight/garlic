@@ -55,6 +55,14 @@ impl Fasta {
         }
     }
 
+    /// The proteins of both, one FASTA; a protein in both (same accession and
+    /// sequence) once
+    pub fn merge(mut self, other: Fasta) -> Fasta {
+        let known: std::collections::HashSet<(Arc<str>, String)> = self.targets.iter().cloned().collect();
+        self.targets.extend(other.targets.into_iter().filter(|t| !known.contains(t)));
+        self
+    }
+
     pub fn digest(&self, enzyme: &EnzymeParameters) -> Vec<Digest> {
         self.targets
             .par_iter()

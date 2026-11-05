@@ -194,7 +194,25 @@ pub struct Builder {
     pub prefilter_low_memory: Option<bool>,
     /// SILAC: labelled channels; every peptide is also searched in each
     pub silac: Option<crate::silac::SilacSettings>,
+    /// Proteins uniformly labelled with 15N and/or 13C
+    pub labelled_proteins: Option<crate::labelled::LabelledProteins>,
+    /// Two FASTA files, searched as one for linear peptides; crosslinks only
+    /// between a protein of one and a protein of the other. Replaces `fasta`.
+    pub crosslink_databases: Option<CrosslinkDatabases>,
 }
+
+/// Two protein databases of a crosslink search between them, e.g. two
+/// complexes: only crosslinks joining a protein of `database_1` to one of
+/// `database_2` are searched. Linear peptides are searched in both, as one.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CrosslinkDatabases {
+    pub database_1: String,
+    pub database_2: String,
+}
+
+/// Peptide of a protein in Database 1 / Database 2 (bits of a group)
+pub const DATABASE_1: u8 = 1;
+pub const DATABASE_2: u8 = 2;
 
 impl Builder {
     pub fn make_parameters(self) -> Result<Parameters, ModificationError> {
@@ -203,15 +221,25 @@ impl Builder {
             &self.static_mods.unwrap_or_default(),
             &self.variable_mods.unwrap_or_default(),
         )?;
+        let mut configured: Vec<(ModificationSpecificity, ModId)> = modifications
+            .static_mods
+            .iter()
+            .copied()
+            .chain(modifications.variable_mods.iter().map(|&(s, id, _)| (s, id)))
+            .collect();
+        // uniformly labelled proteins first: SILAC labels go on top of theirs
+        let protein_labels = match &self.labelled_proteins {
+            Some(labelled) => {
+                labelled.validate().map_err(ModificationError::Silac)?;
+                let labels = crate::labelled::ProteinLabels::register(labelled, &mut modifications.registry, &configured)?;
+                configured.extend(labels.all_ids().into_iter().map(|(r, id)| (ModificationSpecificity::Residue(r), id)));
+                Some(Arc::new(labels))
+            }
+            None => None,
+        };
         let labels = match &self.silac {
             Some(silac) => {
                 silac.validate().map_err(ModificationError::Silac)?;
-                let configured: Vec<(ModificationSpecificity, ModId)> = modifications
-                    .static_mods
-                    .iter()
-                    .copied()
-                    .chain(modifications.variable_mods.iter().map(|&(s, id, _)| (s, id)))
-                    .collect();
                 Some(Arc::new(crate::silac::Labels::register(
                     silac,
                     &mut modifications.registry,
@@ -232,12 +260,20 @@ impl Builder {
             max_variable_mods: self.max_variable_mods.map(|x| x.max(1)).unwrap_or(2),
             max_combinations: self.max_combinations.map(|x| x.max(1)),
             generate_decoys: self.generate_decoys.unwrap_or(true),
-            fasta: self.fasta.expect("A fasta file must be provided!"),
+            // two databases replace the single FASTA
+            fasta: match &self.crosslink_databases {
+                Some(_) => String::new(),
+                None => self.fasta.expect("A fasta file must be provided!"),
+            },
             prefilter_chunk_size: self.prefilter_chunk_size.unwrap_or(0),
             prefilter: self.prefilter.unwrap_or(false),
             prefilter_low_memory: self.prefilter_low_memory.unwrap_or(true),
             silac: self.silac,
             labels,
+            labelled_proteins: self.labelled_proteins,
+            protein_labels,
+            crosslink_databases: self.crosslink_databases,
+            database_groups: None,
         })
     }
 
@@ -271,9 +307,44 @@ pub struct Parameters {
     /// The SILAC labels as modification ids
     #[serde(skip)]
     pub labels: Option<Arc<crate::silac::Labels>>,
+    /// Uniformly 15N / 13C labelled proteins
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labelled_proteins: Option<crate::labelled::LabelledProteins>,
+    /// Their labels as modification ids
+    #[serde(skip)]
+    pub protein_labels: Option<Arc<crate::labelled::ProteinLabels>>,
+    /// Two databases for a crosslink search between them (`fasta` is empty)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crosslink_databases: Option<CrosslinkDatabases>,
+    /// With two databases: which of them each protein is in (accession ->
+    /// [`DATABASE_1`] and/or [`DATABASE_2`]), set by [`Parameters::merge_databases`]
+    #[serde(skip)]
+    pub database_groups: Option<Arc<HashMap<Arc<str>, u8>>>,
 }
 
 impl Parameters {
+    /// The FASTA files searched: `fasta`, or the two crosslink databases
+    pub fn fasta_files(&self) -> Vec<&str> {
+        match &self.crosslink_databases {
+            Some(d) => vec![d.database_1.as_str(), d.database_2.as_str()],
+            None => vec![self.fasta.as_str()],
+        }
+    }
+
+    /// Two crosslink databases read: one FASTA of both (for the linear
+    /// search), remembering which database each protein is in
+    pub fn merge_databases(&mut self, database_1: Fasta, database_2: Fasta) -> Fasta {
+        let mut groups: HashMap<Arc<str>, u8> = HashMap::new();
+        for (accession, _) in &database_1.targets {
+            *groups.entry(accession.clone()).or_default() |= DATABASE_1;
+        }
+        for (accession, _) in &database_2.targets {
+            *groups.entry(accession.clone()).or_default() |= DATABASE_2;
+        }
+        self.database_groups = Some(Arc::new(groups));
+        database_1.merge(database_2)
+    }
+
     pub fn auto_calculate_prefilter_chunk_size(&mut self, fasta: &Fasta) {
         const MAX_PEPS_PER_CHUNK: usize = 2usize.pow(23);
         self.prefilter_chunk_size = match self.prefilter_chunk_size {
@@ -343,6 +414,11 @@ impl Parameters {
                         self.max_combinations,
                     )
                     .into_iter()
+                    // uniformly labelled proteins: their peptides labelled
+                    .flat_map(|peptide| match &self.protein_labels {
+                        Some(labels) => labels.states(peptide),
+                        None => vec![peptide],
+                    })
                     // SILAC: each peptide light and in every labelled channel
                     .flat_map(|peptide| match &self.labels {
                         Some(labels) => labels.states(peptide),
@@ -506,7 +582,17 @@ impl Parameters {
             None => Vec::new(),
         };
 
+        // two databases: which of them each peptide's proteins are in
+        let database_groups = match &self.database_groups {
+            Some(groups) => target_decoys
+                .par_iter()
+                .map(|p| p.proteins.iter().fold(0, |g, acc| g | groups.get(acc).copied().unwrap_or(0)))
+                .collect(),
+            None => Vec::new(),
+        };
+
         IndexedDatabase {
+            database_groups,
             peptides: target_decoys,
             fragments,
             min_value,
@@ -517,6 +603,7 @@ impl Parameters {
             decoy_tag: self.decoy_tag,
             silac: self.labels,
             silac_channels,
+            protein_labels: self.protein_labels,
         }
     }
 }
@@ -668,12 +755,41 @@ pub struct IndexedDatabase {
     /// SILAC channel of each peptide (by index), [`NO_CHANNEL`] for one
     /// without labelled residues; empty without SILAC
     pub silac_channels: Vec<u8>,
+    /// Uniformly 15N / 13C labelled proteins, when searched with them
+    pub protein_labels: Option<Arc<crate::labelled::ProteinLabels>>,
+    /// Two crosslink databases: of each peptide (by index), [`DATABASE_1`]
+    /// and/or [`DATABASE_2`]; empty with one database
+    pub database_groups: Vec<u8>,
 }
 
 /// SILAC channel of a peptide without labelled residues
 pub const NO_CHANNEL: u8 = u8::MAX;
 
 impl IndexedDatabase {
+    /// The uniform isotope label of a peptide (from a labelled protein)
+    pub fn isotope_label(&self, ix: PeptideIx) -> Option<crate::labelled::Isotope> {
+        self.protein_labels.as_ref()?.isotope(&self[ix])
+    }
+
+    /// Modifications that are only heavy isotopes (SILAC labels, uniform
+    /// labels, and SILAC labels on uniformly labelled residues): a residue
+    /// carrying one is still free to react, e.g. to crosslink
+    pub fn isotope_mods(&self) -> Vec<ModId> {
+        let uniform: Vec<ModId> = self
+            .protein_labels
+            .as_ref()
+            .map(|l| l.label_ids().into_iter().map(|(_, id)| id).collect())
+            .unwrap_or_default();
+        let mut ids = uniform.clone();
+        if let Some(silac) = &self.silac {
+            ids.extend(silac.label_ids());
+            ids.extend(silac.combined_with(&uniform));
+        }
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
     /// SILAC channel of a peptide: `Some(0)` light, `None` without SILAC or
     /// labelled residues
     pub fn silac_channel(&self, ix: PeptideIx) -> Option<u8> {
@@ -697,6 +813,35 @@ impl IndexedDatabase {
             }
         }
         true
+    }
+
+    /// Searched with two crosslink databases?
+    pub fn two_databases(&self) -> bool {
+        !self.database_groups.is_empty()
+    }
+
+    /// Database(s) of a peptide's proteins, bits [`DATABASE_1`] and
+    /// [`DATABASE_2`]; `None` with one database
+    pub fn database_group(&self, ix: PeptideIx) -> Option<u8> {
+        self.database_groups.get(ix.0 as usize).copied()
+    }
+
+    /// Can a link join these two peptides as far as the databases go? With
+    /// two databases, one peptide must come from Database 1 and the other from
+    /// Database 2 (a peptide of proteins in both counts as either)
+    pub fn cross_database(&self, a: PeptideIx, b: PeptideIx) -> bool {
+        match (self.database_group(a), self.database_group(b)) {
+            (Some(x), Some(y)) => {
+                (x & DATABASE_1 != 0 && y & DATABASE_2 != 0) || (x & DATABASE_2 != 0 && y & DATABASE_1 != 0)
+            }
+            _ => true,
+        }
+    }
+
+    /// May these two peptides be crosslinked? SILAC channels and the two
+    /// crosslink databases
+    pub fn may_crosslink(&self, a: PeptideIx, b: PeptideIx) -> bool {
+        self.cross_database(a, b) && self.same_silac_channel(&[a, b])
     }
 
     /// Create a new [`IndexedQuery`] for a specific [`ProcessedSpectrum`]
@@ -995,6 +1140,10 @@ mod test {
             prefilter_low_memory: true,
             silac: None,
             labels: None,
+            labelled_proteins: None,
+            protein_labels: None,
+            crosslink_databases: None,
+            database_groups: None,
         };
 
         let peptides = params.digest(&fasta);
@@ -1132,5 +1281,41 @@ mod test {
             builder.unwrap().make_parameters().err(),
             Some(ModificationError::TooMany)
         );
+    }
+
+    #[test]
+    fn two_crosslink_databases_are_merged_and_tagged() {
+        let builder: Builder = serde_json::from_value(serde_json::json!({
+            "crosslink_databases": {"database_1": "complex1.fasta", "database_2": "complex2.fasta"},
+            "enzyme": {"min_len": 5, "max_len": 30},
+            "peptide_min_mass": 400.0
+        }))
+        .unwrap();
+        let mut params = builder.make_parameters().unwrap();
+        assert_eq!(params.fasta_files(), vec!["complex1.fasta", "complex2.fasta"]);
+        // a protein in both files (same accession and sequence) is read once
+        let db1 = Fasta::parse(">sp|P1|ONE\nMSDLANSEKGLEKVSTR\n>sp|P3|SHARED\nAAWLDEKTTPYK\n".into(), "rev_", true);
+        let db2 = Fasta::parse(">sp|P2|TWO\nTDYHFPNEKLIR\n>sp|P3|SHARED\nAAWLDEKTTPYK\n".into(), "rev_", true);
+        let fasta = params.merge_databases(db1, db2);
+        assert_eq!(fasta.targets.len(), 3);
+        let db = params.build(fasta);
+        assert!(db.two_databases());
+        let group = |seq: &str, decoy: bool| {
+            let ix = db.peptides.iter().position(|p| p.decoy == decoy && p.sequence.as_ref() == seq.as_bytes());
+            db.database_group(PeptideIx(ix.unwrap_or_else(|| panic!("{seq}")) as u32)).unwrap()
+        };
+        assert_eq!(group("GLEKVSTR", false), DATABASE_1);
+        assert_eq!(group("TDYHFPNEK", false), DATABASE_2);
+        assert_eq!(group("AAWLDEK", false), DATABASE_1 | DATABASE_2);
+        // decoys come from their target's database
+        assert_eq!(group("GTSVKELR", true), DATABASE_1);
+        assert_eq!(group("TENPFHYDK", true), DATABASE_2);
+        let ix = |seq: &str| {
+            PeptideIx(db.peptides.iter().position(|p| !p.decoy && p.sequence.as_ref() == seq.as_bytes()).unwrap() as u32)
+        };
+        assert!(db.cross_database(ix("GLEKVSTR"), ix("TDYHFPNEK")));
+        assert!(!db.cross_database(ix("GLEKVSTR"), ix("GLEKVSTR")));
+        assert!(db.cross_database(ix("AAWLDEK"), ix("AAWLDEK")));
+        assert!(db.cross_database(ix("AAWLDEK"), ix("GLEKVSTR")));
     }
 }

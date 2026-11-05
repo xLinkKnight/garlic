@@ -112,3 +112,53 @@ on all peptides) for unequal mixing.
 * **Not yet tested on a real SILAC sample.** Check the ratios of a known mixture
   before relying on them.
 * Arginine-to-proline conversion and incomplete labelling are not modelled.
+
+# Isotope-labelled proteins (¹⁵N, ¹³C)
+
+Proteins expressed in ¹⁵N and/or ¹³C media (every nitrogen and/or carbon atom
+heavy) can be searched labelled, in linear and crosslink searches, next to the
+other proteins of the FASTA:
+
+```json
+"database": {
+  "labelled_proteins": {
+    "proteins": { "sp|P08518|RPB2_YEAST": "15N", "P04050": "13C15N" },
+    "include_unlabelled": true
+  }
+}
+```
+
+* `proteins`: protein → label, `15N`, `13C` or `13C15N`. A protein is named by
+  its accession as Sage reads it (the header's first word) or by one of its
+  `|`-separated parts (`P08518`, `RPB2_YEAST`).
+* `include_unlabelled` (default `true`): also search the chosen proteins
+  unlabelled; `false`: labelled only.
+* In `sage-gui`: Database & enzyme tab → Isotope-labelled proteins: the chosen
+  proteins and their labels, and *Choose proteins* (closed at first) to search
+  the FASTA's proteins and pick a label for each.
+
+How it is searched:
+
+* Every residue of a chosen protein's peptides carries its own mass shift: its
+  carbon atoms × 1.0033548 Da (¹³C) and/or nitrogen atoms × 0.9970349 Da (¹⁵N).
+  A uniformly ¹³C¹⁵N lysine is Lys8 (+8.0142), arginine Arg10 (+10.0083).
+* The labels are added after the fixed and variable modifications: they do not
+  count towards `max_variable_mods`, and a residue keeps its fixed or variable
+  modification. A modification's own atoms come from unlabelled reagents (e.g.
+  the carbamidomethyl of a cysteine stays light); deamidation of N/Q and
+  pyro-Glu from Q lose one of the residue's ¹⁵N atoms, which is accounted for.
+* Labels are written per residue as their mass (¹⁵N:
+  `M[+0.9970349]A[+0.9970349]…K[+1.9940698]`; a label and a modification on the
+  same residue as one mass), so every output and the
+  Annotated spectra viewer carry the right masses. `results.sage.tsv` gets an
+  `isotope_label` column, `crosslinks.sage.tsv` `isotope_label_a` / `_b`.
+* A peptide shared with an unlabelled protein is searched unlabelled for that
+  protein and labelled for the chosen one, each credited to its proteins.
+* Crosslinks: a labelled residue still reacts, and crosslinks between labelled
+  and unlabelled proteins are searched (no pairing rule, unlike SILAC
+  channels). SILAC labels can be combined with them.
+* Incomplete incorporation (e.g. 98% ¹⁵N) is not modelled: the fully labelled
+  mass is searched, and the isotope envelope shifts lighter, so the instrument
+  may pick a peak one or two below. Allow isotope errors (`isotope_errors`,
+  e.g. `[-1, 0]`) for such samples. LFQ / SILAC quantification uses natural
+  isotope envelopes.

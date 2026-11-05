@@ -48,6 +48,8 @@ The spectrum annotation in `sage-gui` (ProForma 2.0 peptidoforms including cross
 - [Isobaric quantification](https://sage-docs.vercel.app/docs/how_it_works#tmt-based) (MS2/MS3-TMT, or custom reporter ions)
 - [Label-free quantification](https://sage-docs.vercel.app/docs/how_it_works#label-free): consider all charge states & isotopologues *a la* FlashLFQ
 - SILAC (duplex or triplex) in linear and crosslink searches, with MS1 ratios of every channel to light: see [SILAC.md](SILAC.md)
+- Uniformly ¹⁵N / ¹³C-labelled proteins searched labelled (and optionally unlabelled) next to the rest of the FASTA: see [SILAC.md](SILAC.md#isotope-labelled-proteins-15n-13c)
+- Two-database crosslink searches (e.g. between two complexes): crosslinks only between a Database 1 and a Database 2 protein, linear peptides in both: see [CROSSLINKING.md](CROSSLINKING.md#two-databases-crosslinks-only-between-them)
 - Capable of searching for [chimeric/co-fragmenting spectra](https://sage-docs.vercel.app/docs/configuration/additional)
 - Wide-window (dynamic precursor tolerance) search mode - [enables WWA/PRM/DIA searches](https://sage-docs.vercel.app/docs/configuration/tolerance#wide-window-mode)
 - Retention time prediction models fit to each LC/MS run

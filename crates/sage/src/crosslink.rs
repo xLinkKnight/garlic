@@ -1198,7 +1198,7 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                 .precursor_tol
                 .bounds(mass - sc.min_isotope_err as f32 * NEUTRON)
                 .1;
-            let seed_limit = if cfg.loop_links {
+            let seed_limit = if cfg.loop_links && !db.two_databases() {
                 largest - linker_mass
             } else {
                 largest - linker_mass - min_peptide_mass
@@ -1222,6 +1222,7 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                     // Loop-link: one peptide plus the linker explains the precursor
                     let loop_mass = a.monoisotopic + linker_mass;
                     if cfg.loop_links
+                        && !db.two_databases()
                         && sites_a.len() >= 2
                         && loop_mass >= lo
                         && loop_mass <= hi
@@ -1270,8 +1271,9 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                         .enumerate()
                     {
                         let partner = PeptideIx((start + offset) as u32);
-                        // SILAC: both peptides from one population of cells
-                        if !db.same_silac_channel(&[seed, partner]) {
+                        // SILAC: both peptides from one population of cells;
+                        // two databases: one peptide from each
+                        if !db.may_crosslink(seed, partner) {
                             continue;
                         }
                         let key = (seed.0.min(partner.0), seed.0.max(partner.0));
@@ -1438,7 +1440,7 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                 let (lo, hi) = sc.precursor_tol.bounds(m);
 
                 // ---- loop-links: one peptide + linker explains the precursor
-                if cfg.loop_links {
+                if cfg.loop_links && !db.two_databases() {
                     let start = db.peptides.partition_point(|p| p.monoisotopic < lo - linker);
                     for (offset, a) in db.peptides[start..]
                         .iter()
@@ -1512,7 +1514,7 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
 
                 for (_, i, j) in candidates {
                     let (ix_a, ix_b) = (survivors[i].peptide, survivors[j].peptide);
-                    if !db.same_silac_channel(&[PeptideIx(ix_a), PeptideIx(ix_b)]) || !seen.insert((ix_a, ix_b)) {
+                    if !db.may_crosslink(PeptideIx(ix_a), PeptideIx(ix_b)) || !seen.insert((ix_a, ix_b)) {
                         continue;
                     }
                     let (a, b) = (&db.peptides[ix_a as usize], &db.peptides[ix_b as usize]);
@@ -1767,7 +1769,7 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
 
                 // Loop-links: one peptide plus the linker explains the precursor;
                 // the opened ring shows as stub-carrying fragment ions
-                if cfg.loop_links {
+                if cfg.loop_links && !db.two_databases() {
                     let (lo, hi) = sc.precursor_tol.bounds(m);
                     let start = db.peptides.partition_point(|p| p.monoisotopic < lo - linker);
                     let end = db.peptides[start..]
@@ -1861,7 +1863,7 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                             if ends == 2 && end_a == end_b {
                                 continue;
                             }
-                            if !db.same_silac_channel(&[PeptideIx(ix_a), PeptideIx(ix_b)]) {
+                            if !db.may_crosslink(PeptideIx(ix_a), PeptideIx(ix_b)) {
                                 continue;
                             }
                             let pair = (ix_a, site_a, tally_a, score_a, ix_b, site_b, tally_b, score_b);
@@ -3447,11 +3449,214 @@ mod test {
         (database(targets), a, b)
     }
 
+    /// A database whose proteins are split in two crosslink databases:
+    /// `(protein, DATABASE_1 and/or DATABASE_2)`; others (the distractors) in neither
+    fn database_split(targets: Vec<Peptide>, groups: &[(&str, u8)]) -> IndexedDatabase {
+        let mut all = Vec::new();
+        for t in targets {
+            all.push(t.reverse());
+            all.push(t);
+        }
+        Parameters::reorder_peptides(&mut all);
+        let mut params = Builder { fasta: Some("unused.fasta".into()), ..Default::default() }.make_parameters().unwrap();
+        params.database_groups =
+            Some(std::sync::Arc::new(groups.iter().map(|&(p, g)| (std::sync::Arc::<str>::from(p), g)).collect()));
+        params.build_from_peptides(all)
+    }
+
+    fn expected_pair(x: &Peptide, sx: usize, y: &Peptide, sy: usize) -> Vec<(String, usize)> {
+        let seq = |p: &Peptide| String::from_utf8(p.sequence.to_vec()).unwrap();
+        let mut v = vec![(seq(x), sx), (seq(y), sy)];
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn two_databases_link_only_across() {
+        use crate::database::{DATABASE_1, DATABASE_2};
+        let (_, a, b) = pair_fixture();
+        let c = peptide("AKCDKEFRQLMNR", "PROT_C", Position::Internal);
+        let mut targets = distractors(400);
+        targets.extend([a.clone(), b.clone(), c.clone()]);
+        let cfg = CrosslinkSettings::default();
+        // A in Database 1; B and C in Database 2
+        let db = database_split(
+            targets.clone(),
+            &[("PROT_A", DATABASE_1), ("PROT_B", DATABASE_2), ("PROT_C", DATABASE_2)],
+        );
+        assert!(db.two_databases());
+        let sc = scorer(&db);
+        let kernel = kernel_for(&db, &cfg);
+        let cpu = CrosslinkScorer::new(&sc, &cfg);
+        let reflect = CrosslinkScorer::new(&sc, &cfg).with_kernel(Some(&kernel));
+        for (x, y, sx, sy, found) in
+            [(&a, &b, 3, 9, true), (&a, &c, 3, 4, true), (&b, &c, 9, 1, false), (&c, &c, 1, 4, false)]
+        {
+            let q = pair_spectrum(&db, x, y, sx, sy);
+            let expected = expected_pair(x, sx, y, sy);
+            for (backend, hits) in [("cpu", cpu.score(&q)), ("reflect", reflect.score(&q))] {
+                assert_eq!(hits.iter().any(|h| pair_set(&db, h) == expected), found, "{backend} {expected:?}: {hits:?}");
+                // nothing within one database, whatever was found instead
+                assert!(
+                    hits.iter().filter(|h| h.beta.is_some()).all(|h| db.cross_database(h.alpha, h.beta.unwrap())),
+                    "{backend}: {hits:?}"
+                );
+            }
+        }
+
+        // C in both databases: it links to B, and to itself
+        let db = database_split(
+            targets,
+            &[("PROT_A", DATABASE_1), ("PROT_B", DATABASE_2), ("PROT_C", DATABASE_1 | DATABASE_2)],
+        );
+        let sc = scorer(&db);
+        let cpu = CrosslinkScorer::new(&sc, &cfg);
+        for (x, y, sx, sy) in [(&b, &c, 9, 1), (&c, &c, 1, 4)] {
+            let expected: Vec<String> = expected_pair(x, sx, y, sy).into_iter().map(|(p, _)| p).collect();
+            let hits = cpu.score(&pair_spectrum(&db, x, y, sx, sy));
+            // the peptides (a homodimer's two sites may be told apart either way)
+            let peptides = |h: &CrosslinkMatch| pair_set(&db, h).into_iter().map(|(p, _)| p).collect::<Vec<_>>();
+            assert!(hits.iter().any(|h| peptides(h) == expected), "{expected:?}: {hits:?}");
+        }
+    }
+
+    #[test]
+    fn two_databases_drop_loop_links() {
+        use crate::database::{DATABASE_1, DATABASE_2};
+        let l = peptide("AEFGHDSTWKLMNPQSTVKGYEDFAR", "PROT_L", Position::Internal);
+        let mut targets = distractors(400);
+        targets.push(l.clone());
+        let db = database_split(targets, &[("PROT_L", DATABASE_1 | DATABASE_2)]);
+        let sc = scorer(&db);
+        let cfg = CrosslinkSettings::default();
+        let ions = chain_ions(&l, &db.modifications, &[Kind::B, Kind::Y], Link::Loop { first: 9, second: 18, shift: DSS });
+        let hits = CrosslinkScorer::new(&sc, &cfg).score(&spectrum(l.monoisotopic + DSS, 3, &ions));
+        assert!(!hits.iter().any(|h| h.kind == LinkKind::Loop), "{hits:?}");
+    }
+
+    #[test]
+    fn two_databases_cleavable_pairs_only_across() {
+        use crate::database::{DATABASE_1, DATABASE_2};
+        let a = peptide("GLEKVSTAAMQR", "PROT_A", Position::Internal);
+        let b = peptide("TDYHFPNEWKLIR", "PROT_B", Position::Internal);
+        let cfg = dsso();
+        let stubs = cfg.stubs().unwrap();
+        let mut targets = distractors(400);
+        targets.extend([a.clone(), b.clone()]);
+        for (b_group, found) in [(DATABASE_2, true), (DATABASE_1, false)] {
+            let db = database_split(targets.clone(), &[("PROT_A", DATABASE_1), ("PROT_B", b_group)]);
+            let sc = scorer(&db);
+            let mut ions = stubbed_ions(&a, &db.modifications, 3, &stubs);
+            ions.extend(stubbed_ions(&b, &db.modifications, 9, &stubs));
+            for p in [&a, &b] {
+                ions.push((Kind::B, p.monoisotopic + stubs.short));
+                ions.push((Kind::B, p.monoisotopic + stubs.long));
+            }
+            let precursor = a.monoisotopic + b.monoisotopic + cfg.linker_mass();
+            let hits = CrosslinkScorer::new(&sc, &cfg).score(&spectrum(precursor, 4, &ions));
+            let expected = expected_pair(&a, 3, &b, 9);
+            assert_eq!(hits.iter().any(|h| pair_set(&db, h) == expected), found, "B in {b_group}: {hits:?}");
+        }
+    }
+
+    #[test]
+    fn two_databases_multivalent_needs_one_link_across() {
+        use crate::database::{DATABASE_1, DATABASE_2};
+        // a1b1c with DSSO: a (K4) - b (K10), b (K19) - c (K10)
+        let a = peptide("GLEKVSTAAMQR", "PROT_A", Position::Internal);
+        let b = peptide("AEFGHDSTWKLMNPQSTVKGYEDFAR", "PROT_B", Position::Internal);
+        let c = peptide("TDYHFPNEWKLIR", "PROT_C", Position::Internal);
+        let mut targets = distractors(400);
+        targets.extend([a.clone(), b.clone(), c.clone()]);
+        let cfg = CrosslinkSettings { multivalent: Some(2), ..dsso() };
+        let s = cfg.stubs().unwrap();
+        // a-b crosses and b-c stays in one database: kept; all three in one: not searched
+        for (groups, found) in [
+            ([DATABASE_1, DATABASE_2, DATABASE_2], true),
+            ([DATABASE_2, DATABASE_2, DATABASE_1], true),
+            ([DATABASE_2, DATABASE_2, DATABASE_2], false),
+        ] {
+            let db = database_split(
+                targets.clone(),
+                &[("PROT_A", groups[0]), ("PROT_B", groups[1]), ("PROT_C", groups[2])],
+            );
+            let sc = scorer(&db);
+            let mods = &db.modifications;
+            let (ma, mb, mc, l) = (a.monoisotopic, b.monoisotopic, c.monoisotopic, cfg.linker_mass());
+            let mut ions = cleaved_species_ions(&a, mods, &[(3, s.short)]);
+            ions.extend(cleaved_species_ions(&b, mods, &[(9, s.long), (18, s.short)]));
+            ions.extend(cleaved_species_ions(&c, mods, &[(9, s.long)]));
+            ions.push((Kind::B, ma + s.short));
+            ions.push((Kind::B, ma + s.long));
+            ions.push((Kind::B, mb + s.long + s.short));
+            ions.push((Kind::B, mc + s.long));
+            ions.push((Kind::B, mb + mc + l + s.long));
+            ions.push((Kind::B, ma + mb + l + s.short));
+            let hits = CrosslinkScorer::new(&sc, &cfg).score(&spectrum(ma + mb + mc + 2.0 * l, 4, &ions));
+            let chain = hits.iter().any(|h| h.species.as_ref().is_some_and(|sp| sp.topology() == "a1b1c"));
+            assert_eq!(chain, found, "{groups:?}: {hits:?}");
+        }
+    }
+
     fn pair_spectrum(db: &IndexedDatabase, a: &Peptide, b: &Peptide, sa: usize, sb: usize) -> ProcessedSpectrum {
         let kinds = [Kind::B, Kind::Y];
         let mut ions = chain_ions(a, &db.modifications, &kinds, Link::Single { site: sa, shift: b.monoisotopic + DSS });
         ions.extend(chain_ions(b, &db.modifications, &kinds, Link::Single { site: sb, shift: a.monoisotopic + DSS }));
         spectrum(a.monoisotopic + b.monoisotopic + DSS, 3, &ions)
+    }
+
+    /// A uniformly 15N-labelled protein (A) crosslinked to an unlabelled one
+    /// (B): A's labelled lysine still links, the pair is found by both
+    /// backends, and the labels add every nitrogen's shift to A's ions
+    #[test]
+    fn labelled_protein_crosslinks_to_an_unlabelled_one() {
+        let params = Builder {
+            fasta: Some("unused.fasta".into()),
+            labelled_proteins: Some(crate::labelled::LabelledProteins {
+                proteins: [("PROT_A".to_string(), crate::labelled::Isotope::N15)].into(),
+                include_unlabelled: false,
+            }),
+            ..Default::default()
+        }
+        .make_parameters()
+        .unwrap();
+        let labels = params.protein_labels.clone().unwrap();
+        let a = peptide("GLEKVSTAAMQR", "PROT_A", Position::Internal);
+        let b = peptide("TDYHFPNEWKLIR", "PROT_B", Position::Internal);
+        let mut targets = distractors(400);
+        targets.push(a.clone());
+        targets.push(b.clone());
+        let mut all = Vec::new();
+        for t in targets {
+            for state in labels.states(t) {
+                all.push(state.reverse());
+                all.push(state);
+            }
+        }
+        Parameters::reorder_peptides(&mut all);
+        let db = params.build_from_peptides(all);
+        let heavy_a = labels.states(a.clone()).pop().unwrap();
+        assert_eq!(labels.isotope(&heavy_a), Some(crate::labelled::Isotope::N15));
+        let n: u32 = b"GLEKVSTAAMQR".iter().map(|&r| crate::labelled::atoms(r).unwrap().1 as u32).sum();
+        assert!((heavy_a.monoisotopic - a.monoisotopic - n as f32 * crate::labelled::N15).abs() < 2e-3);
+        // only the labelled form of A is searched (include_unlabelled off)
+        assert!(!db.peptides.iter().any(|p| !p.decoy && p.sequence.as_ref() == b"GLEKVSTAAMQR" && labels.isotope(p).is_none()));
+
+        let cfg = CrosslinkSettings { labels: db.isotope_mods(), ..Default::default() };
+        assert_eq!(cfg.link_sites(&heavy_a), vec![3], "the labelled K is a link site");
+        let sc = scorer(&db);
+        let query = pair_spectrum(&db, &heavy_a, &b, 3, 9);
+        for kernel in [None, Some(kernel_for(&db, &cfg))] {
+            let xl = CrosslinkScorer::new(&sc, &cfg).with_kernel(kernel.as_ref().map(|k| k as &dyn ChainKernel));
+            let hits = xl.score(&query);
+            assert_eq!(hits.len(), 1, "{hits:?}");
+            let m = &hits[0];
+            assert_eq!(pair_set(&db, m), vec![("GLEKVSTAAMQR".to_string(), 3), ("TDYHFPNEWKLIR".to_string(), 9)]);
+            let label = |ix: PeptideIx| db.isotope_label(ix);
+            let mut found = [label(m.alpha), m.beta.and_then(label)];
+            found.sort();
+            assert_eq!(found, [None, Some(crate::labelled::Isotope::N15)]);
+        }
     }
 
     /// SILAC duplex: the pair fixture's peptides in both states, over the

@@ -434,7 +434,14 @@ impl SageGui {
             let lower = path.to_string_lossy().to_ascii_lowercase();
             let text = path.display().to_string();
             if [".fasta", ".fa", ".faa", ".fas"].iter().any(|e| lower.ends_with(e)) {
-                self.s.fasta = text;
+                // a two-database search: fill Database 1, then Database 2
+                if !self.s.two_databases() {
+                    self.s.fasta = text;
+                } else if self.s.database_1.trim().is_empty() {
+                    self.s.database_1 = text;
+                } else {
+                    self.s.database_2 = text;
+                }
             } else if lower.ends_with(".json") {
                 // ignored: use "Load settings" so a drop never silently replaces everything
             } else if !self.s.spectra.contains(&text) {
@@ -484,9 +491,12 @@ impl eframe::App for SageGui {
                         std::mem::take(&mut self.s.fasta),
                         std::mem::take(&mut self.s.spectra),
                         std::mem::take(&mut self.s.output_directory),
+                        std::mem::take(&mut self.s.database_1),
+                        std::mem::take(&mut self.s.database_2),
                     );
                     self.s = Settings::default();
-                    (self.s.fasta, self.s.spectra, self.s.output_directory) = files;
+                    (self.s.fasta, self.s.spectra, self.s.output_directory, self.s.database_1, self.s.database_2) =
+                        files;
                 }
                 ui.toggle_value(&mut self.show_json, "Show JSON")
                     .on_hover_text("Show the configuration file that will be passed to sage.exe.");
@@ -751,6 +761,69 @@ fn path_field(ui: &mut Ui, value: &mut String, hint: &str, pick: impl FnOnce() -
 // ---------------------------------------------------------------------------
 // Tabs
 
+/// Files tab: two FASTA files for a crosslink search between them, e.g. two
+/// complexes. Crosslinks only between a Database 1 and a Database 2 protein;
+/// linear peptides in both, as one database.
+fn crosslink_databases(ui: &mut Ui, s: &mut Settings) {
+    let accent = theme::accent(ui);
+    egui::Frame::group(ui.style())
+        .stroke(egui::Stroke::new(1.0_f32, accent.gamma_multiply(0.6)))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(theme::bold("Two-database crosslink search"));
+                ui.label(
+                    RichText::new(" FOR COMPLEX CROSSLINK SEARCHES ")
+                        .small()
+                        .strong()
+                        .color(Color32::WHITE)
+                        .background_color(accent),
+                );
+            });
+            note(
+                ui,
+                "Crosslinks are searched only between a protein of Database 1 and a protein of Database 2 \
+                 (e.g. two complexes, or a bait and its candidate partners). Crosslinks within either database, \
+                 and loop-links, are not searched. Linear peptides are searched in both, as one database. Setting \
+                 either file replaces the FASTA file above.",
+            );
+            let pick = || {
+                rfd::FileDialog::new()
+                    .add_filter("FASTA", &["fasta", "fa", "faa", "fas"])
+                    .add_filter("All files", &["*"])
+                    .pick_file()
+            };
+            grid(ui, "crosslink_databases", |ui| {
+                row(
+                    ui,
+                    "Database 1",
+                    "Proteins on one side of the crosslinks (e.g. complex 1). A protein in both files links to either side.",
+                    |ui| path_field(ui, &mut s.database_1, "C:\\db\\complex1.fasta", pick),
+                );
+                row(
+                    ui,
+                    "Database 2",
+                    "Proteins on the other side of the crosslinks (e.g. complex 2).",
+                    |ui| path_field(ui, &mut s.database_2, "C:\\db\\complex2.fasta", pick),
+                );
+            });
+            if s.two_databases() {
+                ui.horizontal(|ui| {
+                    if !s.crosslink.enabled {
+                        ui.label(
+                            RichText::new("Crosslinking is off (Crosslinking tab): the two files are searched as one FASTA.")
+                                .color(Color32::from_rgb(220, 140, 30)),
+                        );
+                    }
+                    if ui.small_button("clear both").on_hover_text("Search the FASTA file above instead.").clicked() {
+                        s.database_1.clear();
+                        s.database_2.clear();
+                    }
+                });
+            }
+        });
+}
+
 const SPECTRA_TIP: &str = "Mass spectrometry runs to search.\n\
     • mzML / mzML.gz and MGF / MGF.gz: read directly\n\
     • Bruker timsTOF .d: add the .d FOLDER (\"Add Bruker .d folder…\")\n\
@@ -761,23 +834,32 @@ const SPECTRA_TIP: &str = "Mass spectrometry runs to search.\n\
 impl SageGui {
     fn files_tab(&mut self, ui: &mut Ui) {
         heading(ui, "Protein database");
-        grid(ui, "fasta", |ui| {
-            row(
-                ui,
-                "FASTA file",
-                "Protein sequences to search against, e.g. C:\\db\\human_uniprot_2026.fasta.\n\
-                 Use a database WITHOUT decoys: Sage generates reversed decoys itself \
-                 (Database tab > Generate decoys).",
-                |ui| {
-                    path_field(ui, &mut self.s.fasta, "C:\\db\\proteome.fasta", || {
-                        rfd::FileDialog::new()
-                            .add_filter("FASTA", &["fasta", "fa", "faa", "fas"])
-                            .add_filter("All files", &["*"])
-                            .pick_file()
-                    })
-                },
-            );
+        // Database 1 / 2 set: the FASTA file is not searched
+        let two = self.s.two_databases();
+        ui.add_enabled_ui(!two, |ui| {
+            grid(ui, "fasta", |ui| {
+                row(
+                    ui,
+                    "FASTA file",
+                    "Protein sequences to search against, e.g. C:\\db\\human_uniprot_2026.fasta.\n\
+                     Use a database WITHOUT decoys: Sage generates reversed decoys itself \
+                     (Database tab > Generate decoys).",
+                    |ui| {
+                        path_field(ui, &mut self.s.fasta, "C:\\db\\proteome.fasta", || {
+                            rfd::FileDialog::new()
+                                .add_filter("FASTA", &["fasta", "fa", "faa", "fas"])
+                                .add_filter("All files", &["*"])
+                                .pick_file()
+                        })
+                    },
+                );
+            });
         });
+        if two {
+            note(ui, "Not searched: Database 1 and Database 2 below replace the FASTA file. Clear both to use it.");
+        }
+        ui.add_space(6.0);
+        crosslink_databases(ui, &mut self.s);
 
         heading(ui, "Spectrum files");
         ui.horizontal(|ui| {
@@ -1560,6 +1642,168 @@ fn database_tab(ui: &mut Ui, s: &mut Settings) {
                 |ui| ui.checkbox(&mut s.prefilter_low_memory, "low memory"));
         }
     });
+    labelled_proteins(ui, s);
+}
+
+thread_local! {
+    /// The proteins of the FASTA file(s) last shown: (each path with its
+    /// modification time, proteins)
+    static FASTA_PROTEINS: std::cell::RefCell<Option<(Vec<(String, Option<std::time::SystemTime>)>, std::rc::Rc<Vec<(String, String)>>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The proteins of the FASTA file(s), read again only when a file changes;
+/// a protein in several files once
+fn fasta_proteins(files: &[&str]) -> Option<std::rc::Rc<Vec<(String, String)>>> {
+    let key: Vec<(String, Option<std::time::SystemTime>)> = files
+        .iter()
+        .map(|f| (f.to_string(), std::fs::metadata(f).and_then(|m| m.modified()).ok()))
+        .collect();
+    FASTA_PROTEINS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((k, proteins)) = cache.as_ref() {
+            if *k == key {
+                return Some(proteins.clone());
+            }
+        }
+        let mut all: Vec<(String, String)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for f in files {
+            for p in settings::fasta_proteins(f)? {
+                if seen.insert(p.0.clone()) {
+                    all.push(p);
+                }
+            }
+        }
+        let proteins = std::rc::Rc::new(all);
+        *cache = Some((key, proteins.clone()));
+        Some(proteins)
+    })
+}
+
+/// Proteins of the FASTA expressed in 15N and/or 13C media: pick each one's
+/// label from the list
+fn labelled_proteins(ui: &mut Ui, s: &mut Settings) {
+    use sage_core::labelled::Isotope;
+    heading(ui, "Isotope-labelled proteins");
+    note(ui, "Proteins expressed in 15N and/or 13C media, every nitrogen and/or carbon atom heavy. Their peptides \
+        are searched labelled (in linear and crosslink searches); the labels do not count towards the variable \
+        modification limit, and a labelled residue keeps its fixed or variable modifications and still crosslinks.");
+    let label_text = |l: Option<Isotope>| match l {
+        None => "unlabelled",
+        Some(Isotope::N15) => "15N",
+        Some(Isotope::C13) => "13C",
+        Some(Isotope::C13N15) => "13C + 15N",
+    };
+    let files = s.fasta_files();
+    // one FASTA, or both crosslink databases
+    let Some(proteins) = (!files.is_empty()).then(|| fasta_proteins(&files)).flatten() else {
+        note(ui, "Select a FASTA file (Files tab) to pick proteins from it.");
+        return;
+    };
+    // one protein: its label, accession and name
+    let protein_row = |ui: &mut Ui, s: &mut Settings, salt: &str, accession: &str, name: &str| {
+        ui.horizontal(|ui| {
+            let mut label = s.labelled_proteins.get(accession).copied();
+            let before = label;
+            ComboBox::from_id_salt((salt, accession))
+                .selected_text(label_text(label))
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut label, None, label_text(None));
+                    for i in Isotope::ALL {
+                        ui.selectable_value(&mut label, Some(i), label_text(Some(i)));
+                    }
+                });
+            if label != before {
+                match label {
+                    Some(l) => {
+                        s.labelled_proteins.insert(accession.to_string(), l);
+                    }
+                    None => {
+                        s.labelled_proteins.remove(accession);
+                    }
+                }
+            }
+            let text = RichText::new(accession).monospace();
+            ui.label(if label.is_some() { text.strong() } else { text });
+            ui.label(RichText::new(name).color(theme::muted(ui)));
+        });
+    };
+    let row_height = ui.spacing().interact_size.y + 6.0;
+
+    // the chosen proteins, always shown (a protein may be named by a part of
+    // its accession, e.g. in a configuration file)
+    let chosen: Vec<(String, String)> = s
+        .labelled_proteins
+        .keys()
+        .map(|k| {
+            let name = proteins
+                .iter()
+                .find(|(a, _)| a == k || a.split('|').skip(1).any(|p| p == k))
+                .map(|(_, n)| n.clone())
+                .unwrap_or_default();
+            (k.clone(), name)
+        })
+        .collect();
+    if !chosen.is_empty() {
+        egui::ScrollArea::vertical()
+            .id_salt("labelled_proteins_chosen")
+            .max_height(160.0)
+            .auto_shrink([false, true])
+            .show_rows(ui, row_height, chosen.len(), |ui, rows| {
+                for (accession, name) in &chosen[rows] {
+                    protein_row(ui, s, "labelled_chosen", accession, name);
+                }
+            });
+        ui.add_space(4.0);
+    }
+    ui.horizontal(|ui| {
+        let n = s.labelled_proteins.len();
+        ui.label(theme::bold(format!("{n} labelled")));
+        ui.add_enabled(n > 0, egui::Checkbox::new(&mut s.include_unlabelled, "also search them unlabelled"))
+            .on_hover_text("On: the labelled proteins are searched both labelled and unlabelled (e.g. a labelled \
+                protein mixed with its unlabelled form). Off: labelled only. Peptides they share with other proteins \
+                are searched unlabelled for those.");
+        if n > 0 && ui.small_button("clear").clicked() {
+            s.labelled_proteins.clear();
+        }
+    });
+
+    // every protein of the FASTA, hidden until opened: a large FASTA would
+    // otherwise fill the tab
+    egui::CollapsingHeader::new(format!("Choose proteins ({} in the FASTA)", proteins.len()))
+        .id_salt("labelled_proteins_list")
+        .default_open(false)
+        .show(ui, |ui| {
+            let filter_id = ui.id().with("labelled_filter");
+            let mut filter: String = ui.data_mut(|d| d.get_temp::<String>(filter_id).unwrap_or_default());
+            ui.horizontal(|ui| {
+                ui.label("Search");
+                ui.add(TextEdit::singleline(&mut filter).desired_width(240.0).hint_text("accession, gene or protein name"));
+            });
+            ui.data_mut(|d| d.insert_temp(filter_id, filter.clone()));
+            let needle = filter.to_ascii_lowercase();
+            let shown: Vec<&(String, String)> = proteins
+                .iter()
+                .filter(|(a, n)| {
+                    needle.is_empty() || a.to_ascii_lowercase().contains(&needle) || n.to_ascii_lowercase().contains(&needle)
+                })
+                .collect();
+            if shown.is_empty() {
+                note(ui, "No protein matches the search.");
+                return;
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("labelled_proteins")
+                .max_height(220.0)
+                .auto_shrink([false, true])
+                .show_rows(ui, row_height, shown.len(), |ui, rows| {
+                    for (accession, name) in &shown[rows] {
+                        protein_row(ui, s, "labelled", accession, name);
+                    }
+                });
+        });
 }
 
 const TARGET_TIP: &str = "Where the modification can occur:\n\
@@ -1952,6 +2196,8 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
     note(ui, "Recommended settings: 2 missed cleavages, deisotoping on, precursor charge 3 to 6 \
         (Database & enzyme tab).");
 
+    // two crosslink databases: no loop-links (each is within one protein)
+    let two_databases = s.two_databases();
     let xl = &mut s.crosslink;
     ui.add_enabled_ui(xl.enabled, |ui| {
         grid(ui, "xl", |ui| {
@@ -2019,7 +2265,16 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
                 |ui| ui.checkbox(&mut xl.allow_cterm_residue, "allow"));
             let cleavable = xl.is_cleavable();
             row(ui, "Loop-links", "Also search links with both ends on the same peptide. Not searched for \
-                MS-cleavable reagents.", |ui| ui.add_enabled(!cleavable, egui::Checkbox::new(&mut xl.loop_links, "search loop-links")));
+                MS-cleavable reagents, nor in a two-database crosslink search (Files tab).", |ui| {
+                let r = ui.add_enabled(
+                    !cleavable && !two_databases,
+                    egui::Checkbox::new(&mut xl.loop_links, "search loop-links"),
+                );
+                if two_databases {
+                    ui.label(RichText::new("off: two-database search").weak());
+                }
+                r
+            });
             if cleavable {
                 row(ui, "Complete doublets", "Require both stub peaks for BOTH peptides. Stricter, fewer hits. \
                     Default: both stubs of one peptide and at least one of the other.",
@@ -2241,6 +2496,9 @@ mod screenshots {
         s.crosslink.multivalent = true;
         s.crosslink.valency = 3;
         s.silac = Silac::Triplex;
+        s.fasta = "C:/Users/vahen/source/repos/garlic/tests/PolII_Complex.fasta".into();
+        s.labelled_proteins.insert("sp|P08518|RPB2_YEAST".into(), sage_core::labelled::Isotope::N15);
+        s.labelled_proteins.insert("sp|P04050|RPB1_YEAST".into(), sage_core::labelled::Isotope::C13N15);
         let tabs: [(&str, fn(&mut Ui, &mut Settings)); 3] =
             [("database", database_tab), ("scoring", scoring_tab), ("crosslinking", crosslink_tab)];
         for (name, tab) in tabs {
@@ -2270,5 +2528,71 @@ mod screenshots {
             image.save(&path).unwrap();
             println!("{}", path.display());
         }
+
+        // the Files tab: with and without two crosslink databases
+        for (name, two) in [("files", false), ("files_two_databases", true)] {
+            let mut settings = s.clone();
+            if two {
+                settings.database_1 = "C:\\db\\PolII_core.fasta".into();
+                settings.database_2 = "C:\\db\\TFIIH.fasta".into();
+            }
+            let mut app: Option<SageGui> = None;
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(980.0, 700.0))
+                .build_ui(move |ui| {
+                    let Some(app) = app.as_mut() else {
+                        theme::install(ui.ctx(), false);
+                        let mut new = SageGui::new(ui.ctx());
+                        new.s = settings.clone();
+                        app = Some(new);
+                        return;
+                    };
+                    egui::ScrollArea::vertical().show(ui, |ui| app.files_tab(ui));
+                });
+            harness.run();
+            let path = out.join(format!("gui_{name}.png"));
+            harness.render().expect("render").save(&path).unwrap();
+            println!("{}", path.display());
+        }
+    }
+
+    /// The list of every FASTA protein starts hidden; the chosen ones are
+    /// always shown, and the list opens on a click
+    #[test]
+    fn labelled_protein_list_starts_hidden() {
+        use egui_kittest::kittest::Queryable;
+        let fasta = std::env::temp_dir().join(format!("sage_gui_labelled_{}.fasta", std::process::id()));
+        std::fs::write(
+            &fasta,
+            ">sp|P08518|RPB2_YEAST RNA polymerase II subunit RPB2 OS=Yeast\nMSDLANSEK\n\
+             >sp|P16370|RPB3_YEAST RNA polymerase II subunit RPB3 OS=Yeast\nMSEEGPQVK\n\
+             >sp|P34087|RPB7_YEAST RNA polymerase II subunit RPB7 OS=Yeast\nMFFIKDLSK\n",
+        )
+        .unwrap();
+        let mut s = Settings::default();
+        s.fasta = fasta.to_string_lossy().into_owned();
+        // named by a part of the accession, as a configuration file may
+        s.labelled_proteins.insert("P08518".into(), sage_core::labelled::Isotope::N15);
+        // fonts take effect on the frame after they are set
+        let mut installed = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(900.0, 700.0))
+            .build_ui(move |ui| {
+                if !installed {
+                    theme::install(ui.ctx(), false);
+                    installed = true;
+                    return;
+                }
+                labelled_proteins(ui, &mut s)
+            });
+        harness.run();
+        assert!(harness.query_by_label("P08518").is_some(), "the chosen protein is shown");
+        assert!(harness.query_by_label("RNA polymerase II subunit RPB2").is_some(), "with its name");
+        assert!(harness.query_by_label("sp|P16370|RPB3_YEAST").is_none(), "the full list starts hidden");
+        harness.get_by_label("Choose proteins (3 in the FASTA)").click();
+        harness.run();
+        assert!(harness.query_by_label("sp|P16370|RPB3_YEAST").is_some(), "the list opens");
+        assert!(harness.query_by_label("sp|P34087|RPB7_YEAST").is_some());
+        let _ = std::fs::remove_file(&fasta);
     }
 }

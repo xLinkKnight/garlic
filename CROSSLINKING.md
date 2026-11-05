@@ -76,6 +76,40 @@ protein groups), about 0.08 for a 13-protein complex. Run as normal: `sage confi
   *after* the linked residue; with only N-terminal cutters (Asp-N, Lys-N) consider
   setting `allow_cterm_residue: true`.
 
+## Two databases: crosslinks only between them
+
+For complex crosslink searches, e.g. the interface between two complexes or a
+bait and its candidate partners, give two FASTA files instead of `fasta`:
+
+```json
+"database": {
+  "crosslink_databases": {
+    "database_1": "C:/db/complex1.fasta",
+    "database_2": "C:/db/complex2.fasta"
+  }
+}
+```
+
+* **Linear peptides** are searched in both files as one database (identical
+  proteins once), as with one FASTA, including LFQ, TMT, SILAC and labelled
+  proteins.
+* **Crosslinks** are searched only between a peptide of a Database 1 protein and
+  a peptide of a Database 2 protein. Pairs within one database are never scored,
+  so they take no part in the FDR, and the search is faster. A peptide of
+  proteins in both files counts as either side (so it can also link to itself).
+* **Loop-links** (both ends on one peptide) are not searched.
+* **Multivalent crosslinks:** a species is searched if at least one of its links
+  joins Database 1 to Database 2; its other links may stay within one database
+  (e.g. two subunits of complex 1 linked to each other, one of them also to
+  complex 2).
+* Decoys come from the same database as their target, so the target-decoy
+  competition is restricted in the same way.
+* `crosslinks.sage.tsv` gets `database_a` / `database_b` columns: `1`, `2` or
+  `1+2`.
+* With `crosslink_databases` set, `fasta` is ignored (a warning is logged when
+  both are given). In `sage-gui`: Files tab → Two-database crosslink search;
+  setting either file greys out the FASTA field.
+
 ## Heterobifunctional and zero-length reagents (EDC, DMTMM)
 
 ```json
@@ -367,7 +401,8 @@ peptides, but raise `chain_survivors` if you suspect misses.
 target-target, -1 otherwise; `class` is `TT`/`TD`/`DD` (loop-links: `TT`/`DD`).
 `matched_a` / `matched_b` count all matched fragment ions of each peptide;
 `linked_a` / `linked_b` count those that carry the linker (non-cleavable linkers
-only, see `min_linked_peaks`).
+only, see `min_linked_peaks`). With two crosslink databases, `database_a` /
+`database_b` say which one each peptide is from (`1`, `2` or `1+2`).
 
 ## Files for xiVIEW, ProXL and PRIDE
 
@@ -638,6 +673,11 @@ the peptide may carry the label.
 a crosslink joins peptides of one channel (unless `mixed_crosslinks`), and
 `crosslinks.silac.tsv` gives each crosslinked species' intensity in every
 channel and its ratios to light per run. See [SILAC.md](SILAC.md).
+
+**Isotope-labelled proteins.** Proteins expressed in ¹⁵N and/or ¹³C media
+(`database.labelled_proteins`) are searched labelled; a labelled lysine still
+links, and crosslinks between labelled and unlabelled proteins are found
+(`isotope_label_a` / `_b` in `crosslinks.sage.tsv`). See [SILAC.md](SILAC.md#isotope-labelled-proteins-15n-13c).
 
 **Label-free (MS1).** With `"lfq": true` Sage writes `crosslinks.lfq.tsv`, one
 row per crosslinked *species* (peptide pair or loop-linked peptide; link-site

@@ -249,7 +249,18 @@ impl Results {
         }
 
         let decoy_tag = database.and_then(|d| d.get("decoy_tag")).and_then(Value::as_str).unwrap_or("rev_").to_string();
-        let proteins = database.and_then(|d| d.get("fasta")).and_then(Value::as_str).map(read_fasta).unwrap_or_default();
+        // the FASTA, or both crosslink databases
+        let two = database.and_then(|d| d.get("crosslink_databases"));
+        let fastas: Vec<&str> = match two {
+            Some(two) => ["database_1", "database_2"].iter().filter_map(|k| two.get(*k).and_then(Value::as_str)).collect(),
+            None => database.and_then(|d| d.get("fasta")).and_then(Value::as_str).into_iter().collect(),
+        };
+        let mut proteins = HashMap::new();
+        for f in fastas.into_iter().filter(|f| !f.is_empty()) {
+            for (accession, protein) in read_fasta(f) {
+                proteins.entry(accession).or_insert(protein);
+            }
+        }
 
         let mut matches = Vec::new();
         if let Some(text) = read_tsv(&folder.join("results.sage.tsv")) {

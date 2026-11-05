@@ -729,6 +729,10 @@ fn parse_enzymes(enzyme: Option<&Map<String, Value>>) -> (Vec<String>, Vec<Enzym
 pub struct Settings {
     // Files
     pub fasta: String,
+    /// Two-database crosslink search: crosslinks only between a protein of
+    /// Database 1 and one of Database 2; set, they replace `fasta`
+    pub database_1: String,
+    pub database_2: String,
     pub spectra: Vec<String>,
     pub output_directory: String,
 
@@ -803,6 +807,10 @@ pub struct Settings {
     pub silac_heavy: (f64, f64),
     /// Crosslinks between peptides of different channels
     pub silac_mixed: bool,
+    /// Proteins uniformly labelled with 15N and/or 13C (accession → label)
+    pub labelled_proteins: std::collections::BTreeMap<String, sage_core::labelled::Isotope>,
+    /// Also search the labelled proteins unlabelled
+    pub include_unlabelled: bool,
 
     pub crosslink: Crosslink,
 
@@ -818,6 +826,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             fasta: String::new(),
+            database_1: String::new(),
+            database_2: String::new(),
             spectra: Vec::new(),
             output_directory: String::new(),
             missed_cleavages: 2,
@@ -873,6 +883,8 @@ impl Default for Settings {
             silac_medium: (4.025107, 6.020129),
             silac_heavy: (8.014199, 10.008269),
             silac_mixed: false,
+            labelled_proteins: Default::default(),
+            include_unlabelled: true,
             crosslink: Crosslink::default(),
             extra: Map::new(),
             extra_database: Map::new(),
@@ -894,6 +906,7 @@ const DATABASE_KEYS: &[&str] = &[
     "fasta", "enzyme", "peptide_min_mass", "peptide_max_mass", "ion_kinds", "min_ion_index",
     "static_mods", "variable_mods", "max_variable_mods", "max_combinations", "generate_decoys",
     "decoy_tag", "bucket_size", "prefilter", "prefilter_chunk_size", "prefilter_low_memory", "silac",
+    "labelled_proteins", "crosslink_databases",
 ];
 const ENZYME_KEYS: &[&str] = &[
     "missed_cleavages", "min_len", "max_len", "cleave_at", "restrict", "c_terminal", "enzymes",
@@ -901,6 +914,46 @@ const ENZYME_KEYS: &[&str] = &[
 ];
 const QUANT_KEYS: &[&str] = &["lfq", "tmt", "tmt_settings", "lfq_settings"];
 const LFQ_KEYS: &[&str] = &["ppm_tolerance", "peptide_q_value", "combine_charge_states", "spectral_angle"];
+
+impl Settings {
+    /// Two-database crosslink search: Database 1 or 2 set (they replace the
+    /// FASTA file)
+    pub fn two_databases(&self) -> bool {
+        !self.database_1.trim().is_empty() || !self.database_2.trim().is_empty()
+    }
+
+    /// The FASTA files searched (set ones only): the FASTA file, or Database
+    /// 1 and 2
+    pub fn fasta_files(&self) -> Vec<&str> {
+        let files = if self.two_databases() {
+            vec![self.database_1.trim(), self.database_2.trim()]
+        } else {
+            vec![self.fasta.trim()]
+        };
+        files.into_iter().filter(|f| !f.is_empty()).collect()
+    }
+}
+
+/// The proteins of a FASTA file: accession (the header's first word, as Sage
+/// names it) and the rest of the header; `None` if it cannot be read
+pub fn fasta_proteins(path: &str) -> Option<Vec<(String, String)>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(
+        text.lines()
+            .filter_map(|l| l.strip_prefix('>'))
+            .map(|header| {
+                let (accession, rest) = header.trim().split_once(char::is_whitespace).unwrap_or((header.trim(), ""));
+                // UniProt: the name, up to `OS=`
+                let name = rest[..rest.find(" OS=").unwrap_or(rest.len())].trim();
+                (accession.to_string(), name.to_string())
+            })
+            .collect(),
+    )
+}
+
+fn fasta_accessions(path: &str) -> Option<Vec<String>> {
+    Some(fasta_proteins(path)?.into_iter().map(|(a, _)| a).collect())
+}
 
 /// The GUI's SILAC settings from `database.silac`: (mode, medium, heavy, mixed)
 fn parse_silac(v: Option<&Value>, d: &Settings) -> (Silac, (f64, f64), (f64, f64), bool) {
@@ -1079,7 +1132,15 @@ impl Settings {
             .collect();
 
         let mut db = self.extra_database.clone();
-        db.insert("fasta".into(), json!(self.fasta));
+        // two crosslink databases replace the FASTA file
+        if self.two_databases() {
+            db.insert(
+                "crosslink_databases".into(),
+                json!({"database_1": self.database_1.trim(), "database_2": self.database_2.trim()}),
+            );
+        } else {
+            db.insert("fasta".into(), json!(self.fasta));
+        }
         db.insert("enzyme".into(), Value::Object(enzyme));
         if let Some(mass) = self.peptide_min_mass {
             db.insert("peptide_min_mass".into(), json!(mass));
@@ -1103,6 +1164,13 @@ impl Settings {
         }
         if let Some(silac) = self.silac_json() {
             db.insert("silac".into(), silac);
+        }
+        if !self.labelled_proteins.is_empty() {
+            let labelled = sage_core::labelled::LabelledProteins {
+                proteins: self.labelled_proteins.clone(),
+                include_unlabelled: self.include_unlabelled,
+            };
+            db.insert("labelled_proteins".into(), serde_json::to_value(labelled).unwrap_or_default());
         }
 
         let mut quant = self.extra_quant.clone();
@@ -1184,6 +1252,8 @@ impl Settings {
         let lfq_settings = quant.and_then(|q| q.get("lfq_settings")).and_then(Value::as_object);
         let lv = |k: &str| lfq_settings.and_then(|l| l.get(k));
         let silac = parse_silac(dbv("silac"), &d);
+        let labelled: Option<sage_core::labelled::LabelledProteins> =
+            dbv("labelled_proteins").and_then(|v| serde_json::from_value(v.clone()).ok());
 
         let mut mods = Vec::new();
         if let Some(fixed) = dbv("static_mods").and_then(Value::as_object) {
@@ -1226,6 +1296,8 @@ impl Settings {
 
         Ok(Settings {
             fasta: str_or(dbv("fasta"), ""),
+            database_1: str_or(dbv("crosslink_databases").and_then(|d| d.get("database_1")), ""),
+            database_2: str_or(dbv("crosslink_databases").and_then(|d| d.get("database_2")), ""),
             spectra: top
                 .get("mzml_paths")
                 .and_then(Value::as_array)
@@ -1306,6 +1378,8 @@ impl Settings {
             silac_medium: silac.1,
             silac_heavy: silac.2,
             silac_mixed: silac.3,
+            labelled_proteins: labelled.as_ref().map(|l| l.proteins.clone()).unwrap_or_default(),
+            include_unlabelled: labelled.as_ref().is_none_or(|l| l.include_unlabelled),
             crosslink: top
                 .get("crosslink")
                 .and_then(Value::as_object)
@@ -1342,6 +1416,34 @@ impl Settings {
     pub fn check(&self) -> (Vec<String>, Vec<String>) {
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
+        if !self.labelled_proteins.is_empty() {
+            // every labelled protein should be in the FASTA
+            let headers: Option<Vec<String>> = self
+                .fasta_files()
+                .into_iter()
+                .map(fasta_accessions)
+                .collect::<Option<Vec<_>>>()
+                .map(|files| files.concat());
+            if let Some(accessions) = headers {
+                let missing: Vec<&String> = self
+                    .labelled_proteins
+                    .keys()
+                    .filter(|k| !accessions.iter().any(|a| a == *k || a.split('|').skip(1).any(|p| p == k.as_str())))
+                    .collect();
+                if !missing.is_empty() {
+                    errors.push(format!(
+                        "Isotope-labelled proteins not in the FASTA: {}",
+                        missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                    ));
+                }
+            }
+            warnings.push(format!(
+                "{} protein(s) are searched isotope-labelled{}. Incompletely labelled proteins have a lighter \
+                 isotope envelope: allow isotope errors (e.g. -1 to 0) if the instrument picks a lighter peak.",
+                self.labelled_proteins.len(),
+                if self.include_unlabelled { " and unlabelled" } else { " only (not unlabelled)" }
+            ));
+        }
         if self.silac != Silac::Off {
             let mut channels = vec![("heavy", self.silac_heavy)];
             if self.silac == Silac::Triplex {
@@ -1363,7 +1465,35 @@ impl Settings {
             ));
         }
 
-        if self.fasta.trim().is_empty() {
+        if self.two_databases() {
+            for (name, path) in [("Database 1", &self.database_1), ("Database 2", &self.database_2)] {
+                if path.trim().is_empty() {
+                    errors.push(format!("Two-database crosslink search: select {name} (Files tab), or clear both."));
+                } else if !std::path::Path::new(path.trim()).is_file() {
+                    errors.push(format!("{name} not found: {}", path.trim()));
+                }
+            }
+            if !self.crosslink.enabled {
+                warnings.push(
+                    "Database 1 and Database 2 are set but crosslinking is off: they are searched as one FASTA."
+                        .into(),
+                );
+            } else {
+                warnings.push(
+                    "Two-database crosslink search: only crosslinks between a Database 1 protein and a Database 2 \
+                     protein are searched (loop-links and crosslinks within one database are not). Linear \
+                     peptides are searched in both."
+                        .into(),
+                );
+            }
+            if !self.database_1.trim().is_empty() && self.database_1.trim() == self.database_2.trim() {
+                warnings.push(
+                    "Database 1 and Database 2 are the same file: every protein is in both, so every crosslink \
+                     is searched."
+                        .into(),
+                );
+            }
+        } else if self.fasta.trim().is_empty() {
             errors.push("Select a FASTA database (Files tab).".into());
         } else if !std::path::Path::new(&self.fasta).is_file() {
             errors.push(format!("FASTA file not found: {}", self.fasta));
@@ -1586,6 +1716,97 @@ mod test {
         let edc = Settings::from_json(&json!({"crosslink": {"reagent": "dmtmm"}})).unwrap();
         assert!(edc.crosslink.two_sites);
         assert_eq!(edc.crosslink.site2.residues, "DE");
+    }
+
+    /// Isotope-labelled proteins are written as `database.labelled_proteins`,
+    /// read back, accepted by Sage, and checked against the FASTA
+    #[test]
+    fn labelled_proteins_round_trip_and_are_checked() {
+        use sage_core::labelled::{Isotope, LabelledProteins};
+        let dir = std::env::temp_dir().join(format!("sage-gui-labelled-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fasta = dir.join("two.fasta");
+        std::fs::write(&fasta, ">sp|P1|ONE_HUMAN One protein OS=Homo sapiens GN=ONE\nMKR\n>sp|P2|TWO_HUMAN Two\nMKR\n").unwrap();
+        let mut s = Settings { fasta: fasta.display().to_string(), ..Default::default() };
+        assert!(s.to_json(&[])["database"].get("labelled_proteins").is_none(), "none: not written");
+        assert_eq!(
+            fasta_proteins(&s.fasta).unwrap(),
+            vec![("sp|P1|ONE_HUMAN".to_string(), "One protein".to_string()), ("sp|P2|TWO_HUMAN".to_string(), "Two".to_string())]
+        );
+        s.labelled_proteins.insert("sp|P1|ONE_HUMAN".into(), Isotope::C13N15);
+        s.labelled_proteins.insert("P2".into(), Isotope::N15);
+        s.include_unlabelled = false;
+        let v = s.to_json(&[]);
+        assert_eq!(v["database"]["labelled_proteins"]["proteins"]["sp|P1|ONE_HUMAN"], json!("13C15N"));
+        assert_eq!(v["database"]["labelled_proteins"]["include_unlabelled"], json!(false));
+        let back = Settings::from_json(&v).unwrap();
+        assert_eq!(back.labelled_proteins, s.labelled_proteins);
+        assert!(!back.include_unlabelled);
+        let core: LabelledProteins = serde_json::from_value(v["database"]["labelled_proteins"].clone()).unwrap();
+        assert!(core.validate().is_ok());
+        // in the FASTA (by accession or a part of it): no error, a warning about the labels
+        let (errors, warnings) = s.check();
+        assert!(errors.iter().all(|e| !e.contains("labelled")), "{errors:?}");
+        assert!(warnings.iter().any(|w| w.contains("2 protein(s) are searched isotope-labelled only")));
+        // a protein not in the FASTA is an error
+        s.labelled_proteins.insert("P99".into(), Isotope::C13);
+        assert!(s.check().0.iter().any(|e| e.contains("not in the FASTA: P99")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Database 1 and 2 replace the FASTA file in the JSON, are read back,
+    /// accepted by Sage, and checked
+    #[test]
+    fn crosslink_databases_replace_the_fasta() {
+        let dir = std::env::temp_dir().join(format!("sage-gui-two-db-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (fasta, one, two) = (dir.join("all.fasta"), dir.join("complex1.fasta"), dir.join("complex2.fasta"));
+        std::fs::write(&fasta, ">sp|P9|NINE Nine\nMKR\n").unwrap();
+        std::fs::write(&one, ">sp|P1|ONE_HUMAN One OS=Homo sapiens\nMKR\n").unwrap();
+        std::fs::write(&two, ">sp|P2|TWO_HUMAN Two OS=Homo sapiens\nMKR\n").unwrap();
+        let mut s = Settings { fasta: fasta.display().to_string(), ..Default::default() };
+        assert!(!s.two_databases());
+        assert_eq!(s.fasta_files(), vec![s.fasta.as_str()]);
+        assert!(s.to_json(&[])["database"].get("crosslink_databases").is_none());
+
+        // one database set: the FASTA file is out, and the other is missing
+        s.database_1 = one.display().to_string();
+        assert!(s.two_databases());
+        let v = s.to_json(&[]);
+        assert!(v["database"].get("fasta").is_none(), "the FASTA file is excluded");
+        assert!(s.check().0.iter().any(|e| e.contains("select Database 2")), "{:?}", s.check().0);
+
+        s.database_2 = two.display().to_string();
+        s.crosslink.enabled = true;
+        let v = s.to_json(&[]);
+        assert!(v["database"].get("fasta").is_none());
+        assert_eq!(v["database"]["crosslink_databases"]["database_1"], json!(s.database_1));
+        assert_eq!(v["database"]["crosslink_databases"]["database_2"], json!(s.database_2));
+        let back = Settings::from_json(&v).unwrap();
+        assert_eq!((back.database_1.as_str(), back.database_2.as_str()), (s.database_1.as_str(), s.database_2.as_str()));
+        // Sage takes it, without a FASTA file
+        let builder: sage_core::database::Builder = serde_json::from_value(v["database"].clone()).unwrap();
+        let params = builder.make_parameters().unwrap();
+        assert_eq!(params.fasta_files(), vec![s.database_1.as_str(), s.database_2.as_str()]);
+
+        let (errors, warnings) = s.check();
+        assert!(errors.iter().all(|e| !e.contains("FASTA") && !e.contains("Database")), "{errors:?}");
+        assert!(warnings.iter().any(|w| w.contains("only crosslinks between a Database 1 protein")), "{warnings:?}");
+        // the proteins of both, e.g. for isotope labels
+        s.labelled_proteins.insert("P2".into(), sage_core::labelled::Isotope::N15);
+        assert!(s.check().0.iter().all(|e| !e.contains("not in the FASTA")));
+        s.labelled_proteins.insert("P9".into(), sage_core::labelled::Isotope::N15);
+        assert!(s.check().0.iter().any(|e| e.contains("not in the FASTA: P9")), "the FASTA file is not searched");
+        s.labelled_proteins.clear();
+
+        // crosslinking off: one database, with a warning
+        s.crosslink.enabled = false;
+        assert!(s.check().1.iter().any(|w| w.contains("crosslinking is off")));
+        // cleared: back to the FASTA file
+        s.database_1.clear();
+        s.database_2.clear();
+        assert_eq!(s.to_json(&[])["database"]["fasta"], json!(s.fasta));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// SILAC is written as `database.silac`, read back, accepted by Sage, and
