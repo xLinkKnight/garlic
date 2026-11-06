@@ -585,6 +585,13 @@ impl SageGui {
 
 impl eframe::App for SageGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.draw(ctx);
+    }
+}
+
+impl SageGui {
+    /// One frame of the whole window (the screenshot tests draw it off-screen)
+    fn draw(&mut self, ctx: &egui::Context) {
         self.handle_dropped_files(ctx);
         self.follow_job(ctx);
         self.poll_xiview(ctx);
@@ -674,7 +681,7 @@ impl eframe::App for SageGui {
             ui.horizontal(|ui| {
                 let running = self.running();
                 let run = ui
-                    .add_enabled(!running, theme::tone_button(ui, "▶ Run search", theme::Tone::Blue))
+                    .add_enabled(!running, theme::tone_button(ui, "▶ Run search", theme::Tone::Accent))
                     .on_hover_text(
                         "Check the settings, convert any Thermo .raw files to mzML, write \
                          sage_search.json into the output folder and run sage.exe.",
@@ -723,7 +730,7 @@ impl eframe::App for SageGui {
                 }
                 if let Some(job) = &self.job {
                     let (text, color) = match job.status() {
-                        Status::Running(step) => (format!("Running: {step}"), Color32::from_rgb(70, 130, 220)),
+                        Status::Running(step) => (format!("Running: {step}"), theme::accent(ui)),
                         Status::Finished => ("Finished".to_string(), Color32::from_rgb(40, 160, 70)),
                         Status::Failed(_) => (
                             "Failed: see the Progress tab for what went wrong".to_string(),
@@ -1243,18 +1250,18 @@ impl SageGui {
                 .fill(fill)
                 .animate(running),
         );
-        // Percentage centred on the bar, dark blue on a pale backdrop so it reads
+        // Percentage centred on the bar, dark brown on a pale backdrop so it reads
         // over every fill colour and over the empty track
-        let navy = Color32::from_rgb(15, 40, 100);
+        let brown = Color32::from_rgb(90, 38, 4);
         let galley = ui.painter().layout_no_wrap(
             format!("{:.0}%", 100.0 * t.fraction()),
             egui::FontId::proportional(14.0),
-            navy,
+            brown,
         );
         let pos = bar.rect.center() - galley.size() / 2.0;
         let backdrop = egui::Rect::from_min_size(pos, galley.size()).expand2(egui::vec2(6.0, 0.0));
         ui.painter().rect_filled(backdrop, 4.0, Color32::from_white_alpha(190));
-        ui.painter().galley(pos, galley, navy);
+        ui.painter().galley(pos, galley, brown);
         if running {
             // keep the elapsed time and animation moving
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
@@ -2746,6 +2753,57 @@ mod screenshots {
             let path = out.join(format!("gui_{name}.png"));
             harness.render().expect("render").save(&path).unwrap();
             println!("{}", path.display());
+        }
+    }
+
+    /// The whole window (toolbar, tabs, settings, Run button) in the light and
+    /// dark themes, on the Files, Crosslinking and Scoring & output tabs:
+    /// `SAGE_GUI_FIGURES=<folder> cargo test -p sage-gui window_previews -- --ignored`
+    #[test]
+    #[ignore]
+    fn window_previews() {
+        let out = std::path::PathBuf::from(std::env::var("SAGE_GUI_FIGURES").expect("set SAGE_GUI_FIGURES"));
+        std::fs::create_dir_all(&out).unwrap();
+        let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests");
+        let results = std::env::temp_dir().join("xnova_window_preview");
+        std::fs::create_dir_all(&results).unwrap();
+        let mut s = Settings::default();
+        s.fasta = tests.join("Q99536.fasta").to_string_lossy().into_owned();
+        s.spectra = vec![tests.join("LQSRPAAPPAPGPGQLTLR.mzML").to_string_lossy().into_owned()];
+        s.output_directory = results.to_string_lossy().into_owned();
+        s.crosslink.enabled = true;
+        s.crosslink.multivalent = true;
+        s.crosslink.valency = 3;
+        for dark in [false, true] {
+            for (tab, name) in [(Tab::Files, "files"), (Tab::Crosslink, "crosslinking"), (Tab::Scoring, "scoring")] {
+                let settings = s.clone();
+                let mut app: Option<SageGui> = None;
+                let mut harness = Harness::builder()
+                    .with_size(egui::vec2(1040.0, 780.0))
+                    .with_pixels_per_point(1.5)
+                    .build(move |ctx| {
+                        // fonts take effect on the frame after they are set: draw from the second
+                        let Some(app) = app.as_mut() else {
+                            theme::install(ctx, dark);
+                            let mut new = SageGui::new(ctx);
+                            new.s = settings.clone();
+                            // (new() restores the saved theme: override it)
+                            new.dark = dark;
+                            theme::set_dark(ctx, dark);
+                            new.tab = tab;
+                            // the window is already sized: skip the start-up measuring
+                            new.fit_step = FIT_STEPS;
+                            app = Some(new);
+                            return;
+                        };
+                        app.draw(ctx);
+                    });
+                harness.run_steps(6);
+                let theme = if dark { "dark" } else { "light" };
+                let path = out.join(format!("window_{name}_{theme}.png"));
+                harness.render().expect("render").save(&path).unwrap();
+                println!("{}", path.display());
+            }
         }
     }
 

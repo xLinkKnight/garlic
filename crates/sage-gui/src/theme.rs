@@ -227,17 +227,21 @@ struct Palette {
     selection: Color32,
 }
 
+// The accents come from the XNova logo, an orange-red (#e0520c) to gold
+// (#f2a900) gradient: orange on light panels (#e8650a, 3.3:1 on white, chosen
+// for the colour over the 4.5:1 of a darker burnt orange) and an orange-gold on
+// dark ones (#f59e1f, 7.7:1 on the dark panel). Greys are warm to match.
 const LIGHT: Palette = Palette {
     panel: Color32::WHITE,
     field: Color32::WHITE,
-    faint: rgb(246, 248, 251),
+    faint: rgb(250, 247, 243),
     text: rgb(45, 48, 54),
-    border: rgb(200, 205, 212),
-    rule: rgb(225, 228, 233),
-    hover: rgb(244, 247, 252),
-    pressed: rgb(232, 240, 252),
-    accent: rgb(47, 111, 207),
-    selection: rgb(214, 228, 248),
+    border: rgb(210, 202, 194),
+    rule: rgb(232, 226, 220),
+    hover: rgb(255, 247, 239),
+    pressed: rgb(253, 232, 208),
+    accent: rgb(232, 101, 10),
+    selection: rgb(251, 227, 196),
 };
 
 const DARK: Palette = Palette {
@@ -245,12 +249,12 @@ const DARK: Palette = Palette {
     field: rgb(24, 25, 27),
     faint: rgb(38, 40, 44),
     text: rgb(220, 222, 226),
-    border: rgb(78, 82, 90),
-    rule: rgb(56, 59, 65),
-    hover: rgb(40, 44, 52),
-    pressed: rgb(40, 56, 84),
-    accent: rgb(110, 160, 240),
-    selection: rgb(40, 62, 100),
+    border: rgb(88, 82, 76),
+    rule: rgb(62, 58, 54),
+    hover: rgb(52, 44, 36),
+    pressed: rgb(84, 56, 26),
+    accent: rgb(245, 158, 31),
+    selection: rgb(92, 58, 22),
 };
 
 /// Thin border / rule of colour `c`
@@ -278,6 +282,7 @@ fn visuals(dark: bool) -> Visuals {
     v.hyperlink_color = p.accent;
     v.selection.bg_fill = p.selection;
     v.selection.stroke = line(p.accent);
+    v.text_cursor.stroke.color = p.accent;
 
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = p.panel;
@@ -334,13 +339,13 @@ pub fn accent(ui: &Ui) -> Color32 {
 /// Grey of field labels, a step lighter than values
 pub fn muted(ui: &Ui) -> Color32 {
     if ui.visuals().dark_mode {
-        rgb(160, 165, 175)
+        rgb(168, 164, 160)
     } else {
-        rgb(110, 115, 125)
+        rgb(116, 112, 108)
     }
 }
 
-/// Blue section title followed by a thin rule to the right edge
+/// Section title in the accent colour, followed by a thin rule to the right edge
 pub fn section(ui: &mut Ui, text: &str) {
     ui.add_space(10.0);
     ui.horizontal(|ui| {
@@ -357,8 +362,8 @@ pub fn section(ui: &mut Ui, text: &str) {
 
 #[derive(Clone, Copy)]
 pub enum Tone {
-    /// Primary action (Run)
-    Blue,
+    /// Primary action (Run), in the accent colour
+    Accent,
     /// Stopping / cancelling
     Tan,
 }
@@ -367,8 +372,8 @@ pub enum Tone {
 pub fn tone_button(ui: &Ui, text: &str, tone: Tone) -> Button<'static> {
     let dark = ui.visuals().dark_mode;
     let (stroke, fill, label) = match (tone, dark) {
-        (Tone::Blue, false) => (LIGHT.accent, rgb(232, 240, 252), LIGHT.accent),
-        (Tone::Blue, true) => (DARK.accent, rgb(30, 45, 70), DARK.accent),
+        (Tone::Accent, false) => (LIGHT.accent, rgb(255, 241, 224), LIGHT.accent),
+        (Tone::Accent, true) => (DARK.accent, rgb(74, 50, 24), DARK.accent),
         (Tone::Tan, false) => (rgb(190, 150, 100), rgb(250, 243, 232), rgb(160, 110, 60)),
         (Tone::Tan, true) => (rgb(200, 160, 110), rgb(60, 48, 35), rgb(220, 180, 130)),
     };

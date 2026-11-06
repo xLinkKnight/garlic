@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.0.1] - 2026-11-06
+
+### Added
+- `sage.exe` carries the XNova icon too (Explorer, shortcuts), like `sage-gui.exe`.
+
+### Changed
+- XNova branding: the application icon (window, taskbar and `sage-gui.exe`) is the XNova icon, and the README shows the XNova logo, with a new title, introduction and list of major features.
+- Renamed from garlic to XNova throughout: links point to https://github.com/xLinkKnight/XNova; the development variables are `XNOVA_XIVIEW_DIR`, `XNOVA_XIVIEW_RESULTS` and `XNOVA_XIVIEW_MINUTES` (were `GARLIC_…`); xiVIEW shows the scores as `XNova:hyperscore` and `XNova:q-value`. The `xiview` folder is rebuilt to match (it loads multivalent link metadata from `get_xnova_link_metadata`), so use it with this sage-gui, not an older one.
+- `sage-gui`: the theme's blue accents are now the orange of the XNova logo: section titles, links, selected tabs, the Run search button, hover and selection tints, the text cursor and the running status. Orange (#e8650a) on the light theme and orange-gold (#f59e1f) on the dark one; borders and greys are warmer to match. Data colours (ion series, linker stubs, mobiligram classes) are unchanged.
+
 ## [v1.0.0] - 2026-11-05
 
 ### Added

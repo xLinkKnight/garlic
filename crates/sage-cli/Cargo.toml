@@ -1,6 +1,6 @@
 [package]
 name = "sage-cli"
-version = "1.0.0"
+version = "1.0.1"
 authors = ["Michael Lazear <michaellazear92@gmail.com"]
 edition = "2021"
 rust-version = "1.64"
@@ -48,3 +48,7 @@ report-builder = "0.1.1"
 # Bruker analysis.tdf, for the spectrum positions of the Annotator export
 # (already built for timsrust; same version and features)
 rusqlite = { version = "0.35", features = ["bundled"] }
+
+[target.'cfg(windows)'.build-dependencies]
+# build.rs embeds the XNova icon (sage-gui/assets/xnova.ico) in sage.exe
+winresource = "0.1"
