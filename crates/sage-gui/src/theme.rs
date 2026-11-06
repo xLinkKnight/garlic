@@ -184,7 +184,7 @@ mod test {
                     let mut d = dark;
                     theme_switch(ui, &mut d);
                     ui.add_space(12.0);
-                    github_link(ui, "https://github.com/xLinkKnight/garlic");
+                    github_link(ui, "https://github.com/xLinkKnight/XNova");
                 });
             });
             harness.run();
@@ -204,7 +204,7 @@ mod test {
                     }
                 }
             }
-            assert_eq!(opened, [("https://github.com/xLinkKnight/garlic".to_string(), true)], "dark {dark}");
+            assert_eq!(opened, [("https://github.com/xLinkKnight/XNova".to_string(), true)], "dark {dark}");
         }
     }
 }
@@ -410,7 +410,7 @@ pub fn github_link(ui: &mut Ui, url: &str) -> Response {
     let response = ui
         .add(Button::image_and_text(mark, format!("v{}", env!("CARGO_PKG_VERSION"))).frame(false))
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(format!("garlic on GitHub: {url}"));
+        .on_hover_text(format!("XNova on GitHub: {url}"));
     if response.clicked() {
         ui.ctx().open_url(egui::OpenUrl::new_tab(url));
     }

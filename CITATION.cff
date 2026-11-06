@@ -145,4 +145,4 @@ references:
     end: D553
     year: 2025
     doi: 10.1093/nar/gkae1011
-    notes: "PRIDE; garlic's local xiVIEW server answers the data API of the PRIDE Crosslinking Resource (https://github.com/PRIDE-Archive/crosslinking-api)."
+    notes: "PRIDE; XNova's local xiVIEW server answers the data API of the PRIDE Crosslinking Resource (https://github.com/PRIDE-Archive/crosslinking-api)."

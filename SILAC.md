@@ -1,6 +1,6 @@
 # SILAC
 
-garlic searches and quantifies SILAC samples (stable isotope labelling by amino
+XNova searches and quantifies SILAC samples (stable isotope labelling by amino
 acids in cell culture), duplex or triplex, in linear and in crosslink searches.
 
 ## Configuration

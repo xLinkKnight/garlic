@@ -283,7 +283,7 @@ impl Viewer {
         ui.label(
             RichText::new(
                 "Pick a match to see its spectrum annotated by Annotator's engine (mzcore / mzannotate, \
-                 github.com/snijderlab/annotator), built into garlic. Spectra are read as Sage read them; \
+                 github.com/snijderlab/annotator), built into XNova. Spectra are read as Sage read them; \
                  for timsTOF that is the precursor's merged spectrum.",
             )
             .weak(),
@@ -368,7 +368,7 @@ impl Viewer {
                      colour by identification (crosslinks, linear peptides, unidentified). Export as SVG or PDF.",
                 )
                 .on_disabled_hover_text(
-                    "Needs ion mobility: timsTOF (Bruker .d) data, searched with garlic 0.18 or later \
+                    "Needs ion mobility: timsTOF (Bruker .d) data, searched with XNova 0.18 or later \
                      (crosslinks.sage.tsv with an ion_mobility column).",
                 )
                 .clicked()

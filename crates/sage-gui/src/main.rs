@@ -23,15 +23,15 @@ use std::path::{Path, PathBuf};
 const FIT_STEPS: usize = 2 * Tab::ALL.len();
 
 /// The project on GitHub (the link next to the light/dark switch)
-const REPO_URL: &str = "https://github.com/xLinkKnight/garlic";
+const REPO_URL: &str = "https://github.com/xLinkKnight/XNova";
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Sage search")
-            // the smiling garlic, drawn by examples/make_icon.rs
+            // the XNova icon (from the XNova logo design files)
             .with_icon(
-                eframe::icon_data::from_png_bytes(include_bytes!("../assets/garlic.png"))
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/xnova.png"))
                     .expect("the bundled icon is a valid PNG"),
             )
             .with_inner_size([1040.0, 780.0])
@@ -126,7 +126,7 @@ struct SageGui {
     viewer: viewer::Viewer,
     /// The local xiVIEW server, started on first use
     xiview: Option<std::sync::Arc<xiview::server::Server>>,
-    /// garlic's crosslink FDR at which xiVIEW gets the crosslinks
+    /// XNova's crosslink FDR at which xiVIEW gets the crosslinks
     xiview_fdr: xiview::data::Fdr,
     /// A results folder being loaded for xiVIEW
     xiview_loading: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
@@ -363,7 +363,7 @@ impl SageGui {
                 self.open_xiview(folder);
             }
             use xiview::data::Fdr;
-            let label = |f: Fdr| format!("crosslinks at garlic's {} FDR", f.percent());
+            let label = |f: Fdr| format!("crosslinks at XNova's {} FDR", f.percent());
             ComboBox::from_id_salt("xiview_fdr")
                 .selected_text(label(self.xiview_fdr))
                 .width(230.0)
@@ -374,7 +374,7 @@ impl SageGui {
                 })
                 .response
                 .on_hover_text(
-                    "xiVIEW gets the target crosslinks within garlic's crosslink FDR (crosslink q-value), \
+                    "xiVIEW gets the target crosslinks within XNova's crosslink FDR (crosslink q-value), \
                      shown as passing; xiVIEW's own decoy-based FDR is not used.",
                 );
             if self.xiview_loading.is_some() {
@@ -2318,7 +2318,7 @@ fn scoring_tab(ui: &mut Ui, s: &mut Settings) {
             (useful for plotting annotated spectra; large file).",
             |ui| ui.checkbox(&mut s.annotate_matches, "write matched fragment ions"));
         row(ui, "Annotator app files", "Only for the separate Annotator app (github.com/snijderlab/annotator); \
-            garlic's \"Annotated spectra\" tab needs nothing extra.\n\
+            XNova's \"Annotated spectra\" tab needs nothing extra.\n\
             Writes results.annotator.csv (linear matches) and crosslinks.annotator.csv: target \
             matches at 1% FDR as ProForma (a crosslink is PEPK[XLMOD:02126#XL1]R//AK[#XL1]R) with \
             each spectrum's position in its file. Open them in Annotator together with the \
@@ -2689,7 +2689,7 @@ mod screenshots {
         s.crosslink.multivalent = true;
         s.crosslink.valency = 3;
         s.silac = Silac::Triplex;
-        s.fasta = "C:/Users/vahen/source/repos/garlic/tests/PolII_Complex.fasta".into();
+        s.fasta = "C:/Users/vahen/source/repos/XNova/tests/PolII_Complex.fasta".into();
         s.labelled_proteins.insert("sp|P08518|RPB2_YEAST".into(), sage_core::labelled::Isotope::N15);
         s.labelled_proteins.insert("sp|P04050|RPB1_YEAST".into(), sage_core::labelled::Isotope::C13N15);
         let tabs: [(&str, fn(&mut Ui, &mut Settings)); 3] =

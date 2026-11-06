@@ -11,12 +11,12 @@ The output folder goes next to sage-gui.exe, named `xiview`.
   xiview-server (https://github.com/Rappsilber-Laboratory/xiview-server,
   Apache-2.0), also pinned; the help videos (37 MB) are left out.
 * The two page shells (network.html, spectra.html) are changed to load their
-  data from garlic's local server (`./data/`, `./xiAnnotator/`) instead of
+  data from XNova's local server (`./data/`, `./xiAnnotator/`) instead of
   the PRIDE web service, and the link to the xiSEARCH server is removed.
 * Changes to xiVIEW's source before the build (source_fixes.py): the
   spectrum settings' request id; multivalent crosslinks in the spectrum
   viewer (any number of peptides and links), the network and circle views
-  (garlic's link metadata loaded with the data, multivalent links
+  (XNova's link metadata loaded with the data, multivalent links
   dash-dotted).
 
 xiVIEW stays a separate program: sage-gui talks to it over HTTP on
@@ -34,7 +34,7 @@ import sys
 XIVIEW = ('https://github.com/Rappsilber-Laboratory/xiview.git', '03a49f75d1f832b1e103dd78e318fe49d5354afb')
 XIVIEW_SERVER = ('https://github.com/Rappsilber-Laboratory/xiview-server.git', '9258369aa4e75f50f7ebac687dc7a4b89bb943e5')
 
-# garlic's changes to xiVIEW's source (next to this script; loaded by path,
+# XNova's changes to xiVIEW's source (next to this script; loaded by path,
 # as `python -I` leaves the script's folder off the module path)
 _spec = importlib.util.spec_from_file_location(
     'source_fixes', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'source_fixes.py'))
@@ -57,12 +57,12 @@ def checkout(url, commit, folder):
 
 
 def patch_shell(path, entry):
-    """Point a page shell at garlic's local server"""
+    """Point a page shell at XNova's local server"""
     text = open(path, encoding='utf-8').read()
     api = re.compile(r"const APIS = \{.*?xiview\.%s\([^;]*\);" % entry, re.S)
     assert api.search(text), f'{path}: API block not found'
     text = api.sub(
-        "// garlic serves xiVIEW's data API and its annotator on this computer\n"
+        "// XNova serves xiVIEW's data API and its annotator on this computer\n"
         "    xiview.%s(\"./data/\", \"./xiAnnotator/\");" % entry,
         text,
     )
@@ -113,20 +113,20 @@ def main():
     shutil.copy2(os.path.join(server, 'LICENSE.md'), os.path.join(a.out, 'LICENSE-xiview-server.md'))
     with open(os.path.join(a.out, 'SOURCE.md'), 'w', encoding='utf-8', newline='\n') as f:
         f.write(
-            '# xiVIEW in garlic\n\n'
+            '# xiVIEW in XNova\n\n'
             'This folder is the xiVIEW web app, served by sage-gui on 127.0.0.1 ("Open in xiVIEW").\n\n'
             f'* xiVIEW: {XIVIEW[0]} at commit {XIVIEW[1]} (GPL-3.0-or-later, LICENSE-xiview.txt),\n'
             '  built with `npm ci --ignore-scripts` and webpack (production): xiview.js, vendors.js and fonts.\n'
             f'* xiview-server: {XIVIEW_SERVER[0]} at commit {XIVIEW_SERVER[1]} (Apache-2.0,\n'
             '  LICENSE-xiview-server.md): network.html, spectra.html, styles, images, GO terms, help pages\n'
             '  (without the help videos).\n'
-            '* Changed: network.html and spectra.html load their data from garlic\'s local server\n'
+            '* Changed: network.html and spectra.html load their data from XNova\'s local server\n'
             '  (`./data/`, `./xiAnnotator/`) instead of the PRIDE web service; the xiSEARCH server link\n'
-            '  is removed. xiVIEW\'s source is changed before the build as listed in garlic\'s\n'
+            '  is removed. xiVIEW\'s source is changed before the build as listed in XNova\'s\n'
             '  xiview/source_fixes.py: the spectrum settings\' request id (was NaN, so a re-annotated\n'
             '  spectrum was dropped); multivalent crosslinks in the spectrum viewer (any number of\n'
             '  peptides and links, one linker mass per link) and in the network and circle views\n'
-            '  (garlic\'s link metadata loaded with the data; multivalent links dash-dotted).\n\n'
+            '  (XNova\'s link metadata loaded with the data; multivalent links dash-dotted).\n\n'
             '## Credit and citation\n\n'
             'xiVIEW, xiNET and xiSPEC are the work of the Rappsilber Laboratory (https://www.rappsilberlab.org/;\n'
             'Colin Combe, Martin Graham, Lars Kolbowski, Lutz Fischer, Juri Rappsilber and contributors;\n'
@@ -138,13 +138,13 @@ def main():
             '  of proteomics data. Nucleic Acids Res. 2018, 46 (W1), W473-W478. https://doi.org/10.1093/nar/gky353\n'
             '* Combe, C. W.; Fischer, L.; Rappsilber, J. xiNET: Cross-link Network Maps With Residue\n'
             '  Resolution. Mol. Cell. Proteomics 2015, 14 (4), 1137-1147. https://doi.org/10.1074/mcp.O114.042259\n\n'
-            'The data API garlic answers is the PRIDE Crosslinking Resource\'s\n'
+            'The data API XNova answers is the PRIDE Crosslinking Resource\'s\n'
             '(https://github.com/PRIDE-Archive/crosslinking-api; PRIDE team, EMBL-EBI, and the Rappsilber\n'
             'Laboratory; data model from https://github.com/PRIDE-Archive/mzidentml-reader); the annotation\n'
             'format xiSPEC reads is xiAnnotator\'s (https://github.com/Rappsilber-Laboratory/xiAnnotator).\n'
             'PRIDE: Perez-Riverol, Y. et al. The PRIDE database at 20 years: 2025 update. Nucleic Acids Res.\n'
             '2025, 53 (D1), D543-D553. https://doi.org/10.1093/nar/gkae1011\n\n'
-            'Rebuild with garlic\'s xiview/build_xiview.py.\n'
+            'Rebuild with XNova\'s xiview/build_xiview.py.\n'
         )
     print('xiVIEW ready in', a.out)
 

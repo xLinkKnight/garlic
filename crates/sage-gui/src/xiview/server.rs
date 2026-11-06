@@ -21,9 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// The files of the xiVIEW web app: the `xiview` folder next to sage-gui.exe
-/// (or `GARLIC_XIVIEW_DIR`)
+/// (or `XNOVA_XIVIEW_DIR`)
 pub fn app_folder() -> Option<PathBuf> {
-    let candidates = std::env::var_os("GARLIC_XIVIEW_DIR")
+    let candidates = std::env::var_os("XNOVA_XIVIEW_DIR")
         .map(PathBuf::from)
         .into_iter()
         .chain(std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join("xiview"))));
@@ -83,7 +83,7 @@ impl Server {
 
     /// The page of an opened results folder
     pub fn url(&self, name: &str) -> String {
-        format!("http://127.0.0.1:{}/network.html?project=garlic&file={}", self.port, encode(name))
+        format!("http://127.0.0.1:{}/network.html?project=xnova&file={}", self.port, encode(name))
     }
 
     /// Is this results folder (with these matches) open?
@@ -102,7 +102,7 @@ impl Server {
         let mut upload = Upload::load(folder, id, fdr)?;
         if upload.served.is_empty() {
             return Err(format!(
-                "{}: no crosslinks pass garlic's {} FDR (or there is no crosslinks.sage.tsv)",
+                "{}: no crosslinks pass XNova's {} FDR (or there is no crosslinks.sage.tsv)",
                 folder.display(),
                 fdr.percent()
             ));
@@ -323,7 +323,7 @@ fn data(state: &State, request: tiny_http::Request, endpoint: &str, params: &Has
             if let Ok(mut last) = state.last.lock() {
                 *last = Some((upload.id, match_id.clone()));
             }
-            // xiVIEW asks for its own match (as served): garlic's peptidoform
+            // xiVIEW asks for its own match (as served): XNova's peptidoform
             let known = upload.served(&match_id).filter(|(_, s)| unchanged(&req, &s.signatures));
             let result = match known {
                 Some((m, s)) => {
@@ -340,7 +340,7 @@ fn data(state: &State, request: tiny_http::Request, endpoint: &str, params: &Has
         "get_datasets" => {
             let uploads = state.uploads.read().map(|u| u.clone()).unwrap_or_default();
             let rows: Vec<Value> =
-                uploads.iter().map(|u| json!({"project_id": "garlic", "identification_file_name": u.name})).collect();
+                uploads.iter().map(|u| json!({"project_id": "xnova", "identification_file_name": u.name})).collect();
             respond_json(request, &Value::Array(rows))
         }
         name => {
@@ -457,14 +457,14 @@ mod test {
     use super::*;
 
     /// Serve a results folder to try xiVIEW in a browser:
-    /// `GARLIC_XIVIEW_DIR=<xiview folder> GARLIC_XIVIEW_RESULTS=<results folder>
+    /// `XNOVA_XIVIEW_DIR=<xiview folder> XNOVA_XIVIEW_RESULTS=<results folder>
     /// cargo test -p sage-gui serve_a_results_folder -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn serve_a_results_folder() {
-        let root = app_folder().expect("GARLIC_XIVIEW_DIR: the xiview folder");
-        let folder = PathBuf::from(std::env::var("GARLIC_XIVIEW_RESULTS").expect("GARLIC_XIVIEW_RESULTS"));
-        let minutes: u64 = std::env::var("GARLIC_XIVIEW_MINUTES").ok().and_then(|m| m.parse().ok()).unwrap_or(30);
+        let root = app_folder().expect("XNOVA_XIVIEW_DIR: the xiview folder");
+        let folder = PathBuf::from(std::env::var("XNOVA_XIVIEW_RESULTS").expect("XNOVA_XIVIEW_RESULTS"));
+        let minutes: u64 = std::env::var("XNOVA_XIVIEW_MINUTES").ok().and_then(|m| m.parse().ok()).unwrap_or(30);
         let server = Server::start(root).unwrap();
         for fdr in [Fdr::default(), Fdr(0.05)] {
             let start = std::time::Instant::now();
@@ -474,14 +474,14 @@ mod test {
         std::thread::sleep(std::time::Duration::from_secs(minutes * 60));
     }
 
-    /// xiSPEC's annotation against garlic's viewer on real spectra:
-    /// `GARLIC_XIVIEW_RESULTS=<results folder> cargo test -p sage-gui
+    /// xiSPEC's annotation against XNova's viewer on real spectra:
+    /// `XNOVA_XIVIEW_RESULTS=<results folder> cargo test -p sage-gui
     /// annotations_agree_with_the_viewer -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn annotations_agree_with_the_viewer() {
         use crate::viewer::model::{annotate as viewer_annotate, Model};
-        let folder = PathBuf::from(std::env::var("GARLIC_XIVIEW_RESULTS").expect("GARLIC_XIVIEW_RESULTS"));
+        let folder = PathBuf::from(std::env::var("XNOVA_XIVIEW_RESULTS").expect("XNOVA_XIVIEW_RESULTS"));
         let upload = Upload::load(&folder, 1, Fdr(1.0)).unwrap();
         let mut ids: Vec<&String> = upload.served.keys().collect();
         ids.sort();
@@ -547,7 +547,7 @@ mod test {
     fn urls() {
         assert_eq!(encode("PolII DSSO/run 1"), "PolII%20DSSO%2Frun%201");
         assert_eq!(decode("PolII%20DSSO%2Frun+1"), "PolII DSSO/run 1");
-        let (path, params) = split_url("/data/get_xiview_matches?project=garlic&file=PolII%20DSSO");
+        let (path, params) = split_url("/data/get_xiview_matches?project=xnova&file=PolII%20DSSO");
         assert_eq!(path, "/data/get_xiview_matches");
         assert_eq!(params.get("file").map(String::as_str), Some("PolII DSSO"));
         assert_eq!(decode("100%"), "100%");

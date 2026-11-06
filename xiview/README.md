@@ -1,4 +1,4 @@
-# xiVIEW for garlic
+# xiVIEW for XNova
 
 `sage-gui` shows crosslink results in [xiVIEW](https://github.com/Rappsilber-Laboratory/xiview)
 on this computer ("Open in xiVIEW"): it serves the xiVIEW web app on 127.0.0.1
@@ -11,10 +11,10 @@ with Node.js >= 24:
     python xiview/build_xiview.py --node <folder with node.exe> --work <work folder> --out <release folder>/xiview
 
 and the output folder goes next to `sage-gui.exe` as `xiview`. Its `SOURCE.md`
-lists the commits and the changes: the page shells point at garlic's server,
+lists the commits and the changes: the page shells point at XNova's server,
 and `source_fixes.py` changes xiVIEW's source (multivalent crosslinks in the
 spectrum, network and circle views; xiSPEC's settings request id; loop-link
-spectra). For development, `GARLIC_XIVIEW_DIR`
+spectra). For development, `XNOVA_XIVIEW_DIR`
 points sage-gui at another copy.
 
 See CROSSLINKING.md, "xiVIEW on this computer".
@@ -37,7 +37,7 @@ Lutz Fischer, Juri Rappsilber and contributors). Please cite:
 
 Repositories: https://github.com/Rappsilber-Laboratory/xiview (GPL-3.0),
 https://github.com/Rappsilber-Laboratory/xiview-server (Apache-2.0); the data
-API garlic answers is the PRIDE Crosslinking Resource's,
+API XNova answers is the PRIDE Crosslinking Resource's,
 https://github.com/PRIDE-Archive/crosslinking-api (PRIDE team, EMBL-EBI, and
 the Rappsilber Laboratory; data model from
 https://github.com/PRIDE-Archive/mzidentml-reader); the annotation format is

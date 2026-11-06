@@ -30,7 +30,7 @@ resvg = { version = "0.45", default-features = false, features = ["text", "syste
 svg2pdf = { version = "0.13", default-features = false, features = ["text"] }
 image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
 # Local xiVIEW: a small HTTP server on 127.0.0.1 serving the xiVIEW web app
-# and garlic's results in the form of its data API
+# and XNova's results in the form of its data API
 tiny_http = "0.12"
 # ...opened in the default web browser (the one registered for http)
 webbrowser = "1"
@@ -47,10 +47,8 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
 ] }
 
-# (examples/make_icon.rs, which draws the application icon, uses `image` too)
-
 [target.'cfg(windows)'.build-dependencies]
-# build.rs embeds assets/garlic.ico as the .exe icon
+# build.rs embeds assets/xnova.ico as the .exe icon
 winresource = "0.1"
 
 [dev-dependencies]

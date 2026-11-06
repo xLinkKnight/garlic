@@ -1,4 +1,4 @@
-//! A garlic results folder as the PRIDE crosslinking API serves an uploaded
+//! An XNova results folder as the PRIDE crosslinking API serves an uploaded
 //! mzIdentML file to xiVIEW: the same JSON rows (`get_xiview_matches`,
 //! `get_xiview_peptides`, `get_xiview_proteins` and the search metadata),
 //! built from `results.json` and `crosslinks.sage.tsv` through the viewer's
@@ -6,7 +6,7 @@
 //!
 //! * Crosslinks are donor / acceptor peptide pairs (`MS:1002509` /
 //!   `MS:1002510` on the link residues, the linker mass on the donor), as in
-//!   garlic's `crosslinks.mzid`; loop-links one peptide with both sites.
+//!   XNova's `crosslinks.mzid`; loop-links one peptide with both sites.
 //! * A multivalent species (xiVIEW knows pairs only) is one match per link.
 //! * Decoy proteins are `DECOY_<accession>`, a prefix xiVIEW maps back to
 //!   the target protein.
@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 const PROTON: f64 = 1.007_276_466_6;
-/// garlic's crosslink FDR at which matches are served to xiVIEW: target
+/// XNova's crosslink FDR at which matches are served to xiVIEW: target
 /// matches (rank 1) with crosslink q-value ≤ this. xiVIEW shows them as
 /// passing ("Stored validation"); its own decoy-based FDR is not used.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -39,7 +39,7 @@ impl Fdr {
     }
 }
 
-/// A served match: the garlic match and, for a multivalent species, how
+/// A served match: the XNova match and, for a multivalent species, how
 /// xiVIEW's spectrum viewer shows the whole species
 #[derive(Clone, Debug)]
 pub struct Served {
@@ -76,7 +76,7 @@ pub struct Upload {
     pub results: Results,
     /// Spectrum file names; the index is xiVIEW's spectra data id
     pub files: Vec<String>,
-    /// xiVIEW match id → garlic match
+    /// xiVIEW match id → XNova match
     pub served: HashMap<String, Served>,
     /// Endpoint name (`get_xiview_matches`) → JSON
     endpoints: HashMap<&'static str, Vec<u8>>,
@@ -87,7 +87,7 @@ impl Upload {
         self.endpoints.get(name).map(Vec::as_slice)
     }
 
-    /// The garlic match behind a xiVIEW match id
+    /// The XNova match behind a xiVIEW match id
     pub fn served(&self, id: &str) -> Option<(&Match, &Served)> {
         let s = self.served.get(id)?;
         Some((self.results.matches.get(s.index)?, s))
@@ -106,13 +106,13 @@ impl Upload {
 
         let mut matches = Vec::new();
         let mut served = HashMap::new();
-        // multivalent links: (garlic match, link, donor and acceptor peptide rows)
+        // multivalent links: (XNova match, link, donor and acceptor peptide rows)
         let mut multivalent: Vec<(usize, usize, usize, usize)> = Vec::new();
         for (index, m) in results.matches.iter().enumerate() {
             if m.kind == Kind::Linear || m.rank != 1 {
                 continue;
             }
-            // garlic's FDR: targets within it
+            // XNova's FDR: targets within it
             if !(m.target && m.q <= fdr.0) {
                 continue;
             }
@@ -173,7 +173,7 @@ impl Upload {
         put("get_xiview_search_modifications", meta.search_modifications());
         // the links of multivalent species, as link metadata xiVIEW loads (CSV)
         let metadata = builder.link_metadata(&results, &multivalent);
-        endpoints.insert("get_garlic_link_metadata", metadata.into_bytes());
+        endpoints.insert("get_xnova_link_metadata", metadata.into_bytes());
 
         Ok(Upload {
             id,
@@ -194,14 +194,14 @@ fn match_row(id: &str, m: &Match, upload: u32, a: usize, b: Option<usize>, sd: u
         "id": id,
         "pi1": a,
         "pi2": b,
-        "sc": {"garlic:hyperscore": m.score, "garlic:q-value": m.q},
+        "sc": {"XNova:hyperscore": m.score, "XNova:q-value": m.q},
         "ui": upload,
         "c_mz": (m.calcmass as f64 + z * PROTON) / z,
         "pc_c": m.charge,
         "pc_mz": (m.expmass as f64 + z * PROTON) / z,
         "sp": m.scan,
         "sd": sd,
-        // every match served passes garlic's FDR (as the PRIDE API serves
+        // every match served passes XNova's FDR (as the PRIDE API serves
         // only passing ones)
         "p": true,
         "r": m.rank,
@@ -724,10 +724,10 @@ struct Metadata<'a> {
 impl Metadata<'_> {
     fn software(&self) -> Value {
         json!({
-            "id": "garlic",
-            "name": "garlic (Sage)",
+            "id": "xnova",
+            "name": "XNova (Sage)",
             "version": self.json["version"].as_str().unwrap_or(env!("CARGO_PKG_VERSION")),
-            "uri": "https://github.com/xLinkKnight/garlic",
+            "uri": "https://github.com/xLinkKnight/XNova",
         })
     }
 
@@ -745,7 +745,7 @@ impl Metadata<'_> {
     fn mzidentml_files(&self) -> Value {
         json!([{
             "id": self.id,
-            "project_id": "garlic",
+            "project_id": "xnova",
             "identification_file_name": self.name,
             "analysis_software_list": {"AnalysisSoftware": [self.software()]},
             "provider": {},
@@ -796,7 +796,7 @@ impl Metadata<'_> {
                 "MS:1001256": "fragment mass type mono",
             },
             "analysis_software": self.software(),
-            "threshold": {"garlic:crosslink q-value": self.fdr.0},
+            "threshold": {"XNova:crosslink q-value": self.fdr.0},
         }])
     }
 
@@ -1011,7 +1011,7 @@ mod test {
     /// A small crosslink results folder: rows for xiVIEW
     #[test]
     fn serves_a_results_folder() {
-        let dir = std::env::temp_dir().join(format!("garlic-xiview-data-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("xnova-xiview-data-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fasta = dir.join("p.fasta");
         std::fs::write(&fasta, ">sp|P11111|ONE_HUMAN One protein OS=Homo sapiens GN=ONE\nMKGLEKVSTAAMQRK\n>sp|P22222|TWO_HUMAN Two\nMTDYHFPNEWKLIRGG\n").unwrap();
@@ -1060,7 +1060,7 @@ mod test {
         assert_eq!((acceptor["pos"][0].as_u64(), acceptor["ls1"].as_u64()), (Some(2), Some(10)));
         // m/z from neutral masses
         assert!((first["pc_mz"].as_f64().unwrap() - (3000.0 + 3.0 * PROTON) / 3.0).abs() < 1e-6);
-        assert_eq!(first["sc"]["garlic:hyperscore"], 40.0);
+        assert_eq!(first["sc"]["XNova:hyperscore"], 40.0);
         assert_eq!(first["sp"], "scan=5");
         // the loop-link: one peptide, both sites, no second peptide
         let lp = &matches[1];
@@ -1073,17 +1073,17 @@ mod test {
         assert_eq!((one["name"].as_str(), one["accession"].as_str()), (Some("ONE"), Some("P11111")));
         assert_eq!(one["description"], "One protein");
 
-        // garlic's FDR: targets only, at any level
+        // XNova's FDR: targets only, at any level
         let all = Upload::load(&dir, 2, Fdr(1.0)).unwrap();
         let matches = get(&all, "get_xiview_matches");
         assert_eq!(matches.as_array().unwrap().len(), 2, "never the decoy pair: {matches}");
         assert!(matches.as_array().unwrap().iter().all(|m| m["p"] == true));
-        // the served match leads back to garlic's, and knows how xiSPEC writes its peptides
+        // the served match leads back to XNova's, and knows how xiSPEC writes its peptides
         let (m, s) = all.served(matches[0]["id"].as_str().unwrap()).unwrap();
         assert_eq!((m.scan.as_str(), s.layout.is_none()), ("scan=5", true));
         assert_eq!(s.signatures[0], vec!["GLEKVSTAAM(oxidation)QR".to_string(), "TDYHFPNEWKLIR".to_string()]);
         // no multivalent species: no link metadata
-        assert!(all.endpoint("get_garlic_link_metadata").unwrap().is_empty());
+        assert!(all.endpoint("get_xnova_link_metadata").unwrap().is_empty());
 
         // metadata
         let sip = get(&all, "get_xiview_spectrum_identification_protocols");
@@ -1104,7 +1104,7 @@ mod test {
     fn serves_a_multivalent_species() {
         use super::super::annotate::{annotate, Known};
         use crate::viewer::model::Peaks;
-        let dir = std::env::temp_dir().join(format!("garlic-xiview-multi-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("xnova-xiview-multi-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fasta = dir.join("p.fasta");
         std::fs::write(
@@ -1131,7 +1131,7 @@ mod test {
         let matches: Value = serde_json::from_slice(upload.endpoint("get_xiview_matches").unwrap()).unwrap();
         assert_eq!(matches.as_array().unwrap().len(), 2, "one match per link");
         // the link metadata: both links, one species label
-        let csv = String::from_utf8(upload.endpoint("get_garlic_link_metadata").unwrap().to_vec()).unwrap();
+        let csv = String::from_utf8(upload.endpoint("get_xnova_link_metadata").unwrap().to_vec()).unwrap();
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(lines[0], "Protein1,SeqPos1,Protein2,SeqPos2,Multivalent,Multivalent species");
         assert_eq!(lines.len(), 3, "{csv}");

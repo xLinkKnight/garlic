@@ -1,4 +1,4 @@
-"""Changes garlic makes to xiVIEW's source before building it.
+"""Changes XNova makes to xiVIEW's source before building it.
 
 Each is (file, text, replacement); the text must occur exactly once, so a
 change in xiVIEW's source stops the build instead of being missed.
@@ -10,8 +10,8 @@ change in xiVIEW's source stops the build instead of being missed.
    (a row each, peptides 3 and 4 in their own colours) and of links (a line
    each; a loop-link as a bracket), and the precursor mass with one linker
    per link. Two peptides with one link are drawn exactly as before.
-3. Multivalent crosslinks, network (xiNET) and circle views: garlic's link
-   metadata (`get_garlic_link_metadata`: `Multivalent`, `Multivalent
+3. Multivalent crosslinks, network (xiNET) and circle views: XNova's link
+   metadata (`get_xnova_link_metadata`: `Multivalent`, `Multivalent
    species`) is loaded with the data, and links of multivalent species are
    drawn dash-dotted. "Multivalent species" is also a link colour scheme
    (one colour per species).
@@ -54,14 +54,14 @@ SOURCE_FIXES = [
         })''',
         '''        .then(response => {
             if (!response.ok) {
-                // garlic: the server's reason
+                // XNova: the server's reason
                 return response.text().then(text => {
                     let detail = text;
                     try {
                         const json = JSON.parse(text);
                         detail = json.error || json.detail || text;
                     } catch (e) { /* plain text */ }
-                    throw new Error("garlic could not show this spectrum: " + detail);
+                    throw new Error("XNova could not show this spectrum: " + detail);
                 });
             }
             return response.json();
@@ -74,14 +74,14 @@ SOURCE_FIXES = [
         });''',
         '''        .catch(error => {
             console.log("error getting annotated peak list", error);
-            showMessage(error instanceof TypeError ? GARLIC_NOT_RUNNING : String(error.message || error), "error");
+            showMessage(error instanceof TypeError ? XNOVA_NOT_RUNNING : String(error.message || error), "error");
         });''',
     ),
     (
         J('js', 'load-spectrum.js'),
         'export const loadSpectrum = function (match) {',
-        '''// garlic: a request that reached no server
-const GARLIC_NOT_RUNNING = "The spectrum could not be fetched: sage-gui serves this page's data and spectra, "
+        '''// XNova: a request that reached no server
+const XNOVA_NOT_RUNNING = "The spectrum could not be fetched: sage-gui serves this page's data and spectra, "
     + "so keep sage-gui open while you use xiVIEW (if it was closed, open the results again with Open in xiVIEW).";
 
 export const loadSpectrum = function (match) {''',
@@ -98,7 +98,7 @@ export const loadSpectrum = function (match) {''',
             });''',
         '''            .catch(error => {
                 console.error("Error during annotation request:", error);
-                // garlic: say so (it was silent)
+                // XNova: say so (it was silent)
                 showMessage(error instanceof TypeError
                     ? "The spectrum could not be re-annotated: keep sage-gui open while you use xiVIEW."
                     : "The spectrum could not be re-annotated: " + (error.message || error), "error");
@@ -110,7 +110,7 @@ export const loadSpectrum = function (match) {''',
         J(XISPEC, 'annotated-spectrum-model.js'),
         '''    updateColors: function () {
         switch (this.get("visFragments")) {''',
-        '''    // garlic: the colour of peptide p (multivalent crosslinks have more than
+        '''    // XNova: the colour of peptide p (multivalent crosslinks have more than
     // two); kind "", "_loss" or "_cluster"
     pepColor: function (p, kind) {
         if (p === 0) return this["p1color" + kind];
@@ -131,7 +131,7 @@ export const loadSpectrum = function (match) {''',
             if (JSONdata.LinkSite[0].linkSite !== -1 && JSONdata.LinkSite[1].linkSite !== -1)
                 totalMass += clModMass;
         }''',
-        '''        // garlic: one linker per link (both ends set; multivalent crosslinks have several)
+        '''        // XNova: one linker per link (both ends set; multivalent crosslinks have several)
         const linkEnds = {};
         JSONdata.LinkSite.forEach(function (l) {
             if (l.linkSite !== -1) linkEnds[l.id] = (linkEnds[l.id] || 0) + 1;
@@ -185,7 +185,7 @@ export const loadSpectrum = function (match) {''',
             y_coord = 25;
         if (this.peptideId === 1)
             y_coord = 75;''',
-        '''        // garlic: a row per peptide
+        '''        // XNova: a row per peptide
         y_coord = 25 + 50 * this.peptideId;''',
     ),
 
@@ -210,7 +210,7 @@ export const loadSpectrum = function (match) {''',
         this.align_peptides_to_CL();''',
         '''        this.tooltip.style("opacity", 0);
 
-        // garlic: any number of peptides and links (multivalent crosslinks)
+        // XNova: any number of peptides and links (multivalent crosslinks)
         this.links = this.linksOf(this.linkPos);
         this.align_peptides_to_CL();
         this.CLpos = this.links.length > 0 ? this.pepoffset[this.links[0].a] + this.links[0].sa : -1;''',
@@ -229,14 +229,14 @@ export const loadSpectrum = function (match) {''',
         J(XISPEC, 'FragmentationKeyView.js'),
         '''        // CL line svg elements
         if (this.linkPos.length > 0) {''',
-        '''        // CL line svg elements (garlic: the first link between two peptides)
+        '''        // CL line svg elements (XNova: the first link between two peptides)
         if (this.links.length > 0 && this.links[0].a !== this.links[0].b) {''',
     ),
     (
         J(XISPEC, 'FragmentationKeyView.js'),
         '''        // change-mod svg element
         let changeModLetterG = this.scaleSvgGroup.append("g");''',
-        '''        // garlic: every link where it is (multivalent crosslinks, loop-links)
+        '''        // XNova: every link where it is (multivalent crosslinks, loop-links)
         this.drawLinks();
 
         // change-mod svg element
@@ -268,7 +268,7 @@ export const loadSpectrum = function (match) {''',
             }
         }
     },''',
-        '''    // garlic: the links as {a, sa, b, sb} (peptides and residues), the two ends
+        '''    // XNova: the links as {a, sa, b, sb} (peptides and residues), the two ends
     // of each link sharing an id
     linksOf: function (linkPos) {
         const byId = new Map();
@@ -285,7 +285,7 @@ export const loadSpectrum = function (match) {''',
         return links;
     },
 
-    // garlic: line the peptides up at their linked residues (the first link
+    // XNova: line the peptides up at their linked residues (the first link
     // first, then the peptides the links reach), any number of peptides
     align_peptides_to_CL: function () {
         const n = this.peptideStrs.length;
@@ -321,7 +321,7 @@ export const loadSpectrum = function (match) {''',
         }
     },
 
-    // garlic: a line per link between the rows of its peptides (the first
+    // XNova: a line per link between the rows of its peptides (the first
     // one is xiSPEC's own, clickable line); a loop-link as a bracket
     drawLinks: function () {
         const self = this;
@@ -375,7 +375,7 @@ export const loadSpectrum = function (match) {''',
                 group: pep2SvgGroup
             });
         }''',
-        '''        // garlic: a row per peptide (multivalent crosslinks have more than two)
+        '''        // XNova: a row per peptide (multivalent crosslinks have more than two)
         let peptides = this.peptides.map(function (sequence, p) {
             return {
                 sequence: sequence,
@@ -446,12 +446,12 @@ export const loadSpectrum = function (match) {''',
         if (parentWidth < fragKeyWidth + this.margin.left + this.margin.right) {
             scale = parentWidth / (fragKeyWidth + this.margin.left + this.margin.right);
         }
-        // garlic: more than two peptides: about the height of two
+        // XNova: more than two peptides: about the height of two
         if (this.peptides && this.peptides.length > 2 && fragKeyHeight > 0)
             scale = Math.min(scale, 95 / fragKeyHeight);''',
     ),
 
-    # --- 3. network and circle views: garlic's link metadata, multivalent links dash-dotted
+    # --- 3. network and circle views: XNova's link metadata, multivalent links dash-dotted
     (
         J('js', 'main.js'),
         '''import vent from "./vent";''',
@@ -462,23 +462,23 @@ import {updateLinkMetadata} from "./modelUtils";''',
         J('js', 'main.js'),
         '''    // Add the blosum promise to the tasks array
     const allTasks = [...tasks, blosumPromise];''',
-        '''    // garlic: multivalent crosslinks as link metadata (CSV; empty without them)
-    let garlicLinkMetadata = "";
-    const garlicTask = fetch(`${apiBase}get_garlic_link_metadata${window.location.search}`)
+        '''    // XNova: multivalent crosslinks as link metadata (CSV; empty without them)
+    let xnovaLinkMetadata = "";
+    const xnovaTask = fetch(`${apiBase}get_xnova_link_metadata${window.location.search}`)
         .then(response => response.ok ? response.text() : "")
-        .then(text => { garlicLinkMetadata = text; })
+        .then(text => { xnovaLinkMetadata = text; })
         .catch(() => {});
 
     // Add the blosum promise to the tasks array
-    const allTasks = [...tasks, blosumPromise, garlicTask];''',
+    const allTasks = [...tasks, blosumPromise, xnovaTask];''',
     ),
     (
         J('js', 'main.js'),
         '''            const compositeModelInst = models({}, clmsModel);
             compositeModelInst.set("blosumColl", blosumCollInst);''',
         '''            const compositeModelInst = models({}, clmsModel);
-            if (garlicLinkMetadata.trim()) {
-                updateLinkMetadata(garlicLinkMetadata, clmsModel);
+            if (xnovaLinkMetadata.trim()) {
+                updateLinkMetadata(xnovaLinkMetadata, clmsModel);
             }
             compositeModelInst.set("blosumColl", blosumCollInst);''',
     ),
@@ -487,7 +487,7 @@ import {updateLinkMetadata} from "./modelUtils";''',
         '''        this.dashedLine(this.crosslink.ambiguous && this.crosslink.isMonoLink() === false);
 ''',
         '''        this.dashedLine(this.crosslink.ambiguous && this.crosslink.isMonoLink() === false);
-        // garlic: links of multivalent crosslinks, dash-dotted
+        // XNova: links of multivalent crosslinks, dash-dotted
         if (this.shown && !this.crosslink.ambiguous && this.crosslink.getMeta("Multivalent")) {
             this.line.setAttribute("stroke-dasharray", "10, 3, 2, 3");
         }
@@ -501,8 +501,8 @@ import {updateLinkMetadata} from "./modelUtils";''',
         '''            .classed("ambiguous", function (d) {
                 return crosslinks.get(d.id).ambiguous;
             })
-            // garlic: links of multivalent crosslinks, dash-dotted
-            .classed("garlicMultivalent", function (d) {
+            // XNova: links of multivalent crosslinks, dash-dotted
+            .classed("xnovaMultivalent", function (d) {
                 const crosslink = crosslinks.get(d.id);
                 return !crosslink.ambiguous && !!crosslink.getMeta("Multivalent");
             });''',
@@ -510,8 +510,8 @@ import {updateLinkMetadata} from "./modelUtils";''',
     (
         J('css', 'circularViewBB.css'),
         '''.circleLink {''',
-        '''/* garlic: links of multivalent crosslinks */
-.circleLink.garlicMultivalent {
+        '''/* XNova: links of multivalent crosslinks */
+.circleLink.xnovaMultivalent {
     stroke-dasharray: 10, 3, 2, 3;
 }
 

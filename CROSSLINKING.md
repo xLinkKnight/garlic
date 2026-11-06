@@ -483,7 +483,7 @@ numbering from ProXL's importer.
 ## xiVIEW on this computer
 
 `sage-gui` runs [xiVIEW](https://github.com/Rappsilber-Laboratory/xiview) (the
-Rappsilber lab's crosslink viewer) on this computer with garlic's results: **Open
+Rappsilber lab's crosslink viewer) on this computer with XNova's results: **Open
 in xiVIEW** (bottom bar, Progress tab, Annotated spectra tab) or
 `sage-gui --xiview <results folder>` opens it in your web browser. Nothing is
 uploaded and no database or Python is needed.
@@ -497,17 +497,17 @@ uploaded and no database or Python is needed.
   tables, exports and the annotated spectra (xiSPEC), including **View Spectra
   Only**. UniProt features and PDB structures are downloaded when those views
   use them; the rest works offline.
-* **FDR: garlic's.** xiVIEW gets the target crosslinks within garlic's crosslink
+* **FDR: XNova's.** xiVIEW gets the target crosslinks within XNova's crosslink
   FDR (crosslink q-value; 1% by default, 5% or 10% chosen next to the button),
   all shown as passing ("Stored validation"). Decoys are not sent, so xiVIEW's
-  own decoy-based "In-browser FDR" is not used. Scores: `garlic:hyperscore`
-  (the default) and `garlic:q-value`.
+  own decoy-based "In-browser FDR" is not used. Scores: `XNova:hyperscore`
+  (the default) and `XNova:q-value`.
 * Loop-links are shown on their peptide (in the spectrum viewer, the link as a
   bracket).
 * **Multivalent crosslinks:**
   * Network, circle (and matrix, 3D) views: each link of a species is a
     crosslink between its residues (a homodimer's same-residue links as
-    homomultimer links), drawn **dash-dotted**. garlic loads link metadata with
+    homomultimer links), drawn **dash-dotted**. XNova loads link metadata with
     the data: `Multivalent` (the topology, `a2a`, `a1b1a`) and `Multivalent
     species` (the species by its links, e.g. `a1b1a: RPO21 K695–RPB3 K161 +
     RPO21 K695–RPB3 K165`, the same on every link of it). Both are link colour
@@ -523,11 +523,11 @@ uploaded and no database or Python is needed.
 * Proteins are named by gene (from the FASTA) and looked up in UniProt by their
   accession; decoys are `DECOY_<accession>`.
 * **Annotated spectra:** the fragments come from Annotator's engine as in
-  garlic's Annotated spectra tab, and MS-cleavable linker stub ions (`P+A`,
-  `y6+S`, `b26+T+S`) from garlic's own stub search; they are converted to the
+  XNova's Annotated spectra tab, and MS-cleavable linker stub ions (`P+A`,
+  `y6+S`, `b26+T+S`) from XNova's own stub search; they are converted to the
   format xiSPEC reads, with the isotope peaks of each matched ion grouped. In a
   sample of 49 spectra from the Pol II DSSO runs (crosslinks, loop-links and
-  multivalent species), every peak garlic's viewer explains (a/b/y, precursor
+  multivalent species), every peak XNova's viewer explains (a/b/y, precursor
   and stub ions) was annotated in xiSPEC too (xiSPEC also marks their isotope
   peaks). Changing xiSPEC's settings
   (tolerance, ion types, modifications) re-annotates the spectrum locally.
@@ -545,7 +545,7 @@ uploaded and no database or Python is needed.
   doi:10.1074/mcp.O114.042259) when you use them. Repositories:
   [xiview](https://github.com/Rappsilber-Laboratory/xiview) (GPL-3.0),
   [xiview-server](https://github.com/Rappsilber-Laboratory/xiview-server)
-  (Apache-2.0); the data API garlic answers is the PRIDE Crosslinking
+  (Apache-2.0); the data API XNova answers is the PRIDE Crosslinking
   Resource's, [crosslinking-api](https://github.com/PRIDE-Archive/crosslinking-api)
   (PRIDE team, EMBL-EBI, and the Rappsilber Laboratory; data model from
   [mzidentml-reader](https://github.com/PRIDE-Archive/mzidentml-reader)), and the
@@ -557,7 +557,7 @@ uploaded and no database or Python is needed.
   listed in `xiview/source_fixes.py`: the spectrum viewer's settings (their
   re-annotation was dropped) and loop-links (their spectrum did not open), and
   the multivalent display above (any number of peptides and links in the
-  spectrum viewer, garlic's link metadata, dash-dotted links). See the
+  spectrum viewer, XNova's link metadata, dash-dotted links). See the
   `SOURCE.md` in the `xiview` folder.
 
 ## Annotated spectra
@@ -643,7 +643,7 @@ generates and matches its fragments. Nothing else needs to be installed.
   and 1/K0; click a legend entry to hide that class; with several runs, pick
   one or show all. **Save…** writes it as SVG or PDF (7 inches wide, white or
   transparent, optional title) with a legend of the colours (with counts) and
-  the charge shapes. Needs `crosslinks.sage.tsv` from garlic 0.18 or later,
+  the charge shapes. Needs `crosslinks.sage.tsv` from XNova 0.18 or later,
   which has an `ion_mobility` column. Precursors where Sage found no candidate
   peptide at all are not in Sage's result tables and so not shown.
   A search run from `sage-gui` on timsTOF data also writes mobiligrams by
