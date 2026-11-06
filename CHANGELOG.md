@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+- CI: the Rust workflow runs its test searches with `cargo run --bin sage`. A bare `cargo run` had failed on every push since `sage-gui` joined the workspace, as Cargo could not choose between the two programs.
+
+### Removed
+- The Docker image workflow (`.github/workflows/docker.yml`). It never published an image (the workflow token cannot write packages) and failed on every release; XNova releases are Windows zips.
+
 ## [v1.0.1] - 2026-11-06
 
 ### Added

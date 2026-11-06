@@ -20,11 +20,12 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+    # the workspace has two programs (sage, sage-gui): name the one to run
     - name: Run VAT1_HUMAN search
-      run: cargo run tests/config.json
+      run: cargo run --bin sage -- tests/config.json
     - name: Run with CLI args
       run: |
-        cargo run -- \
+        cargo run --bin sage -- \
           -f tests/Q99536.fasta \
           -o foo \
           --annotate-matches \
