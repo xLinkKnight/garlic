@@ -2,7 +2,7 @@
 
 # XNova: Ultra-Fast Crosslinking Search Engine, Powered by Sage
 
-[![Rust](https://github.com/lazear/sage/actions/workflows/rust.yml/badge.svg)](https://github.com/lazear/sage/actions/workflows/rust.yml) [![Anaconda-Server Badge](https://anaconda.org/bioconda/sage-proteomics/badges/version.svg)](https://anaconda.org/bioconda/sage-proteomics)
+[![Rust](https://github.com/lazear/sage/actions/workflows/rust.yml/badge.svg)](https://github.com/lazear/sage/actions/workflows/rust.yml)
 
 XNova is a search engine for crosslinking mass spectrometry (XL-MS), built on [Sage](https://github.com/lazear/sage) by Michael Lazear. It keeps everything Sage does for ordinary (linear) peptides and adds crosslink searches for non-cleavable, MS-cleavable and zero-length reagents, from purified complexes to whole proteomes. It runs as the `sage` command-line program and as `sage-gui`, a desktop app for setting up searches, following them and exploring the results.
 
